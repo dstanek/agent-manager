@@ -57,7 +57,11 @@ Selecting the agent also selects the container image — `am` ships with built-i
 
 ## Environment variables
 
-Environment variables override both the global and project configs and are useful for CI pipelines, Docker-in-Docker setups, or temporary one-off overrides without editing any files. Unknown or malformed values are silently ignored.
+Environment variables override both the global and project configs and are useful for CI pipelines, Docker-in-Docker setups, or temporary one-off overrides without editing any files.
+
+**Validation:** Enum fields (`AM_VCS`, `AM_TMUX_SPLIT`, etc.) silently ignore unrecognised values so that adding new enum variants remains backwards-compatible. Numeric and identifier fields (`AM_TMUX_SPLIT_PERCENT`, `AM_CONTAINER_USER`) return a hard error if the value is out of range or malformed — the same behaviour as loading an invalid value from a config file.
+
+### Config overrides
 
 | Variable | Config key | Values | Example |
 |---|---|---|---|
@@ -65,19 +69,33 @@ Environment variables override both the global and project configs and are usefu
 | `AM_AGENT` | `defaults.agent` | any non-empty string | `AM_AGENT=claude` |
 | `AM_TMUX_AGENT_PANE` | `tmux.agent_pane` | `left`, `right` | `AM_TMUX_AGENT_PANE=right` |
 | `AM_TMUX_SPLIT` | `tmux.split` | `horizontal`, `vertical` | `AM_TMUX_SPLIT=vertical` |
-| `AM_TMUX_SPLIT_PERCENT` | `tmux.split_percent` | integer 1–99 | `AM_TMUX_SPLIT_PERCENT=30` |
+| `AM_TMUX_SPLIT_PERCENT` | `tmux.split_percent` | integer 1–99 (error if out of range) | `AM_TMUX_SPLIT_PERCENT=30` |
 | `AM_CONTAINER_ENABLED` | `container.enabled` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_CONTAINER_ENABLED=false` |
 | `AM_CONTAINER_RUNTIME` | `container.runtime` | `auto`, `podman`, `docker` | `AM_CONTAINER_RUNTIME=docker` |
-| `AM_CONTAINER_AGENT` | `container.agent` | any non-empty string | `AM_CONTAINER_AGENT=claude` |
+| `AM_CONTAINER_AGENT` | `container.agent` | known agent name | `AM_CONTAINER_AGENT=claude` |
 | `AM_CONTAINER_IMAGE` | `container.image` | any non-empty string | `AM_CONTAINER_IMAGE=my-image:latest` |
 | `AM_CONTAINER_NETWORK` | `container.network` | `full`, `none` | `AM_CONTAINER_NETWORK=none` |
-| `AM_CONTAINER_USER` | `container.user` | safe username (`[a-z_][a-z0-9_-]*`) | `AM_CONTAINER_USER=am` |
-| `AM_CONTAINER_GITCONFIG` | `container.gitconfig` | directory path | `AM_CONTAINER_GITCONFIG=/custom/.gitconfig` |
+| `AM_CONTAINER_USER` | `container.user` | safe username (`[a-z_][a-z0-9_-]*`, error if invalid) | `AM_CONTAINER_USER=am` |
+| `AM_CONTAINER_GITCONFIG` | `container.gitconfig` | file path | `AM_CONTAINER_GITCONFIG=/custom/.gitconfig` |
 | `AM_CONTAINER_SSH` | `container.ssh` | directory path | `AM_CONTAINER_SSH=/custom/.ssh` |
 | `CLAUDE_CONFIG_DIR` | (none) | directory path | `CLAUDE_CONFIG_DIR=/custom/.claude` |
 
 !!! note "Mount path customization"
-    The `AM_CONTAINER_GITCONFIG` and `AM_CONTAINER_SSH` variables allow you to override where `am` looks for your git and SSH configuration on the host. `AM_CONTAINER_USER` changes the username used when constructing mount targets inside the container, such as `/home/<user>/.ssh` and `/home/<user>/.gitconfig`, and must be a safe username. `CLAUDE_CONFIG_DIR` allows you to override the Claude configuration directory location. These are rarely needed unless you have a non-standard directory structure.
+    `AM_CONTAINER_GITCONFIG` and `AM_CONTAINER_SSH` override where `am` looks for your git and SSH configuration on the host. `AM_CONTAINER_USER` changes the username used when constructing mount targets inside the container (e.g. `/home/<user>/.ssh`, `/home/<user>/.gitconfig`) and must be a safe POSIX username. `CLAUDE_CONFIG_DIR` overrides the Claude configuration directory. These are rarely needed unless you have a non-standard directory structure.
+
+### Binary path overrides
+
+These variables redirect `am` to a specific binary instead of searching `PATH`. Useful when a tool is installed in a non-standard location or when you want to pin to a specific version.
+
+| Variable | Default binary | Description |
+|---|---|---|
+| `AM_TMUX_BIN` | `tmux` (from PATH) | Path or name of the tmux binary |
+| `AM_PODMAN_BIN` | `podman` (from PATH) | Path or name of the Podman binary |
+| `AM_DOCKER_BIN` | `docker` (from PATH) | Path or name of the Docker binary |
+| `AM_JJ_BIN` | `jj` (from PATH) | Path or name of the Jujutsu binary |
+| `AM_GH_BIN` | `gh` (from PATH) | Path or name of the GitHub CLI binary (used for Copilot auth) |
+
+If set to a bare name (e.g. `AM_TMUX_BIN=tmux3`), `am` searches PATH for that name. If set to an absolute path, it uses that path directly and errors if the file does not exist.
 
 ---
 
@@ -138,7 +156,7 @@ Controls how the tmux window and panes are arranged for each session.
 |---|---|---|---|---|
 | `agent_pane` | string | `"left"` | Which pane receives the agent command after the split | `"left"`, `"right"` |
 | `split` | string | `"horizontal"` | Direction of the tmux pane split | `"horizontal"`, `"vertical"` |
-| `split_percent` | integer | `50` | Percentage of the window given to the first (agent) pane | 1–99 |
+| `split_percent` | integer | `50` | Percentage of the total window given to the agent pane | 1–99 (error if out of range) |
 
 ### `[container]`
 

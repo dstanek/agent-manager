@@ -204,8 +204,8 @@ AM_CONTAINER_RUNTIME=docker am start feat
 # Use Copilot and vertical split
 AM_AGENT=copilot AM_TMUX_SPLIT=vertical am start feat
 
-# Set startup delay for slow machines (milliseconds)
-AM_CONTAINER_STARTUP_DELAY_MS=2000 am start feat
+# Use no network inside the container
+AM_CONTAINER_NETWORK=none am start feat
 
 # Override which git config to mount
 AM_CONTAINER_GITCONFIG=~/.my-gitconfig am start feat
