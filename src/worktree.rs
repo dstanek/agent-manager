@@ -387,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn create_git_worktree_succeeds_when_worktrees_dir_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        // Pre-create the worktrees directory (as would happen after a prior session)
+        std::fs::create_dir_all(tmp.path().join(".am").join("worktrees")).unwrap();
+
+        let worktree_path = create_git_worktree("feat", tmp.path()).unwrap();
+        assert!(worktree_path.exists(), "worktree directory should exist");
+    }
+
+    #[test]
     fn remove_git_worktree_removes_directory_and_branch() {
         let tmp = TempDir::new().unwrap();
         init_repo_with_commit(tmp.path());
@@ -402,6 +414,24 @@ mod tests {
             !branch_exists(&bin, "feat", tmp.path()),
             "branch should be deleted"
         );
+    }
+
+    #[test]
+    fn remove_git_worktree_succeeds_when_branch_already_gone() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        create_git_worktree("feat", tmp.path()).unwrap();
+
+        // Detach the worktree so git allows branch deletion, then delete the branch.
+        let bin = git_bin().unwrap();
+        let worktree_path = tmp.path().join(".am").join("worktrees").join("feat");
+        std::fs::remove_dir_all(&worktree_path).unwrap();
+        let _ = run_git(&bin, tmp.path(), &["worktree", "prune"]);
+        run_git(&bin, tmp.path(), &["branch", "-D", "am/feat"]).unwrap();
+
+        // remove_git_worktree should succeed even though the branch is already gone
+        remove_git_worktree("feat", tmp.path()).unwrap();
     }
 
     // ── git_worktree_has_changes ───────────────────────────────────────────────

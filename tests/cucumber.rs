@@ -66,6 +66,38 @@ impl AmWorld {
         self.mock_tmux_log = Some(log);
     }
 
+    /// Install a mock tmux that fails the **first** `select-window` call and
+    /// succeeds on all subsequent calls. Used to exercise the window
+    /// re-creation path in `am attach`.
+    fn setup_mock_tmux_failing_select_window(&mut self) {
+        let bin = self.project_dir.path().join("mock_tmux");
+        let log = self.project_dir.path().join("mock_tmux.log");
+        // A flag file is created on the first select-window call; its presence
+        // makes subsequent select-window calls succeed.
+        let flag = self.project_dir.path().join("mock_tmux_select_window_failed");
+        let flag_str = flag.to_string_lossy().into_owned();
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"$MOCK_TMUX_LOG\" ]; then\n\
+                     echo \"$@\" >> \"$MOCK_TMUX_LOG\"\n\
+                 fi\n\
+                 if [ \"$1\" = \"select-window\" ] && [ ! -f \"{flag_str}\" ]; then\n\
+                     touch \"{flag_str}\"\n\
+                     exit 1\n\
+                 fi\n\
+                 exit 0\n"
+            ),
+        )
+        .expect("write mock_tmux");
+        #[cfg(unix)]
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
+            .expect("chmod mock_tmux");
+        self.mock_tmux_bin = Some(bin);
+        self.mock_tmux_log = Some(log);
+    }
+
     /// Install a mock podman binary that logs every invocation to a file.
     fn setup_mock_podman(&mut self) {
         let bin = self.project_dir.path().join("mock_podman");
@@ -228,6 +260,11 @@ async fn given_session_started(world: &mut AmWorld, slug: String) {
 #[given("I am inside a tmux session")]
 async fn given_in_tmux(world: &mut AmWorld) {
     world.setup_mock_tmux();
+}
+
+#[given("the tmux window no longer exists")]
+async fn given_tmux_window_gone(world: &mut AmWorld) {
+    world.setup_mock_tmux_failing_select_window();
 }
 
 #[given("I am using a mock container runtime")]
