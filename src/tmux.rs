@@ -63,18 +63,22 @@ pub fn create_window(window_name: &str, working_dir: &Path) -> Result<()> {
 }
 
 /// Split an existing window.
-/// Horizontal: `tmux split-window -h -p <new_pane_percent> -c <working_dir> -t <window_name>`
-/// Vertical:   `tmux split-window -v -p <new_pane_percent> -c <working_dir> -t <window_name>`
+/// Horizontal: `tmux split-window -h -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
+/// Vertical:   `tmux split-window -v -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
 ///
 /// `new_pane_percent` is the percentage of the window given to the **new** pane (1–99).
 /// The caller is responsible for mapping the logical agent/shell pane assignment to the
 /// correct percentage (e.g. if the agent is in the new pane, pass `split_percent` directly;
 /// if the agent is in the original pane, pass `100 - split_percent`).
+///
+/// `shell_cmd` — when `Some`, tmux runs this command (via `$SHELL -c`) in the new pane
+/// instead of an interactive shell.
 pub fn split_window(
     window_name: &str,
     working_dir: &Path,
     direction: &SplitDirection,
     new_pane_percent: u8,
+    shell_cmd: Option<&str>,
 ) -> Result<()> {
     let bin = tmux_bin()?;
     let flag = match direction {
@@ -82,19 +86,21 @@ pub fn split_window(
         SplitDirection::Vertical => "-v",
     };
     let percent = new_pane_percent.to_string();
-    run_tmux(
-        &bin,
-        &[
-            "split-window",
-            flag,
-            "-p",
-            &percent,
-            "-c",
-            &working_dir.to_string_lossy(),
-            "-t",
-            window_name,
-        ],
-    )
+    let wd = working_dir.to_string_lossy();
+    let mut args = vec![
+        "split-window",
+        flag,
+        "-p",
+        &percent,
+        "-c",
+        &wd,
+        "-t",
+        window_name,
+    ];
+    if let Some(cmd) = shell_cmd {
+        args.push(cmd);
+    }
+    run_tmux(&bin, &args)
 }
 
 /// `tmux select-pane -t <target>`
@@ -261,6 +267,7 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Horizontal,
             50,
+            None,
         )
         .unwrap();
         let out = mock.captured();
@@ -277,6 +284,7 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Vertical,
             50,
+            None,
         )
         .unwrap();
         let out = mock.captured();
@@ -292,11 +300,31 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Horizontal,
             30,
+            None,
         )
         .unwrap();
         let out = mock.captured();
         assert!(out.contains("-p"), "expected -p flag, got: {out}");
         assert!(out.contains("30"), "expected percent value 30, got: {out}");
+    }
+
+    #[test]
+    fn split_window_with_shell_cmd_appends_command() {
+        let mock = MockTmux::new();
+        split_window(
+            "am-feat",
+            Path::new("/tmp/worktree"),
+            &SplitDirection::Horizontal,
+            50,
+            Some("podman run --rm -it myimage"),
+        )
+        .unwrap();
+        let out = mock.captured();
+        assert!(out.contains("split-window"));
+        assert!(
+            out.contains("podman run --rm -it myimage"),
+            "expected shell command in output, got: {out}"
+        );
     }
 
     #[test]

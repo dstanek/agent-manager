@@ -228,19 +228,20 @@ fn cmd_start(
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
+        let container_shell_cmd = container_cmd
+            .as_ref()
+            .map(|cmd| cmd.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
         tmux::split_window(
             &window_name,
             &worktree_path,
             &cfg.tmux.split,
             new_pane_percent,
+            container_shell_cmd.as_deref(),
         )?;
-        if let Some(ref cmd) = container_cmd {
-            tmux::send_keys(
-                &tmux::get_pane_id(&window_name, agent_pane_idx),
-                &cmd.join(" "),
-            )?;
-        } else if let Some(ref agent) = effective_agent {
-            tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
+        if container_cmd.is_none() {
+            if let Some(ref agent) = effective_agent {
+                tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
+            }
         }
         // cd the shell pane into the worktree.
         tmux::send_keys(
@@ -404,6 +405,7 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
             &s.vcs.worktree_path,
             &cfg.tmux.split,
             new_pane_percent,
+            None,
         )?;
         tmux::select_pane(&tmux::get_pane_id(&window_name, shell_pane_idx))?;
         tmux::select_window(&window_name)?;
@@ -529,6 +531,20 @@ fn cmd_generate_config() -> anyhow::Result<()> {
 fn cd_cmd(path: &std::path::Path) -> String {
     let escaped = path.to_string_lossy().replace('\'', "'\\''");
     format!("cd '{escaped}'")
+}
+
+/// Quote a single shell token only when it contains characters that require quoting.
+/// Safe characters (alphanumeric, common punctuation in paths/flags) are left bare.
+fn shell_quote(s: &str) -> String {
+    let needs_quoting = s.is_empty()
+        || s.chars().any(|c| {
+            !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/' | ':' | '=' | '+' | '@' | '%')
+        });
+    if needs_quoting {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    } else {
+        s.to_string()
+    }
 }
 
 fn read_git_config(key: &str) -> Option<String> {
