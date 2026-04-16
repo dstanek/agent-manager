@@ -388,8 +388,13 @@ env = []               # extra environment variables passed into the container, 
 "#
 }
 
-/// Read environment variables and apply them to the config, silently ignoring unknown values.
-fn apply_env_vars(config: &mut Config) {
+/// Read environment variables and apply them to the config.
+///
+/// Unknown/unrecognised values for enum fields are silently ignored so that
+/// adding new enum variants is backwards-compatible. Numeric fields with hard
+/// physical constraints (e.g. split_percent must be 1–99) return an error
+/// rather than silently falling back, matching the behaviour of TOML parsing.
+fn apply_env_vars(config: &mut Config) -> Result<()> {
     if let Ok(val) = std::env::var("AM_VCS") {
         match val.as_str() {
             "git" => config.vcs = Vcs::Git,
@@ -417,11 +422,12 @@ fn apply_env_vars(config: &mut Config) {
         }
     }
     if let Ok(val) = std::env::var("AM_TMUX_SPLIT_PERCENT") {
-        if let Ok(n) = val.parse::<u8>() {
-            if (1..=99).contains(&n) {
-                config.tmux.split_percent = n;
-            } else {
-                eprintln!("warning: AM_TMUX_SPLIT_PERCENT must be 1-99, ignoring value {n}");
+        match val.parse::<u8>() {
+            Ok(n) if (1..=99).contains(&n) => config.tmux.split_percent = n,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "invalid AM_TMUX_SPLIT_PERCENT '{val}': must be a number between 1 and 99"
+                ))
             }
         }
     }
@@ -472,6 +478,7 @@ fn apply_env_vars(config: &mut Config) {
             config.container.user = val;
         }
     }
+    Ok(())
 }
 
 /// Validate that every entry in `container.env` is a valid env var pass-through.
@@ -494,6 +501,15 @@ fn validate_env_passthrough(env: &[String]) -> Result<()> {
                  letters, digits, and underscores"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_split_percent(percent: u8) -> Result<()> {
+    if !(1..=99).contains(&percent) {
+        return Err(anyhow::anyhow!(
+            "invalid tmux.split_percent {percent}: must be between 1 and 99"
+        ));
     }
     Ok(())
 }
@@ -538,8 +554,9 @@ pub fn load_with_global(
     }
 
     // Apply environment variable overrides (highest precedence after CLI flags)
-    apply_env_vars(&mut config);
+    apply_env_vars(&mut config)?;
 
+    validate_split_percent(config.tmux.split_percent)?;
     validate_env_passthrough(&config.container.env)?;
     validate_container_user(&config.container.user)?;
 
@@ -921,6 +938,83 @@ env = ["--rm"]
         );
         let err = load_with_global(None, Some(&project)).unwrap_err();
         assert!(err.to_string().contains("--rm"));
+    }
+
+    // ── split_percent validation ───────────────────────────────────────────────
+
+    #[test]
+    fn split_percent_out_of_range_in_toml_fails() {
+        let tmp = TempDir::new().unwrap();
+        let project = write_toml(
+            tmp.path(),
+            "config.toml",
+            r#"
+[tmux]
+split_percent = 100
+"#,
+        );
+        let err = load_with_global(None, Some(&project)).unwrap_err();
+        assert!(
+            err.to_string().contains("split_percent"),
+            "expected split_percent error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_percent_zero_in_toml_fails() {
+        let tmp = TempDir::new().unwrap();
+        let project = write_toml(
+            tmp.path(),
+            "config.toml",
+            r#"
+[tmux]
+split_percent = 0
+"#,
+        );
+        assert!(load_with_global(None, Some(&project)).is_err());
+    }
+
+    #[test]
+    fn split_percent_env_var_out_of_range_errors() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::set_var("AM_TMUX_SPLIT_PERCENT", "0");
+
+        let err = load_with_global(None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("AM_TMUX_SPLIT_PERCENT"),
+            "expected AM_TMUX_SPLIT_PERCENT error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn split_percent_env_var_over_max_errors() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::set_var("AM_TMUX_SPLIT_PERCENT", "100");
+
+        let err = load_with_global(None, None).unwrap_err();
+        assert!(err.to_string().contains("AM_TMUX_SPLIT_PERCENT"));
+    }
+
+    #[test]
+    fn split_percent_env_var_non_numeric_errors() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::set_var("AM_TMUX_SPLIT_PERCENT", "fifty");
+
+        let err = load_with_global(None, None).unwrap_err();
+        assert!(err.to_string().contains("AM_TMUX_SPLIT_PERCENT"));
+    }
+
+    #[test]
+    fn split_percent_env_var_valid_value_applied() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::set_var("AM_TMUX_SPLIT_PERCENT", "30");
+
+        let config = load_with_global(None, None).unwrap();
+        assert_eq!(config.tmux.split_percent, 30);
     }
 
     // ── validate_container_user ────────────────────────────────────────────────
