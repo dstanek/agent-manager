@@ -560,6 +560,7 @@ mod tests {
     #[test]
     fn defaults_when_no_config_files() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
         let nonexistent_global = tmp.path().join("global.toml");
@@ -591,6 +592,7 @@ mod tests {
     #[test]
     fn project_config_overrides_global() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
 
@@ -625,6 +627,7 @@ image = "project-image"
     #[test]
     fn project_config_inherits_unset_global_fields() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
 
@@ -681,9 +684,39 @@ image = "myimage"
     // Mutex to serialise all tests that mutate process-global env vars.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// RAII guard that saves the current value of env vars on construction and
+    /// restores them on drop. Prevents test pollution when a test panics or
+    /// fails an assertion before its manual `remove_var` calls.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        /// Save the current values of `keys` so they are restored on drop.
+        /// The caller is still responsible for calling `set_var`/`remove_var`
+        /// to establish the desired state; this guard only handles cleanup.
+        fn save(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|k| (*k, std::env::var_os(k)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     #[test]
     fn env_vars_override_project_config() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_IMAGE"]);
         let tmp = TempDir::new().unwrap();
 
         let project_path = write_toml(
@@ -701,9 +734,6 @@ image = "project-image"
         std::env::set_var("AM_CONTAINER_IMAGE", "env-image");
 
         let config = load_with_global(None, Some(&project_path)).unwrap();
-
-        std::env::remove_var("AM_AGENT");
-        std::env::remove_var("AM_CONTAINER_IMAGE");
 
         assert_eq!(config.agent.as_deref(), Some("codex"));
         assert_eq!(config.container.image.as_deref(), Some("env-image"));
@@ -743,6 +773,7 @@ image = "project-image"
     #[test]
     fn agent_image_overridden_in_project_config() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
 
@@ -774,6 +805,7 @@ image = "myorg/am-claude:custom"
     #[test]
     fn agent_images_merged_across_global_and_project() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
 
@@ -820,6 +852,7 @@ image = "myorg/am-claude:project"
     #[test]
     fn global_config_path_uses_xdg_config_home() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_CONFIG_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         let xdg_dir = tmp.path().join("xdg");
         std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
@@ -827,13 +860,12 @@ image = "myorg/am-claude:project"
 
         let path = global_config_path();
         assert_eq!(path, Some(xdg_dir.join("am").join("config.toml")));
-
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
     fn global_config_path_falls_back_to_home_dot_config() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_CONFIG_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_var("HOME", tmp.path());
@@ -843,8 +875,6 @@ image = "myorg/am-claude:project"
             path,
             Some(tmp.path().join(".config").join("am").join("config.toml"))
         );
-
-        std::env::remove_var("HOME");
     }
 
     // ── validate_env_passthrough ──────────────────────────────────────────────
@@ -926,11 +956,10 @@ user = "../root"
     #[test]
     fn env_var_can_override_container_user() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_USER"]);
         std::env::set_var("AM_CONTAINER_USER", "dev-user1");
 
         let config = load_with_global(None, None).unwrap();
-
-        std::env::remove_var("AM_CONTAINER_USER");
 
         assert_eq!(config.container.user, "dev-user1");
     }
@@ -938,11 +967,10 @@ user = "../root"
     #[test]
     fn load_with_global_errors_on_invalid_container_user_in_env() {
         let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_USER"]);
         std::env::set_var("AM_CONTAINER_USER", "../root");
 
         let err = load_with_global(None, None).unwrap_err();
-
-        std::env::remove_var("AM_CONTAINER_USER");
 
         assert!(err.to_string().contains("../root"));
     }
