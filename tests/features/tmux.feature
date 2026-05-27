@@ -43,3 +43,13 @@ Feature: am start and am attach with tmux
     And the output contains "Destroyed session 'my-feature'"
     And the mock tmux log contains "kill-window"
     And the mock tmux log contains "am-my-feature"
+
+  Scenario: attach to a container session with missing window suggests a clean restart
+    Given am init has been run
+    And I am using a mock container runtime
+    And a session "my-feature" has been started
+    And the tmux window no longer exists
+    When I run "am attach my-feature"
+    Then the command succeeds
+    And the output contains "am destroy"
+    And the output contains "am start"

@@ -10,6 +10,7 @@ mod worktree;
 use std::io::Write;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use clap::Parser;
 use cli::{Cli, Commands};
 
@@ -242,7 +243,10 @@ fn cmd_start(
             &cfg.tmux.split,
             new_pane_percent,
             split_shell_cmd,
-        )?;
+        )
+        .with_context(|| {
+            format!("tmux split failed — run 'am destroy --force {slug}' to clean up")
+        })?;
         if let Some(ref cmd) = container_shell_cmd {
             if split_shell_cmd.is_none() {
                 tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), cmd)?;
@@ -298,7 +302,7 @@ fn cmd_start(
                 let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
                 // exec() only returns on failure
                 return Err(error::AmError::ContainerError(format!(
-                    "failed to exec container: {err}"
+                    "failed to exec container: {err} — run 'am destroy --force {slug}' to clean up"
                 ))
                 .into());
             }
@@ -417,6 +421,10 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
         tmux::select_pane(&tmux::get_pane_id(&window_name, shell_pane_idx))?;
         tmux::select_window(&window_name)?;
         println!("Opened new window for session '{slug}'.");
+        if s.container.is_some() {
+            println!("  Note: the container was stopped when the window closed.");
+            println!("  To restart cleanly: am destroy --force {slug} && am start {slug}");
+        }
     } else {
         println!("Attached to session '{slug}'.");
     }
