@@ -556,10 +556,10 @@ fn shell_quote(s: &str) -> String {
 
 /// `tmux split-window [shell-command]` runs the command in the newly created pane.
 /// Only attach the container command there when the agent pane is that new pane.
-fn split_window_shell_cmd<'a>(
-    container_shell_cmd: Option<&'a str>,
+fn split_window_shell_cmd(
+    container_shell_cmd: Option<&str>,
     agent_pane_idx: usize,
-) -> Option<&'a str> {
+) -> Option<&str> {
     if agent_pane_idx == 1 {
         container_shell_cmd
     } else {

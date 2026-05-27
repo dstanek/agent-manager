@@ -26,3 +26,12 @@ Feature: container integration — session isolation with a container runtime
     And the mock podman log contains "stop"
     And the mock podman log contains "rm"
     And the session file does not contain "my-feature"
+
+  Scenario: destroy stops the container and kills the tmux window
+    Given a session "my-feature" has been started
+    When I run "am destroy --force my-feature"
+    Then the command succeeds
+    And the mock podman log contains "stop"
+    And the mock podman log contains "rm"
+    And the mock tmux log contains "kill-window"
+    And the session file does not contain "my-feature"

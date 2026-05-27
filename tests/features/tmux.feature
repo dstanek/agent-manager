@@ -35,3 +35,11 @@ Feature: am start and am attach with tmux
     And the output contains "Launched 'claude'"
     And the mock tmux log contains "send-keys"
     And the mock tmux log contains "claude"
+
+  Scenario: destroy kills the tmux window
+    Given a session "my-feature" has been started
+    When I run "am destroy --force my-feature"
+    Then the command succeeds
+    And the output contains "Destroyed session 'my-feature'"
+    And the mock tmux log contains "kill-window"
+    And the mock tmux log contains "am-my-feature"

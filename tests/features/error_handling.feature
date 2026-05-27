@@ -37,3 +37,10 @@ Feature: error handling — clear, early errors for invalid usage
     When I run "am run my-feature claude"
     Then the command fails
     And the output contains "tmux"
+
+  Scenario: run with an unknown session fails while inside tmux
+    Given a git repository
+    And I am inside a tmux session
+    When I run "am run no-such-session claude"
+    Then the command fails
+    And the output contains "not found"

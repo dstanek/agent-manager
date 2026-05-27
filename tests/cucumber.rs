@@ -26,6 +26,8 @@ pub struct AmWorld {
     /// When Some, the container runtime is mocked (+ log file).
     mock_podman_bin: Option<PathBuf>,
     mock_podman_log: Option<PathBuf>,
+    /// Extra environment variables injected into the next `run_am` call.
+    extra_env: Vec<(String, String)>,
 }
 
 impl Default for AmWorld {
@@ -37,6 +39,7 @@ impl Default for AmWorld {
             mock_tmux_log: None,
             mock_podman_bin: None,
             mock_podman_log: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -148,6 +151,11 @@ impl AmWorld {
         } else {
             cmd.env_remove("TMUX");
         }
+
+        for (k, v) in &self.extra_env.clone() {
+            cmd.env(k, v);
+        }
+        self.extra_env.clear();
 
         let output = cmd
             .output()
@@ -287,6 +295,22 @@ async fn when_run(world: &mut AmWorld, cmd: String) {
         Some(&"am") => &parts[1..],
         _ => &parts[..],
     };
+    world.run_am(args);
+}
+
+#[given(expr = "I have set env {string} to {string}")]
+async fn given_env_var(world: &mut AmWorld, key: String, value: String) {
+    world.extra_env.push((key, value));
+}
+
+#[when(expr = "I run {string} with env {string} = {string}")]
+async fn when_run_with_env(world: &mut AmWorld, cmd: String, key: String, value: String) {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let args: &[&str] = match parts.first() {
+        Some(&"am") => &parts[1..],
+        _ => &parts[..],
+    };
+    world.extra_env.push((key, value));
     world.run_am(args);
 }
 
