@@ -87,6 +87,8 @@ Use `am attach <slug>` to switch your tmux focus to an existing session's window
 
 If you run `am start` outside of tmux, the worktree and container are still created, but no window is opened. `am` prints the worktree path and the container run command so you can use them directly.
 
+For a complete reference of how tmux, container, and VCS interact across all combinations, see [Session lifecycle](guides/session-lifecycle.md).
+
 ---
 
 ## Container isolation
@@ -107,6 +109,8 @@ The container is launched interactively in the agent pane — you can see its ou
 Paths are mirrored from the host so that absolute paths inside the container resolve correctly. The container runs as the host user (matched uid/gid), so bind-mounted files are readable and writable without permission issues.
 
 Container isolation can be disabled per-session with `--no-container`, or turned off by default in config with `container.enabled = false`.
+
+Containers run with `--rm -it`: they are automatically removed when the tmux pane is closed or when the container's main process exits.
 
 ---
 
