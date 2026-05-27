@@ -228,20 +228,27 @@ fn cmd_start(
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
-        let container_shell_cmd = container_cmd
-            .as_ref()
-            .map(|cmd| cmd.iter().map(|s| shell_quote(s)).collect::<Vec<_>>().join(" "));
+        let container_shell_cmd = container_cmd.as_ref().map(|cmd| {
+            cmd.iter()
+                .map(|s| shell_quote(s))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        let split_shell_cmd =
+            split_window_shell_cmd(container_shell_cmd.as_deref(), agent_pane_idx);
         tmux::split_window(
             &window_name,
             &worktree_path,
             &cfg.tmux.split,
             new_pane_percent,
-            container_shell_cmd.as_deref(),
+            split_shell_cmd,
         )?;
-        if container_cmd.is_none() {
-            if let Some(ref agent) = effective_agent {
-                tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
+        if let Some(ref cmd) = container_shell_cmd {
+            if split_shell_cmd.is_none() {
+                tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), cmd)?;
             }
+        } else if let Some(ref agent) = effective_agent {
+            tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
         }
         // cd the shell pane into the worktree.
         tmux::send_keys(
@@ -547,6 +554,19 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// `tmux split-window [shell-command]` runs the command in the newly created pane.
+/// Only attach the container command there when the agent pane is that new pane.
+fn split_window_shell_cmd<'a>(
+    container_shell_cmd: Option<&'a str>,
+    agent_pane_idx: usize,
+) -> Option<&'a str> {
+    if agent_pane_idx == 1 {
+        container_shell_cmd
+    } else {
+        None
+    }
+}
+
 fn read_git_config(key: &str) -> Option<String> {
     std::process::Command::new("git")
         .args(["config", "--global", key])
@@ -576,5 +596,34 @@ fn find_repo_root() -> anyhow::Result<(PathBuf, config::Vcs)> {
             Some(parent) => dir = parent.to_path_buf(),
             None => return Err(error::AmError::NotInRepo.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shell_quote, split_window_shell_cmd};
+
+    #[test]
+    fn split_window_shell_cmd_used_when_agent_is_new_pane() {
+        assert_eq!(
+            split_window_shell_cmd(Some("podman run image"), 1),
+            Some("podman run image")
+        );
+    }
+
+    #[test]
+    fn split_window_shell_cmd_not_used_when_agent_is_original_pane() {
+        assert_eq!(split_window_shell_cmd(Some("podman run image"), 0), None);
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_leaves_safe_tokens_unquoted() {
+        assert_eq!(shell_quote("podman"), "podman");
+        assert_eq!(shell_quote("/tmp/foo:rw"), "/tmp/foo:rw");
     }
 }

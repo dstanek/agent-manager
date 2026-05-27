@@ -60,8 +60,7 @@ impl AmWorld {
         )
         .expect("write mock_tmux");
         #[cfg(unix)]
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-            .expect("chmod mock_tmux");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod mock_tmux");
         self.mock_tmux_bin = Some(bin);
         self.mock_tmux_log = Some(log);
     }
@@ -74,7 +73,10 @@ impl AmWorld {
         let log = self.project_dir.path().join("mock_tmux.log");
         // A flag file is created on the first select-window call; its presence
         // makes subsequent select-window calls succeed.
-        let flag = self.project_dir.path().join("mock_tmux_select_window_failed");
+        let flag = self
+            .project_dir
+            .path()
+            .join("mock_tmux_select_window_failed");
         let flag_str = flag.to_string_lossy().into_owned();
         fs::write(
             &bin,
@@ -92,8 +94,7 @@ impl AmWorld {
         )
         .expect("write mock_tmux");
         #[cfg(unix)]
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-            .expect("chmod mock_tmux");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod mock_tmux");
         self.mock_tmux_bin = Some(bin);
         self.mock_tmux_log = Some(log);
     }
@@ -112,8 +113,7 @@ impl AmWorld {
         )
         .expect("write mock_podman");
         #[cfg(unix)]
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-            .expect("chmod mock_podman");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod mock_podman");
         self.mock_podman_bin = Some(bin);
         self.mock_podman_log = Some(log);
     }
@@ -191,7 +191,9 @@ impl AmWorld {
     }
 
     fn last_output(&self) -> &Output {
-        self.last_output.as_ref().expect("no command has been run yet")
+        self.last_output
+            .as_ref()
+            .expect("no command has been run yet")
     }
 
     /// stdout + stderr concatenated for assertion convenience.
@@ -214,7 +216,10 @@ async fn given_git_repo(world: &mut AmWorld) {
     run_git(&["config", "user.email", "test@example.com"], &dir);
     run_git(&["config", "user.name", "Test"], &dir);
     // An initial commit is required so that `am start` can resolve HEAD.
-    run_git(&["commit", "--allow-empty", "-m", "chore: initial commit"], &dir);
+    run_git(
+        &["commit", "--allow-empty", "-m", "chore: initial commit"],
+        &dir,
+    );
 }
 
 #[given("a jj repository")]
@@ -336,7 +341,10 @@ async fn then_worktree_exists(world: &mut AmWorld, rel_path: String) {
 #[then(expr = "the worktree {string} does not exist")]
 async fn then_worktree_gone(world: &mut AmWorld, rel_path: String) {
     let path = world.project_path().join(&rel_path);
-    assert!(!path.exists(), "expected {path:?} to not exist, but it does");
+    assert!(
+        !path.exists(),
+        "expected {path:?} to not exist, but it does"
+    );
 }
 
 #[then(expr = "the session file contains {string}")]
@@ -372,8 +380,7 @@ async fn then_file_exists(world: &mut AmWorld, rel_path: String) {
 #[then(expr = "the file {string} contains {string}")]
 async fn then_file_contains(world: &mut AmWorld, rel_path: String, text: String) {
     let path = world.project_path().join(&rel_path);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("could not read {path:?}"));
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("could not read {path:?}"));
     assert!(
         content.contains(&text),
         "expected {path:?} to contain {text:?}\ngot:\n{content}",

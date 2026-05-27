@@ -711,11 +711,7 @@ image = "myimage"
         /// The caller is still responsible for calling `set_var`/`remove_var`
         /// to establish the desired state; this guard only handles cleanup.
         fn save(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|k| (*k, std::env::var_os(k)))
-                    .collect(),
-            )
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
         }
     }
 
