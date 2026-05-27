@@ -1,38 +1,20 @@
-FROM ubuntu:25.10
+FROM alpine:3.21
 
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN <<EOF
-set -e
-
-apt-get update && apt-get install -y \
+RUN apk add --no-cache \
+    bash \
     ca-certificates \
     curl \
-    git
-
-# Install GitHub CLI (gh) — needed for auth (gh auth login stores creds in ~/.config/gh)
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    > /etc/apt/sources.list.d/github-cli.list
-apt-get update && apt-get install -y gh
-
-# Install Node.js LTS via NodeSource (required for @github/copilot, needs Node 22+)
-curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-apt-get install -y nodejs
+    git \
+    github-cli \
+    nodejs \
+    npm
 
 # Install GitHub Copilot CLI
-npm install -g @github/copilot
-
-rm -rf /var/lib/apt/lists/*
-EOF
+RUN npm install -g @github/copilot
 
 # Create a non-root user so agents can run without elevated privileges
-# Ubuntu 25.10+ ships with an 'ubuntu' user at UID 1000; remove it and create 'am' instead
-RUN userdel -r ubuntu 2>/dev/null || true \
- && useradd -m -u 1000 -s /bin/bash am \
+RUN addgroup -g 1000 am \
+ && adduser -D -u 1000 -G am -s /bin/bash am \
  && mkdir -p /home/am/.config /workspace \
  && chown -R am:am /home/am/.config /workspace
 

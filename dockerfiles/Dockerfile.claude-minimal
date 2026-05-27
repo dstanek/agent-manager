@@ -1,18 +1,15 @@
-FROM ubuntu:25.10
+FROM alpine:3.21
 
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
+    bash \
     ca-certificates \
     curl \
     git \
- && rm -rf /var/lib/apt/lists/*
+    jujutsu
 
 # Create a non-root user so Claude Code can run with --dangerously-skip-permissions
-# Ubuntu 25.10+ ships with an 'ubuntu' user at UID 1000; remove it and create 'am' instead
-RUN userdel -r ubuntu 2>/dev/null || true \
- && useradd -m -u 1000 -s /bin/bash am \
+RUN addgroup -g 1000 am \
+ && adduser -D -u 1000 -G am -s /bin/bash am \
  && mkdir -p /home/am/.config /workspace \
  && chown -R am:am /home/am/.config /workspace
 
