@@ -40,3 +40,31 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  cross-build:
+    name: Release build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Linux is already build-checked by the `test` job. This job catches
+    # macOS/Windows-specific compile breakage on PRs instead of only at release
+    # time; the remaining targets are exercised by release.yml on v* tags.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (release, no packaging)
+        run: cargo build --release --target ${{ matrix.target }}

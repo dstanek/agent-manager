@@ -49,15 +49,13 @@ Two workflows exercise the build:
 
 - **`.github/workflows/ci.yml`** — on every push and pull request to `main`,
   runs `cargo clippy -- -D warnings`, `cargo build`, and `cargo test` on
-  `ubuntu-latest`.
+  `ubuntu-latest` (which build-checks Linux), plus a `cross-build` job that runs
+  `cargo build --release --target <triple>` (build-only, no packaging) for
+  `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`. This catches
+  macOS/Windows-specific compile breakage on the PR that introduces it rather
+  than only at release time; the remaining targets are exercised at tag time.
 - **`.github/workflows/release.yml`** — on every `v*` tag, runs
   `cargo build --release --target <triple>` across the full platform matrix
   above (Linux via `ubuntu-latest`/`ubuntu-24.04-arm`, macOS via
-  `macos-latest`, Windows via `windows-latest`), packages the artifacts, and
-  publishes them to the GitHub release.
-
-Because macOS and Windows binaries are cross-checked only when a release tag is
-pushed, a compile error specific to those platforms would not surface during a
-normal PR. If that becomes a concern, add the release build matrix to `ci.yml`
-as a build-only job (no packaging) so per-platform breakage is caught earlier —
-at the cost of extra macOS/Windows runner minutes on every PR.
+  `macos-latest`, Windows via `windows-latest`), then packages the artifacts
+  and publishes them to the GitHub release.
