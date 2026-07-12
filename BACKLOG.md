@@ -64,12 +64,12 @@ Write `README.md` at the repo root covering:
 
 ### Cross-platform build verification
 
-Verify `cargo build --release` produces a working binary on:
-- Linux x86_64
-- macOS arm64 (Apple Silicon)
-- macOS x86_64 (Intel)
-
-Document any platform-specific build requirements or CI configuration needed.
+**Done.** `cargo build --release` is confirmed working on Linux x86_64 (local build:
+`am --version` reports the crate version, all subcommands present). macOS arm64/x86_64 and
+Windows are built by the `release.yml` matrix on every `v*` tag. Requirements and CI coverage
+are documented in [`docs/reference/building.md`](docs/reference/building.md); the crate graph
+is pure Rust with no system-library dependencies, so a stock toolchain suffices on every
+platform.
 
 ---
 
