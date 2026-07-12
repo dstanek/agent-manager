@@ -1,7 +1,9 @@
 Feature: full session lifecycle
 
-  Scenario: start then list then destroy
+  Scenario: init then start then list then destroy
     Given a git repository
+    When I run "am init"
+    Then the command succeeds
     When I run "am start my-feature"
     Then the command succeeds
     When I run "am list"

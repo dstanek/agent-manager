@@ -8,7 +8,7 @@ pub enum AmError {
     #[error("not inside a tmux session (run inside tmux or use 'tmux new-session' first)")]
     NotInTmux,
 
-    #[error("slug '{0}' already exists — run 'am destroy {0}' first")]
+    #[error("slug '{0}' already exists — run 'am attach {0}' to resume it, or 'am destroy {0}' first")]
     SlugAlreadyExists(String),
 
     #[error("slug '{0}' not found — run 'am list' to see active sessions")]

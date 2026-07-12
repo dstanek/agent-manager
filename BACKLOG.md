@@ -40,7 +40,7 @@ Auth mount preset for Google Gemini CLI.
 
 ### Integration test: full flow
 
-Write an integration test that exercises `am init` → `am start` → `am list` → `am destroy` as a single end-to-end flow in a temp git repo, outside tmux with `--no-container`. Lives in `tests/`.
+**Done.** `tests/features/full_flow.feature` exercises `am init` → `am start` → `am list` → `am destroy` as a single end-to-end flow (plus a multi-session variant). The cucumber harness runs outside tmux with containers disabled by default.
 
 ### README
 
@@ -54,13 +54,13 @@ Write `README.md` at the repo root covering:
 
 ### Error message audit
 
-Review every user-facing error for clarity and actionability — each should tell the user what went wrong AND what to do next:
+**Done.** Every user-facing error in `src/error.rs` now states what went wrong and what to do next:
 
-- `ContainerImageNotConfigured` → suggest setting `container.image` in config
-- `ContainerRuntimeNotFound` → include Podman install URL
-- `SlugAlreadyExists` → suggest `am destroy <slug>` or `am attach <slug>`
-- `NotInTmux` → explain that the command requires an active tmux session
-- `SlugNotFound` → suggest `am list` to see valid slugs
+- `ContainerImageNotConfigured` → suggests setting an agent (`--agent`/`defaults.agent`) or `container.image`
+- `ContainerRuntimeNotFound` → includes Podman and Docker install URLs
+- `SlugAlreadyExists` → suggests `am attach <slug>` or `am destroy <slug>`
+- `NotInTmux` → explains the command must run inside tmux (`tmux new-session` first)
+- `SlugNotFound` → suggests `am list` to see valid slugs
 
 ### Cross-platform build verification
 
