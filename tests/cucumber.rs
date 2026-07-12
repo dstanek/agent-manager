@@ -356,6 +356,15 @@ async fn then_output_contains(world: &mut AmWorld, text: String) {
     );
 }
 
+#[then(expr = "the output does not contain {string}")]
+async fn then_output_not_contains(world: &mut AmWorld, text: String) {
+    let combined = world.combined_output();
+    assert!(
+        !combined.contains(&text),
+        "expected output to NOT contain {text:?}\ngot:\n{combined}",
+    );
+}
+
 #[then(expr = "a worktree exists at {string}")]
 async fn then_worktree_exists(world: &mut AmWorld, rel_path: String) {
     let path = world.project_path().join(&rel_path);

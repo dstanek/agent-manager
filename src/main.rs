@@ -3,6 +3,7 @@ mod command;
 mod config;
 mod container;
 mod error;
+mod messages;
 mod session;
 mod tmux;
 mod worktree;
@@ -24,6 +25,9 @@ fn main() {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
+    // Choose context-appropriate wording once, up front, based on tmux state.
+    let msgs = messages::Messages::from_env();
+
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Start {
@@ -35,7 +39,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::List => cmd_list(),
         Commands::Attach { slug } => cmd_attach(&slug),
         Commands::Run { slug, agent } => cmd_run(&slug, &agent),
-        Commands::Destroy { slug, force } => cmd_destroy(&slug, force),
+        Commands::Destroy { slug, force } => cmd_destroy(&slug, force, &msgs),
         Commands::GenerateConfig => cmd_generate_config(),
     }
 }
@@ -452,7 +456,7 @@ fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
 
 // ── am destroy ───────────────────────────────────────────────────────────────
 
-fn cmd_destroy(slug: &str, force: bool) -> anyhow::Result<()> {
+fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Result<()> {
     let (repo_root, vcs) = find_repo_root()?;
     let sessions = session::load_sessions(&repo_root)?;
 
@@ -468,7 +472,7 @@ fn cmd_destroy(slug: &str, force: bool) -> anyhow::Result<()> {
                 "\x1b[31mWarning: the worktree has uncommitted changes that will be lost.\x1b[0m"
             );
         }
-        print!("Remove worktree and kill tmux window for '{slug}'? [y/N] ");
+        print!("{}", msgs.destroy_confirm(slug));
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;

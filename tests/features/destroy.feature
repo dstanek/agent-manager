@@ -30,3 +30,18 @@ Feature: am destroy — remove a session and its worktree
     Then the command succeeds
     And the worktree ".am/worktrees/my-feature" does not exist
     And the session file does not contain "my-feature"
+
+  Scenario: destroy prompt omits tmux wording when not inside tmux
+    Given a session "my-feature" has been started
+    When I run "am destroy my-feature" with input "n"
+    Then the command succeeds
+    And the output contains "Remove worktree for 'my-feature'"
+    And the output does not contain "window"
+    And the output does not contain "pane"
+
+  Scenario: destroy prompt mentions the tmux window when inside tmux
+    Given I am inside a tmux session
+    And a session "my-feature" has been started
+    When I run "am destroy my-feature" with input "n"
+    Then the command succeeds
+    And the output contains "kill tmux window"
