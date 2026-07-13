@@ -4,11 +4,11 @@ Feature: am start and am attach with tmux
     Given a git repository
     And I am inside a tmux session
 
-  Scenario: start renames the current window and splits it
+  Scenario: start creates a dedicated window and splits it
     When I run "am start my-feature"
     Then the command succeeds
     And the output contains "Started session 'my-feature'"
-    And the mock tmux log contains "rename-window"
+    And the mock tmux log contains "new-window"
     And the mock tmux log contains "am-my-feature"
     And the mock tmux log contains "split-window"
 

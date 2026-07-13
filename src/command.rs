@@ -42,7 +42,8 @@ where
 
 /// Execute a pre-built `Command` and return stdout.
 ///
-/// Prefer this over `run_command_output` when arguments include `Path`s.
+/// Building the `Command` yourself keeps `Path`/`OsStr` arguments intact instead
+/// of forcing an early lossy conversion to `&str`.
 pub fn run_built_command_output<E>(
     mut cmd: std::process::Command,
     error_fn: impl Fn(String) -> E,
@@ -74,27 +75,6 @@ where
     Ok(())
 }
 
-/// Execute a command and return stdout.
-///
-/// The `error_fn` closure is called to construct an error if the command
-/// fails or produces output that can't be converted to UTF-8, allowing each
-/// caller to produce their own error type.
-pub fn run_command_output<E>(
-    bin: &str,
-    args: &[&str],
-    error_fn: impl Fn(String) -> E,
-) -> Result<String>
-where
-    E: Error + Send + Sync + 'static,
-{
-    let output = std::process::Command::new(bin)
-        .args(args)
-        .output()
-        .map_err(|e| error_fn(format!("failed to run {bin}: {e}")))?;
-    let stdout = check_output(bin, output, error_fn)?;
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,19 +103,6 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("status"));
-    }
-
-    #[test]
-    fn run_command_output_success() {
-        let result = run_command_output("echo", &["hello"], |msg| TestError(msg));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "hello");
-    }
-
-    #[test]
-    fn run_command_output_failure() {
-        let result = run_command_output("false", &[], |msg| TestError(msg));
-        assert!(result.is_err());
     }
 
     #[test]

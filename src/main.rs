@@ -225,11 +225,11 @@ fn cmd_start(
         config::PaneSide::Left => (0usize, 1usize, 100 - cfg.tmux.split_percent),
     };
 
-    let (original_window_name, original_shell_dir) = if tmux::is_in_tmux() {
-        // Capture the current window name and pane path before we rename/split.
-        let orig_window = tmux::current_window_name().ok().filter(|s| !s.is_empty());
-        let orig_dir = tmux::current_pane_path().ok();
-        tmux::rename_window(None, &window_name)
+    if tmux::is_in_tmux() {
+        // Create a dedicated window for the session instead of commandeering the
+        // caller's current window. `new-window` opens both panes in the worktree
+        // and switches focus to the new window automatically.
+        tmux::create_window(&window_name, &worktree_path)
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
@@ -258,20 +258,12 @@ fn cmd_start(
         } else if let Some(ref agent) = effective_agent {
             tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
         }
-        // cd the shell pane into the worktree.
-        tmux::send_keys(
-            &tmux::get_pane_id(&window_name, shell_pane_idx),
-            &cd_cmd(&worktree_path),
-        )?;
-        // Keep focus on the shell pane.
+        // Both panes already open in the worktree (via `new-window -c`), so no cd
+        // is needed. Keep focus on the shell pane.
         tmux::select_pane(&tmux::get_pane_id(&window_name, shell_pane_idx))?;
-        (orig_window, orig_dir)
-    } else {
-        if container_cmd.is_none() {
-            println!("Note: not inside tmux — no window opened. Run 'am attach {slug}' from inside tmux to open one.");
-        }
-        (None, None)
-    };
+    } else if container_cmd.is_none() {
+        println!("Note: not inside tmux — no window opened. Run 'am attach {slug}' from inside tmux to open one.");
+    }
 
     let new_session = session::Session {
         slug: slug.to_string(),
@@ -285,8 +277,11 @@ fn cmd_start(
             tmux_window: window_name,
             agent_pane: tmux::get_pane_id(&format!("am-{slug}"), agent_pane_idx),
             shell_pane: tmux::get_pane_id(&format!("am-{slug}"), shell_pane_idx),
-            original_window_name,
-            original_shell_dir,
+            // Sessions now own a dedicated window; there is no prior window state
+            // to restore on destroy. These remain for compatibility with records
+            // written by older versions of `am`.
+            original_window_name: None,
+            original_shell_dir: None,
         },
         container: session_container,
     };

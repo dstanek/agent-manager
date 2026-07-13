@@ -37,10 +37,6 @@ fn run_tmux(bin: &Path, args: &[&str]) -> Result<()> {
     command::run_command(&bin.to_string_lossy(), args, AmError::TmuxError)
 }
 
-fn run_tmux_output(bin: &Path, args: &[&str]) -> Result<String> {
-    command::run_command_output(&bin.to_string_lossy(), args, AmError::TmuxError)
-}
-
 /// Returns `true` if the `$TMUX` environment variable is set (i.e. we are
 /// running inside a tmux session).
 pub fn is_in_tmux() -> bool {
@@ -131,21 +127,6 @@ pub fn kill_window(window_name: &str) -> Result<()> {
 pub fn kill_pane(target: &str) -> Result<()> {
     let bin = tmux_bin()?;
     run_tmux(&bin, &["kill-pane", "-t", target])
-}
-
-/// Returns the name of the current tmux window.
-/// `tmux display-message -p '#W'`
-pub fn current_window_name() -> Result<String> {
-    let bin = tmux_bin()?;
-    run_tmux_output(&bin, &["display-message", "-p", "#W"])
-}
-
-/// Returns the working directory of the current tmux pane.
-/// `tmux display-message -p '#{pane_current_path}'`
-pub fn current_pane_path() -> Result<std::path::PathBuf> {
-    let bin = tmux_bin()?;
-    let s = run_tmux_output(&bin, &["display-message", "-p", "#{pane_current_path}"])?;
-    Ok(std::path::PathBuf::from(s))
 }
 
 /// Rename a tmux window.
@@ -372,25 +353,6 @@ mod tests {
         let out = mock.captured();
         assert!(out.contains("kill-pane"));
         assert!(out.contains("am-feat.1"));
-    }
-
-    #[test]
-    fn current_window_name_sends_display_message() {
-        let mock = MockTmux::new();
-        // mock tmux doesn't emit stdout, so we just verify the right command is issued
-        let _ = current_window_name();
-        let out = mock.captured();
-        assert!(out.contains("display-message"));
-        assert!(out.contains("#W"));
-    }
-
-    #[test]
-    fn current_pane_path_sends_display_message() {
-        let mock = MockTmux::new();
-        let _ = current_pane_path();
-        let out = mock.captured();
-        assert!(out.contains("display-message"));
-        assert!(out.contains("pane_current_path"));
     }
 
     #[test]

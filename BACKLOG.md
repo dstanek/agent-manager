@@ -139,13 +139,14 @@ window still exists, and stale/broken markers.
       go" phrasing on primary surfaces until the core UX earns it. (README
       already lists prerequisites honestly; audit the docs site for the same.)
 
-### Open for discussion (not yet actioned)
+### Done
 
-- **tmux window model.** `am start` inside tmux renames the *current* window in
-  place (`rename_window(None, …)`) and splits it, restoring the original name on
-  destroy. This is surprising — a dedicated new window would be clearer — but the
-  change touches the `original_window_name` restore logic. Confirm intent before
-  changing.
+- **tmux window model.** `am start` inside tmux now creates a *dedicated* window
+  (`new-window`) instead of renaming/splitting the caller's current window. This
+  matches what the docs already described and makes start/attach symmetric.
+  `destroy` kills the window outright; the `original_window_name` /
+  `original_shell_dir` restore machinery is retained only to read session records
+  written by older versions.
 
 ---
 
