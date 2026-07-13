@@ -87,6 +87,68 @@ Commands currently emit tmux-specific language (e.g. "kill tmux window") even wh
 
 ---
 
+## Architecture Audit Follow-ups
+
+Actioned items from the 2026-07-12 architecture/usability audit. These are the
+recommendations we *agreed* with; the "get back to basics" theme here means
+**decoupling overloaded concepts**, not dropping the tmux/container/jj matrix
+(that composition is the product's edge and stays first-class).
+
+### Decouple command, integration, and image (highest priority)
+
+Today a single `--agent` string means three things at once: the command that
+launches (`main.rs` appends it as the container CMD), the auth preset
+(`container.rs::resolve_agent_auth`), and the image (`config::resolve_image` via
+`[agents.<name>]`). `KnownAgent::parse` rejects any name outside
+`claude|copilot|gemini|codex` — even with `--no-container` — so there is no path
+to "run this image, mount these creds, exec this command."
+
+- [ ] Introduce independent concepts: **command** (what to exec), **integration**
+      (which auth preset, if any), **image/profile** (runtime environment).
+- [ ] Keep the current `--agent claude` shorthand as a preset that expands into
+      the three, so nothing breaks for existing users.
+- [ ] Make integration optional: an unknown/custom command with no preset should
+      be allowed (this is what makes the tool genuinely "harness-agnostic").
+
+### Custom-harness fast path
+
+Deliver the mission promise ("quickly manage isolated AI harnesses") for
+arbitrary tools, e.g. `am start idea --image my-image --cmd my-agent` with no
+built-in integration required. Depends on the decoupling above.
+
+### `am doctor` readiness check
+
+Add a command that reports what's present/missing for a first successful
+`am start`: repo + VCS, `.am/` initialized, container runtime, an available
+image, tmux, and (per selected integration) required credentials/paths. Reuses
+the existing preflight checks in `container.rs`. Preferred over silently
+auto-bootstrapping `.am/` on `am start`.
+
+### Session observability in `am list`
+
+Session state is currently storage-oriented (enough for teardown/navigation).
+Make `am list` operator-oriented by surfacing higher-level state: which
+integration/command is active, whether the container is alive, whether the tmux
+window still exists, and stale/broken markers.
+
+### Docs: separate the fast path from the custom path; tone down future features
+
+- [ ] Split docs into a **fast supported-integration path** and an
+      **advanced/custom-harness path** so the two stories stop blurring.
+- [ ] De-emphasize future `--team`/autonomous language and "everything ready to
+      go" phrasing on primary surfaces until the core UX earns it. (README
+      already lists prerequisites honestly; audit the docs site for the same.)
+
+### Open for discussion (not yet actioned)
+
+- **tmux window model.** `am start` inside tmux renames the *current* window in
+  place (`rename_window(None, …)`) and splits it, restoring the original name on
+  destroy. This is surprising — a dedicated new window would be clearer — but the
+  change touches the `original_window_name` restore logic. Confirm intent before
+  changing.
+
+---
+
 ## Future (v2)
 
 ### Autonomous mode (`--auto` flag)
