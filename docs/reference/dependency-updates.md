@@ -24,10 +24,11 @@ so a config change takes effect immediately instead of a week later.
 |---|---|---|
 | `cargo` | `Cargo.toml`, `Cargo.lock` | Non-major bumps are grouped into one PR; majors are separate |
 | `github-actions` | `.github/workflows/*.yml` | All actions grouped into one PR |
-| `dockerfile` | `dockerfiles/`, `examples/`, `.devcontainer/Dockerfile` | `FROM` base images; non-majors grouped |
+| `dockerfile` | `dockerfiles/`, `examples/`, `.devcontainer/Dockerfile` | `FROM` base images; non-majors grouped. Ubuntu uses `ubuntu` versioning restricted to `YY.MM`, or its dated rebuild tags (`questing-20260610`) parse as newer than `25.10` |
 | `devcontainer` | `.devcontainer/devcontainer.json` | Feature versions (`ghcr.io/devcontainers/features/*`) |
 | `pip_requirements` | `requirements-docs.txt` | `rangeStrategy: bump`, so the `>=` floors actually move |
 | `custom.regex` | Any `Dockerfile*` | Versions in `ARG`/`ENV` lines carrying a `# renovate:` annotation |
+| `custom.regex` | `.devcontainer/devcontainer.json` | Versions passed as feature *options*, carrying a `// renovate:` annotation |
 
 Lock file maintenance is enabled, so `Cargo.lock` gets a periodic refresh of
 transitive crates instead of only moving when a direct dependency happens to be
@@ -59,6 +60,23 @@ Two versions are annotated this way today:
   developed and tested against
 - `GO_VERSION` in `examples/Dockerfile.golang`
 
+A second custom manager does the same for devcontainer **feature options**. The
+`devcontainer` manager updates the feature reference (`node:1`) but never looks
+inside the option object passed to it, so the Node line needs its own
+annotation — with `//` comments, since `devcontainer.json` is JSONC:
+
+```jsonc
+"ghcr.io/devcontainers/features/node:1": {
+  // renovate: datasource=node-version depName=node versioning=node
+  "version": "22"
+}
+```
+
+`node` versioning reads a bare major as a range, so Renovate rewrites this to
+`"24"` rather than pinning `"24.19.0"` — the feature keeps resolving the latest
+patch itself. That shape is preserved by the versioning scheme, not by a
+`rangeStrategy` setting; setting one here has no effect.
+
 ## What is deliberately not managed
 
 Some versions have nothing for Renovate to bump, because nothing is pinned:
@@ -73,18 +91,31 @@ Some versions have nothing for Renovate to bump, because nothing is pinned:
 - **Distro packages** (`apt-get install`, `apk add`) follow whatever the base
   image's package index offers.
 
-Two more are pinned but intentionally manual:
-
-- **The Node major in `.devcontainer/devcontainer.json`** (`"version": "22"` on
-  the Node feature). Renovate manages the *feature* version, not the option
-  passed to it; managing the option would replace the coarse major with a hard
-  patch pin and lose "latest 22.x". Bump it by hand.
-- **`.devcontainer/devcontainer-lock.json`** is not updated by the `devcontainer`
-  manager. Re-resolve it with the Dev Containers CLI after changing a feature.
+One thing is still manual: **`.devcontainer/devcontainer-lock.json`** is not
+updated by the `devcontainer` manager. Re-resolve it with the Dev Containers CLI
+after changing a feature.
 
 `tests/fixtures/**` is in `ignorePaths` — the devcontainer configs there are
 recorded test inputs and expected CLI output, so bumping a version in them
 changes what the suite asserts rather than what ships.
+
+## What checks a dependency PR
+
+`ci.yml` covers `src/**`, `tests/**`, and the Cargo manifests, so it gates crate
+bumps and lock file maintenance.
+
+Everything else is gated by
+[`images-ci.yml`](https://github.com/dstanek/agent-manager/blob/main/.github/workflows/images-ci.yml),
+which builds each Dockerfile — amd64 only, never pushed — plus the dev container
+via the Dev Containers CLI, the same path `am` takes in devcontainer mode. That
+is what verifies a base image bump, `JJ_VERSION`, `GO_VERSION`, and the docs
+requirements. It lives in its own workflow because GitHub path filters are
+workflow-level: widening `ci.yml`'s filter would spend a macOS and a Windows
+runner cross-building Rust that a Dockerfile change cannot affect.
+
+`dockerfiles/Dockerfile.am-dev` is not built there. It starts `FROM
+am-rust:latest`, a tag only `make build-am-dev` produces, and `.devcontainer/`
+has replaced it for development.
 
 ## Setup
 
