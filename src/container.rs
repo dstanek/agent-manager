@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::command::shell_quote;
 use crate::config::{NetworkMode, RuntimePreference, Vcs};
 use crate::error::AmError;
 
@@ -102,7 +103,55 @@ pub struct ContainerMounts {
     pub gitconfig_host: PathBuf,             // .am/gitconfig (or override)
     pub ssh_host: PathBuf,                   // ~/.ssh
     pub agent_auth: Vec<AgentAuthMount>,
-    pub container_user: String, // username inside the container
+    /// Home directory inside the container. Derived from the configured container user
+    /// unless a devcontainer's `remoteUser` or an explicit override says otherwise.
+    /// Everything user-dependent resolves through this, so the username itself is not
+    /// carried any further.
+    pub container_home: String,
+}
+
+/// Derive the home directory for a user inside a container.
+///
+/// `root` is the case worth special-casing: devcontainer images frequently run as root,
+/// and `/home/root` does not exist, so credential mounts would land somewhere the agent
+/// never looks.
+pub fn container_home(user: &str, override_home: Option<&Path>) -> String {
+    if let Some(path) = override_home {
+        return path.to_string_lossy().into_owned();
+    }
+    if user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{user}")
+    }
+}
+
+/// Runtime settings contributed by a devcontainer config.
+///
+/// Everything here has already passed the trust gate — `build_run_command` applies what it
+/// is given and does not second-guess it, so the decision about escalating options lives in
+/// exactly one place rather than being spread across the command builder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DevcontainerRuntime {
+    /// `containerEnv` and `remoteEnv`, already merged and substituted.
+    pub env: Vec<(String, String)>,
+    pub mounts: Vec<crate::devcontainer::NormalizedMount>,
+    pub init: bool,
+    pub privileged: bool,
+    pub cap_add: Vec<String>,
+    pub security_opt: Vec<String>,
+    /// Raw runtime flags from `runArgs`.
+    pub run_args: Vec<String>,
+    /// `workspaceFolder`, overriding the mirrored host path as the working directory.
+    pub workdir: Option<String>,
+    /// Feature entrypoint scripts, composed ahead of the agent command.
+    pub entrypoints: Vec<String>,
+    /// The user to run as, from `remoteUser`/`containerUser`.
+    ///
+    /// Without this the container runs as the image's default user — root for most
+    /// devcontainer images — and `$HOME` is `/root`, so the credentials `am` mounts at
+    /// the `remoteUser`'s home are invisible to the agent.
+    pub user: Option<String>,
 }
 
 // ── Runtime detection ─────────────────────────────────────────────────────────
@@ -175,6 +224,7 @@ fn home_dir() -> Result<PathBuf> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_mounts(
     slug: &str,
     repo_root: &Path,
@@ -183,6 +233,7 @@ pub fn resolve_mounts(
     gitconfig: Option<&Path>,
     ssh: Option<&Path>,
     container_user: &str,
+    home_override: Option<&Path>,
 ) -> Result<ContainerMounts> {
     let home = home_dir()?;
     let worktree_host = repo_root.join(".am").join("worktrees").join(slug);
@@ -216,18 +267,22 @@ pub fn resolve_mounts(
         gitconfig_host,
         ssh_host,
         agent_auth,
-        container_user: container_user.to_string(),
+        container_home: container_home(container_user, home_override),
     })
 }
 
+/// Where each agent keeps its credentials inside the container.
+///
+/// `home_in_container` is passed in rather than derived from the username: a devcontainer's
+/// `remoteUser` may be `root` (home `/root`, not `/home/root`), and mounting credentials at
+/// a path the agent never reads fails silently at the worst moment.
 fn resolve_agent_auth_mounts(
     agent: KnownAgent,
-    container_user: &str,
+    home_in_container: &str,
 ) -> Result<Vec<AgentAuthMount>> {
     Ok(match agent {
         KnownAgent::Claude => {
             let home = home_dir()?;
-            let home_in_container = format!("/home/{container_user}");
             // Config dir: use CLAUDE_CONFIG_DIR if set, otherwise ~/.claude
             let config_host = std::env::var("CLAUDE_CONFIG_DIR")
                 .map(PathBuf::from)
@@ -247,7 +302,6 @@ fn resolve_agent_auth_mounts(
         }
         KnownAgent::Copilot => {
             let home = home_dir()?;
-            let home_in_container = format!("/home/{container_user}");
             vec![
                 AgentAuthMount {
                     // GitHub CLI auth token (required for Copilot authentication)
@@ -266,7 +320,6 @@ fn resolve_agent_auth_mounts(
         }
         KnownAgent::Gemini => {
             let home = home_dir()?;
-            let home_in_container = format!("/home/{container_user}");
             vec![AgentAuthMount {
                 host_path: home.join(".gemini"),
                 container_path: PathBuf::from(format!("{home_in_container}/.gemini")),
@@ -336,10 +389,10 @@ fn ensure_required_paths(agent: KnownAgent, required: &[PathBuf]) -> Result<()> 
     Ok(())
 }
 
-fn resolve_agent_auth(agent: KnownAgent, container_user: &str) -> Result<AgentAuth> {
+fn resolve_agent_auth(agent: KnownAgent, home_in_container: &str) -> Result<AgentAuth> {
     match agent {
         KnownAgent::Claude => {
-            let mounts = resolve_agent_auth_mounts(agent, container_user)?;
+            let mounts = resolve_agent_auth_mounts(agent, home_in_container)?;
             let required = mounts
                 .first()
                 .map(|mount| vec![mount.host_path.clone()])
@@ -351,7 +404,7 @@ fn resolve_agent_auth(agent: KnownAgent, container_user: &str) -> Result<AgentAu
             })
         }
         KnownAgent::Copilot => {
-            let mounts = resolve_agent_auth_mounts(agent, container_user)?;
+            let mounts = resolve_agent_auth_mounts(agent, home_in_container)?;
             let required = mounts
                 .iter()
                 .find(|mount| mount.host_path.ends_with(Path::new(".config/gh")))
@@ -365,7 +418,7 @@ fn resolve_agent_auth(agent: KnownAgent, container_user: &str) -> Result<AgentAu
             })
         }
         KnownAgent::Gemini => {
-            let mounts = resolve_agent_auth_mounts(agent, container_user)?;
+            let mounts = resolve_agent_auth_mounts(agent, home_in_container)?;
             let required = mounts
                 .first()
                 .map(|mount| vec![mount.host_path.clone()])
@@ -389,8 +442,34 @@ fn resolve_agent_auth(agent: KnownAgent, container_user: &str) -> Result<AgentAu
 /// Resolve and validate a known agent's authentication requirements before the
 /// container is launched. This performs all preflight checks and returns the
 /// mounts and environment variables needed for the actual runtime command.
-pub fn preflight_agent_auth(agent: KnownAgent, container_user: &str) -> Result<AgentAuth> {
-    resolve_agent_auth(agent, container_user)
+pub fn preflight_agent_auth(agent: KnownAgent, home_in_container: &str) -> Result<AgentAuth> {
+    resolve_agent_auth(agent, home_in_container)
+}
+
+/// Check that an agent's credentials exist on the host, without deciding where they will
+/// be mounted.
+///
+/// This exists so credential problems surface *before* `am start` creates a worktree. The
+/// mount targets cannot be known that early in devcontainer mode — they depend on the
+/// `remoteUser` recorded in an image that has not been built yet — but whether the user is
+/// logged in does not depend on any of that.
+pub fn validate_agent_credentials(agent: KnownAgent) -> Result<()> {
+    match agent {
+        KnownAgent::Claude => {
+            let config_host = std::env::var("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home_dir().unwrap_or_default().join(".claude"));
+            ensure_required_paths(agent, &[config_host])
+        }
+        KnownAgent::Copilot => {
+            ensure_required_paths(agent, &[home_dir()?.join(".config").join("gh")])
+        }
+        KnownAgent::Gemini => ensure_required_paths(agent, &[home_dir()?.join(".gemini")]),
+        KnownAgent::Codex => {
+            required_env_var(agent, "OPENAI_API_KEY", "sk-...")?;
+            Ok(())
+        }
+    }
 }
 
 // ── Command building ──────────────────────────────────────────────────────────
@@ -410,6 +489,7 @@ fn get_host_uid_gid() -> Option<(u32, u32)> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_run_command(
     runtime: &ContainerRuntime,
     image: &str,
@@ -418,8 +498,9 @@ pub fn build_run_command(
     extra_env: &[(String, String)],
     network: &NetworkMode,
     container_name: &str,
+    dc: &DevcontainerRuntime,
 ) -> Vec<String> {
-    let container_user = &mounts.container_user;
+    let home = &mounts.container_home;
     let selinux = use_selinux_labels(runtime);
     let mut cmd = vec![
         runtime.bin.to_string_lossy().into_owned(),
@@ -437,10 +518,22 @@ pub fn build_run_command(
                 cmd.push(format!("--userns=keep-id:uid={uid},gid={gid}"));
             }
             RuntimeKind::Docker => {
-                cmd.push("--user".to_string());
-                cmd.push(format!("{uid}:{gid}"));
+                // A named devcontainer user takes precedence over the numeric mapping;
+                // devcontainer images give that user uid 1000, which is the same mapping
+                // by another name.
+                if dc.user.is_none() {
+                    cmd.push("--user".to_string());
+                    cmd.push(format!("{uid}:{gid}"));
+                }
             }
         }
+    }
+
+    // Run as the devcontainer's remoteUser rather than the image's default (usually root),
+    // so $HOME matches where the credential mounts land.
+    if let Some(ref user) = dc.user {
+        cmd.push("--user".to_string());
+        cmd.push(user.clone());
     }
 
     // Worktree mount — same path inside the container as on the host
@@ -477,7 +570,7 @@ pub fn build_run_command(
         cmd.push("-v".to_string());
         cmd.push(mount_str(
             &mounts.gitconfig_host,
-            &format!("/home/{container_user}/.gitconfig"),
+            &format!("{home}/.gitconfig"),
             MountMode::ReadOnly,
             selinux,
         ));
@@ -488,7 +581,7 @@ pub fn build_run_command(
         cmd.push("-v".to_string());
         cmd.push(mount_str(
             &mounts.ssh_host,
-            &format!("/home/{container_user}/.ssh"),
+            &format!("{home}/.ssh"),
             MountMode::ReadOnly,
             selinux,
         ));
@@ -507,8 +600,38 @@ pub fn build_run_command(
         }
     }
 
+    // Devcontainer mounts. These come from the repo's config and its Features, so they
+    // are labelled for SELinux like am's own mounts rather than passed through raw.
+    for mount in &dc.mounts {
+        let Some(ref source) = mount.source else {
+            // A bind with no source is meaningless and a volume with no name is
+            // anonymous — neither is worth guessing at.
+            continue;
+        };
+        let mode = if mount.read_only {
+            MountMode::ReadOnly
+        } else {
+            MountMode::ReadWrite
+        };
+        cmd.push("-v".to_string());
+        // Only bind mounts name a host path; volumes name a runtime-managed volume and
+        // must not be relabelled.
+        if mount.kind == "bind" {
+            cmd.push(mount_str(Path::new(source), &mount.target, mode, selinux));
+        } else {
+            let mode_str = if mount.read_only { "ro" } else { "rw" };
+            cmd.push(format!("{source}:{}:{mode_str}", mount.target));
+        }
+    }
+
     // Extra env vars (e.g. agent-specific tokens)
     for (key, val) in extra_env {
+        cmd.push("-e".to_string());
+        cmd.push(format!("{key}={val}"));
+    }
+
+    // Devcontainer containerEnv/remoteEnv
+    for (key, val) in &dc.env {
         cmd.push("-e".to_string());
         cmd.push(format!("{key}={val}"));
     }
@@ -519,19 +642,66 @@ pub fn build_run_command(
         cmd.push(var.clone());
     }
 
-    // Network
+    // Escalating options from the devcontainer config. These have already passed the
+    // trust gate; anything the user declined was dropped before we got here.
+    if dc.init {
+        cmd.push("--init".to_string());
+    }
+    if dc.privileged {
+        cmd.push("--privileged".to_string());
+    }
+    for cap in &dc.cap_add {
+        cmd.push("--cap-add".to_string());
+        cmd.push(cap.clone());
+    }
+    for opt in &dc.security_opt {
+        cmd.push("--security-opt".to_string());
+        cmd.push(opt.clone());
+    }
+
+    // Network. Applied after runArgs would be, so am's own setting stays authoritative
+    // over a config that tries to widen it.
+    cmd.extend(dc.run_args.iter().cloned());
     if matches!(network, NetworkMode::None) {
         cmd.push("--network".to_string());
         cmd.push("none".to_string());
     }
 
-    // Working directory — same as worktree host path
+    // Working directory — the worktree's host path, unless the config names another.
     cmd.push("--workdir".to_string());
-    cmd.push(mounts.worktree_host.to_string_lossy().into_owned());
+    cmd.push(match dc.workdir {
+        Some(ref dir) => dir.clone(),
+        None => mounts.worktree_host.to_string_lossy().into_owned(),
+    });
 
     cmd.push(image.to_string());
     cmd
 }
+
+/// Compose feature entrypoints and the agent into a single container command.
+///
+/// Features contribute entrypoint scripts that must run before the agent — starting a
+/// docker daemon, an SSH server. `am` overrides the image's `ENTRYPOINT` to launch the
+/// agent, so those scripts have to be chained explicitly or they never run at all.
+///
+/// `exec` on the last element matters: it makes the agent PID 1's direct child, so signals
+/// and exit codes propagate instead of being swallowed by an intermediate shell.
+pub fn compose_entrypoint_command(entrypoints: &[String], agent_cmd: &[String]) -> Vec<String> {
+    if entrypoints.is_empty() {
+        return agent_cmd.to_vec();
+    }
+    let mut script = entrypoints.join(" && ");
+    if !agent_cmd.is_empty() {
+        let quoted = agent_cmd
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        script.push_str(&format!(" && exec {quoted}"));
+    }
+    vec!["sh".to_string(), "-c".to_string(), script]
+}
+
 
 // ── Container lifecycle ───────────────────────────────────────────────────────
 
@@ -645,7 +815,7 @@ mod tests {
             gitconfig_host: tmp.join(".gitconfig"),
             ssh_host: tmp.join(".ssh"),
             agent_auth: vec![],
-            container_user: "am".to_string(),
+            container_home: "/home/am".to_string(),
         }
     }
 
@@ -740,7 +910,7 @@ mod tests {
 
         let repo_root = tmp.path().join("repo");
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Git, vec![], None, None, "am").unwrap();
+            resolve_mounts("feat", &repo_root, &Vcs::Git, vec![], None, None, "am", None).unwrap();
 
         assert_eq!(mounts.worktree_host, repo_root.join(".am/worktrees/feat"));
         assert_eq!(mounts.vcs_host, repo_root.join(".git"));
@@ -760,7 +930,7 @@ mod tests {
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(repo_root.join(".git")).unwrap();
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am").unwrap();
+            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am", None).unwrap();
 
         assert_eq!(mounts.colocated_git_host, Some(repo_root.join(".git")));
 
@@ -775,7 +945,7 @@ mod tests {
 
         let repo_root = tmp.path().join("repo");
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am").unwrap();
+            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am", None).unwrap();
 
         assert_eq!(mounts.colocated_git_host, None);
 
@@ -798,6 +968,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(
@@ -814,7 +985,7 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::fs::create_dir(tmp.path().join(".claude")).unwrap();
 
-        let agent_auth = preflight_agent_auth(KnownAgent::Claude, "am").unwrap();
+        let agent_auth = preflight_agent_auth(KnownAgent::Claude, "/home/am").unwrap();
         let mounts = resolve_mounts(
             "feat",
             tmp.path(),
@@ -823,6 +994,7 @@ mod tests {
             None,
             None,
             "am",
+            None,
         )
         .unwrap();
         assert_eq!(mounts.agent_auth.len(), 2);
@@ -868,6 +1040,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
 
         let joined = cmd.join(" ");
@@ -906,6 +1079,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(joined.contains(&worktree), "missing worktree mount");
@@ -932,6 +1106,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         // Container path should equal host path for worktree and vcs
@@ -961,6 +1136,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         // On Linux with Podman, all mounts should have ,z
@@ -990,12 +1166,283 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(
             !joined.contains(",z"),
             "Docker should never have ,z: {joined}"
         );
+    }
+
+    // ── Devcontainer run path ─────────────────────────────────────────────────
+
+    fn dc_run(dc: &DevcontainerRuntime, tmp: &Path) -> String {
+        build_run_command(
+            &podman_runtime(),
+            "am-dc-abc",
+            &make_mounts(tmp),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            dc,
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn devcontainer_env_becomes_e_flags() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            env: vec![("FOO".to_string(), "bar".to_string())],
+            ..Default::default()
+        };
+        assert!(dc_run(&dc, tmp.path()).contains("-e FOO=bar"));
+    }
+
+    #[test]
+    fn devcontainer_bind_mounts_get_am_selinux_labelling() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some("/var/run/docker.sock".to_string()),
+                target: "/var/run/docker-host.sock".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        let joined = dc_run(&dc, tmp.path());
+        assert!(joined.contains("/var/run/docker.sock:/var/run/docker-host.sock:rw"));
+        #[cfg(target_os = "linux")]
+        assert!(joined.contains("/var/run/docker-host.sock:rw,z"));
+    }
+
+    #[test]
+    fn devcontainer_volume_mounts_are_not_relabelled() {
+        // `,z` on a named volume is meaningless and podman rejects some combinations.
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some("my-volume".to_string()),
+                target: "/data".to_string(),
+                kind: "volume".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        let joined = dc_run(&dc, tmp.path());
+        assert!(joined.contains("my-volume:/data:rw"));
+        assert!(!joined.contains("my-volume:/data:rw,z"));
+    }
+
+    #[test]
+    fn devcontainer_read_only_mount_is_marked_ro() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some("/host".to_string()),
+                target: "/ro".to_string(),
+                kind: "bind".to_string(),
+                read_only: true,
+            }],
+            ..Default::default()
+        };
+        assert!(dc_run(&dc, tmp.path()).contains("/host:/ro:ro"));
+    }
+
+    #[test]
+    fn devcontainer_mount_without_a_source_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: None,
+                target: "/nowhere".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        assert!(!dc_run(&dc, tmp.path()).contains("/nowhere"));
+    }
+
+    #[test]
+    fn devcontainer_escalating_options_are_applied_when_granted() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            init: true,
+            privileged: true,
+            cap_add: vec!["SYS_PTRACE".to_string()],
+            security_opt: vec!["label=disable".to_string()],
+            ..Default::default()
+        };
+        let joined = dc_run(&dc, tmp.path());
+        assert!(joined.contains("--init"));
+        assert!(joined.contains("--privileged"));
+        assert!(joined.contains("--cap-add SYS_PTRACE"));
+        assert!(joined.contains("--security-opt label=disable"));
+    }
+
+    #[test]
+    fn escalating_options_are_absent_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let joined = dc_run(&DevcontainerRuntime::default(), tmp.path());
+        assert!(!joined.contains("--privileged"));
+        assert!(!joined.contains("--cap-add"));
+        assert!(!joined.contains("--init"));
+    }
+
+    #[test]
+    fn workspace_folder_overrides_the_mirrored_workdir() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            workdir: Some("/workspaces/custom".to_string()),
+            ..Default::default()
+        };
+        assert!(dc_run(&dc, tmp.path()).contains("--workdir /workspaces/custom"));
+    }
+
+    #[test]
+    fn am_network_setting_wins_over_run_args() {
+        // A config that asks for --network=host must not defeat container.network = "none".
+        let tmp = TempDir::new().unwrap();
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "am-dc-abc",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::None,
+            "am-feat",
+            &DevcontainerRuntime {
+                run_args: vec!["--network=host".to_string()],
+                ..Default::default()
+            },
+        );
+        let host = cmd.iter().position(|a| a == "--network=host").unwrap();
+        let none = cmd.iter().position(|a| a == "--network").unwrap();
+        assert!(none > host, "am's --network none must come last");
+    }
+
+    #[test]
+    fn devcontainer_remote_user_becomes_the_container_user() {
+        // Without this the image's default user (root) wins and $HOME is /root, so the
+        // credentials am mounts under the remoteUser's home are never found.
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            user: Some("vscode".to_string()),
+            ..Default::default()
+        };
+        assert!(dc_run(&dc, tmp.path()).contains("--user vscode"));
+    }
+
+    #[test]
+    fn image_mode_keeps_the_numeric_user_mapping() {
+        let tmp = TempDir::new().unwrap();
+        let joined = dc_run(&DevcontainerRuntime::default(), tmp.path());
+        assert!(!joined.contains("--user vscode"));
+    }
+
+    #[test]
+    fn docker_prefers_the_named_user_over_the_numeric_mapping() {
+        // Two --user flags would leave docker using the last one; emit only one.
+        let tmp = TempDir::new().unwrap();
+        let cmd = build_run_command(
+            &ContainerRuntime {
+                kind: RuntimeKind::Docker,
+                bin: PathBuf::from("/usr/bin/docker"),
+            },
+            "am-dc-abc",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime {
+                user: Some("vscode".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cmd.iter().filter(|a| *a == "--user").count(), 1);
+        assert!(cmd.contains(&"vscode".to_string()));
+    }
+
+    #[test]
+    fn container_home_uses_root_for_the_root_user() {
+        // /home/root does not exist; credentials mounted there are silently invisible.
+        assert_eq!(container_home("root", None), "/root");
+        assert_eq!(container_home("vscode", None), "/home/vscode");
+        assert_eq!(
+            container_home("vscode", Some(Path::new("/custom"))),
+            "/custom"
+        );
+    }
+
+    #[test]
+    fn gitconfig_and_ssh_follow_the_derived_home() {
+        let tmp = TempDir::new().unwrap();
+        let mut mounts = make_mounts(tmp.path());
+        mounts.container_home = container_home("root", None);
+        std::fs::write(&mounts.gitconfig_host, "").unwrap();
+        std::fs::create_dir_all(&mounts.ssh_host).unwrap();
+        let joined = build_run_command(
+            &podman_runtime(),
+            "am-dc-abc",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        )
+        .join(" ");
+        assert!(joined.contains("/root/.gitconfig"));
+        assert!(joined.contains("/root/.ssh"));
+    }
+
+    // ── Entrypoint composition ────────────────────────────────────────────────
+
+    #[test]
+    fn no_entrypoints_leaves_the_agent_command_alone() {
+        let agent = vec!["claude".to_string()];
+        assert_eq!(compose_entrypoint_command(&[], &agent), agent);
+    }
+
+    #[test]
+    fn entrypoints_are_chained_before_the_agent() {
+        let cmd = compose_entrypoint_command(
+            &[
+                "/usr/local/share/docker-init.sh".to_string(),
+                "/usr/local/share/ssh-init.sh".to_string(),
+            ],
+            &["claude".to_string()],
+        );
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        assert_eq!(
+            cmd[2],
+            "/usr/local/share/docker-init.sh && /usr/local/share/ssh-init.sh && exec claude"
+        );
+    }
+
+    #[test]
+    fn entrypoints_run_even_without_an_agent_command() {
+        let cmd = compose_entrypoint_command(&["/init.sh".to_string()], &[]);
+        assert_eq!(cmd[2], "/init.sh");
+    }
+
+    #[test]
+    fn agent_flags_are_quoted_in_the_composed_script() {
+        let cmd = compose_entrypoint_command(
+            &["/init.sh".to_string()],
+            &[
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "it's".to_string(),
+            ],
+        );
+        assert!(cmd[2].contains("exec claude --dangerously-skip-permissions 'it'\\''s'"));
     }
 
     #[test]
@@ -1010,6 +1457,7 @@ mod tests {
             &[],
             &NetworkMode::None,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         assert!(cmd.contains(&"--network".to_string()));
         assert!(cmd.contains(&"none".to_string()));
@@ -1027,6 +1475,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(joined.contains("ANTHROPIC_API_KEY"));
@@ -1078,7 +1527,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
-        let mounts = resolve_agent_auth_mounts(KnownAgent::Claude, "am").unwrap();
+        let mounts = resolve_agent_auth_mounts(KnownAgent::Claude, "/home/am").unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].host_path, tmp.path().join(".claude"));
         assert_eq!(mounts[0].container_path, PathBuf::from("/home/am/.claude"));
@@ -1101,7 +1550,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::set_var("CLAUDE_CONFIG_DIR", &custom_config);
 
-        let mounts = resolve_agent_auth_mounts(KnownAgent::Claude, "am").unwrap();
+        let mounts = resolve_agent_auth_mounts(KnownAgent::Claude, "/home/am").unwrap();
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[0].host_path, custom_config);
         assert_eq!(mounts[0].container_path, PathBuf::from("/home/am/.claude"));
@@ -1140,6 +1589,7 @@ mod tests {
             &[],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(
@@ -1189,7 +1639,7 @@ mod tests {
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::fs::create_dir(tmp.path().join(".claude")).unwrap();
 
-        assert!(preflight_agent_auth(KnownAgent::Claude, "am").is_ok());
+        assert!(preflight_agent_auth(KnownAgent::Claude, "/home/am").is_ok());
 
         std::env::remove_var("HOME");
     }
@@ -1201,7 +1651,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::env::remove_var("CLAUDE_CONFIG_DIR");
 
-        assert!(preflight_agent_auth(KnownAgent::Claude, "am").is_err());
+        assert!(preflight_agent_auth(KnownAgent::Claude, "/home/am").is_err());
 
         std::env::remove_var("HOME");
     }
@@ -1216,7 +1666,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".config").join("gh")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".config").join("github-copilot")).unwrap();
 
-        let auth = preflight_agent_auth(KnownAgent::Copilot, "am").unwrap();
+        let auth = preflight_agent_auth(KnownAgent::Copilot, "/home/am").unwrap();
         assert_eq!(
             auth.env,
             vec![("GH_TOKEN".to_string(), "gh-test-token".to_string())]
@@ -1233,7 +1683,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        assert!(preflight_agent_auth(KnownAgent::Copilot, "am").is_err());
+        assert!(preflight_agent_auth(KnownAgent::Copilot, "/home/am").is_err());
 
         std::env::remove_var("HOME");
     }
@@ -1245,7 +1695,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         std::fs::create_dir(tmp.path().join(".gemini")).unwrap();
 
-        assert!(preflight_agent_auth(KnownAgent::Gemini, "am").is_ok());
+        assert!(preflight_agent_auth(KnownAgent::Gemini, "/home/am").is_ok());
 
         std::env::remove_var("HOME");
     }
@@ -1256,7 +1706,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        assert!(preflight_agent_auth(KnownAgent::Gemini, "am").is_err());
+        assert!(preflight_agent_auth(KnownAgent::Gemini, "/home/am").is_err());
 
         std::env::remove_var("HOME");
     }
@@ -1266,7 +1716,7 @@ mod tests {
         let _g = lock_env();
         std::env::set_var("OPENAI_API_KEY", "sk-test");
 
-        let auth = preflight_agent_auth(KnownAgent::Codex, "am").unwrap();
+        let auth = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap();
         assert_eq!(
             auth.env,
             vec![("OPENAI_API_KEY".to_string(), "sk-test".to_string())]
@@ -1281,7 +1731,7 @@ mod tests {
         let _g = lock_env();
         std::env::remove_var("OPENAI_API_KEY");
 
-        let err = preflight_agent_auth(KnownAgent::Codex, "am").unwrap_err();
+        let err = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap_err();
         assert!(err.to_string().contains("OPENAI_API_KEY"));
     }
 
@@ -1290,7 +1740,7 @@ mod tests {
         let _g = lock_env();
         std::env::set_var("OPENAI_API_KEY", "");
 
-        let err = preflight_agent_auth(KnownAgent::Codex, "am").unwrap_err();
+        let err = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap_err();
         assert!(err.to_string().contains("OPENAI_API_KEY"));
 
         std::env::remove_var("OPENAI_API_KEY");
@@ -1308,6 +1758,7 @@ mod tests {
             &[("OPENAI_API_KEY".to_string(), "sk-test-key".to_string())],
             &NetworkMode::Full,
             "am-feat",
+            &DevcontainerRuntime::default(),
         );
         let joined = cmd.join(" ");
         assert!(joined.contains("-e OPENAI_API_KEY=sk-test-key"));
@@ -1321,7 +1772,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Copilot, "am").unwrap();
+        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Copilot, "/home/am").unwrap();
         assert_eq!(auth_mounts.len(), 2);
 
         let paths: Vec<_> = auth_mounts.iter().map(|m| m.host_path.clone()).collect();
@@ -1351,7 +1802,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Copilot, "am").unwrap();
+        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Copilot, "/home/am").unwrap();
         let container_paths: Vec<_> = auth_mounts
             .iter()
             .map(|m| m.container_path.clone())
@@ -1368,7 +1819,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Gemini, "am").unwrap();
+        let auth_mounts = resolve_agent_auth_mounts(KnownAgent::Gemini, "/home/am").unwrap();
         assert_eq!(auth_mounts.len(), 1);
         assert_eq!(auth_mounts[0].host_path, tmp.path().join(".gemini"));
         assert_eq!(
@@ -1386,7 +1837,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
-        assert!(resolve_agent_auth_mounts(KnownAgent::Codex, "am")
+        assert!(resolve_agent_auth_mounts(KnownAgent::Codex, "/home/am")
             .unwrap()
             .is_empty());
 

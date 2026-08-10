@@ -2,6 +2,7 @@ mod cli;
 mod command;
 mod config;
 mod container;
+mod devcontainer;
 mod error;
 mod messages;
 mod session;
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 use cli::{Cli, Commands};
+use command::shell_quote;
 
 fn main() {
     let cli = Cli::parse();
@@ -35,7 +37,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             agent,
             no_container,
             auto,
-        } => cmd_start(&slug, agent.as_deref(), no_container, auto),
+            rebuild,
+        } => cmd_start(&slug, agent.as_deref(), no_container, auto, rebuild),
         Commands::List => cmd_list(),
         Commands::Attach { slug } => cmd_attach(&slug),
         Commands::Run { slug, agent } => cmd_run(&slug, &agent),
@@ -106,6 +109,7 @@ fn cmd_start(
     agent_flag: Option<&str>,
     no_container: bool,
     auto: bool,
+    rebuild: bool,
 ) -> anyhow::Result<()> {
     let (repo_root, vcs) = find_repo_root()?;
     let sessions = session::load_sessions(&repo_root)?;
@@ -155,64 +159,47 @@ fn cmd_start(
         }
     }
 
-    // 5. Container config
+    // 5. Container runtime and host-side credentials. Everything checkable without a
+    //    worktree is checked here; a devcontainer config only exists once the worktree
+    //    does, so its half of preflight happens below.
     let use_container = cfg.container.enabled && !no_container;
-    let (_runtime, container_cmd, session_container) = if use_container {
-        let agent_auth = if let Some(agent) = effective_known_agent {
-            container::preflight_agent_auth(agent, &cfg.container.user)?
-        } else {
-            container::AgentAuth::default()
-        };
-
-        let image = config::resolve_image(effective_agent.as_deref(), &cfg)
-            .ok_or(error::AmError::ContainerImageNotConfigured)?;
-
+    let runtime = if use_container {
         let runtime = container::detect_runtime(cfg.container.runtime.clone())?;
-
+        if let Some(agent) = effective_known_agent {
+            container::validate_agent_credentials(agent)?;
+        }
         // Pre-emptively remove any leftover container from a previous run
         container::remove_if_exists(&runtime, &format!("am-{slug}"));
-
-        let mounts = container::resolve_mounts(
-            slug,
-            &repo_root,
-            &vcs,
-            agent_auth.mounts.clone(),
-            cfg.container.gitconfig.as_deref(),
-            cfg.container.ssh.as_deref(),
-            &cfg.container.user,
-        )?;
-
-        let mut cmd = container::build_run_command(
-            &runtime,
-            image,
-            &mounts,
-            &cfg.container.env,
-            &agent_auth.env,
-            &cfg.container.network,
-            &format!("am-{slug}"),
-        );
-
-        // Append the agent as the container CMD so it launches automatically
-        if let Some(agent) = effective_known_agent {
-            cmd.push(agent.to_string());
-            if auto {
-                cmd.extend(container::agent_auto_flags(agent));
-            }
-        }
-
-        let sc = session::SessionContainer {
-            runtime: runtime.kind.to_string(),
-            image: image.to_string(),
-            container_id: None,
-        };
-        (Some(runtime), Some(cmd), Some(sc))
+        Some(runtime)
     } else {
-        (None, None, None)
+        None
     };
 
-    let worktree_path = match vcs {
-        config::Vcs::Git => worktree::create_git_worktree(slug, &repo_root)?,
-        config::Vcs::Jj => worktree::create_jj_workspace(slug, &repo_root)?,
+    // ── Worktree ──────────────────────────────────────────────────────────────
+    //
+    // Guarded from here on: a failed build, a declined trust prompt, or a tmux error
+    // must not leave an orphaned worktree that `am destroy` cannot see.
+    let guard = worktree::WorktreeGuard::create(slug, &repo_root, vcs.clone())?;
+    let worktree_path = guard.path().to_path_buf();
+
+    // ── Post-worktree preflight: the devcontainer config, if any ──────────────
+    let (container_cmd, session_container) = match runtime {
+        Some(ref runtime) => {
+            let plan = plan_container(ContainerPlanInput {
+                slug,
+                repo_root: &repo_root,
+                worktree: &worktree_path,
+                vcs: &vcs,
+                cfg: &cfg,
+                runtime,
+                agent: effective_known_agent,
+                agent_name: effective_agent.as_deref(),
+                auto,
+                rebuild,
+            })?;
+            (Some(plan.cmd), Some(plan.session))
+        }
+        None => (None, None),
     };
     let window_name = format!("am-{slug}");
 
@@ -292,6 +279,7 @@ fn cmd_start(
     if let Some(ref cmd) = container_cmd {
         if !tmux::is_in_tmux() {
             session::add_session(&repo_root, new_session)?;
+            guard.commit();
             println!("Started session '{slug}'");
             println!("  worktree:  {}", worktree_path.display());
             println!("  container: am-{slug}");
@@ -318,15 +306,288 @@ fn cmd_start(
         }
     }
 
+    let mode = new_session
+        .container
+        .as_ref()
+        .map(|c| (c.mode, c.image.clone()));
     session::add_session(&repo_root, new_session)?;
+    guard.commit();
 
     println!("Started session '{slug}'");
     println!("  worktree:  {}", worktree_path.display());
     println!("  branch:    am/{slug}");
-    if use_container {
+    if let Some((mode, image)) = mode {
         println!("  container: am-{slug}");
+        if mode == session::ContainerMode::Devcontainer {
+            println!("  image:     {image} (from devcontainer.json)");
+        }
     }
     Ok(())
+}
+
+// ── am start: container planning ──────────────────────────────────────────────
+
+/// Inputs for resolving the container half of a session. Grouped into a struct because
+/// these all travel together and a positional argument list this long invites mix-ups.
+struct ContainerPlanInput<'a> {
+    slug: &'a str,
+    repo_root: &'a std::path::Path,
+    worktree: &'a std::path::Path,
+    vcs: &'a config::Vcs,
+    cfg: &'a config::Config,
+    runtime: &'a container::ContainerRuntime,
+    agent: Option<container::KnownAgent>,
+    agent_name: Option<&'a str>,
+    auto: bool,
+    rebuild: bool,
+}
+
+struct ContainerPlan {
+    cmd: Vec<String>,
+    session: session::SessionContainer,
+}
+
+/// Decide whether this session runs from an `am`-resolved image or the repo's own
+/// devcontainer, and assemble the run command either way.
+fn plan_container(input: ContainerPlanInput) -> anyhow::Result<ContainerPlan> {
+    let ContainerPlanInput {
+        slug,
+        repo_root,
+        worktree,
+        vcs,
+        cfg,
+        runtime,
+        agent,
+        agent_name,
+        auto,
+        rebuild,
+    } = input;
+
+    // Discovery is relative to the worktree: the config is a checked-in, branch-specific
+    // file, so two sessions on different branches may legitimately disagree about it.
+    let discovered = match cfg.container.mode {
+        config::ContainerMode::Image => None,
+        _ => devcontainer::find_config(worktree, cfg.devcontainer.path.as_deref())?,
+    };
+
+    let config_path = match (&cfg.container.mode, discovered) {
+        (config::ContainerMode::Image, _) => None,
+        (config::ContainerMode::Devcontainer, None) => {
+            return Err(anyhow::anyhow!(
+                "container.mode is \"devcontainer\" but no devcontainer.json was found in {}\n\
+                 Add .devcontainer/devcontainer.json, set devcontainer.path, or use \
+                 container.mode = \"auto\"",
+                worktree.display()
+            ))
+        }
+        (_, found) => found,
+    };
+
+    match config_path {
+        Some(path) => plan_devcontainer(
+            slug, repo_root, worktree, vcs, cfg, runtime, agent, agent_name, auto, rebuild, &path,
+        ),
+        None => plan_image(slug, repo_root, vcs, cfg, runtime, agent, agent_name, auto),
+    }
+}
+
+/// The pre-existing path: an image `am` resolves from config.
+#[allow(clippy::too_many_arguments)]
+fn plan_image(
+    slug: &str,
+    repo_root: &std::path::Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    runtime: &container::ContainerRuntime,
+    agent: Option<container::KnownAgent>,
+    agent_name: Option<&str>,
+    auto: bool,
+) -> anyhow::Result<ContainerPlan> {
+    let image = config::resolve_image(agent_name, cfg)
+        .ok_or(error::AmError::ContainerImageNotConfigured)?;
+    let home = container::container_home(&cfg.container.user, cfg.devcontainer.home.as_deref());
+    let agent_auth = match agent {
+        Some(agent) => container::preflight_agent_auth(agent, &home)?,
+        None => container::AgentAuth::default(),
+    };
+    let mounts = container::resolve_mounts(
+        slug,
+        repo_root,
+        vcs,
+        agent_auth.mounts.clone(),
+        cfg.container.gitconfig.as_deref(),
+        cfg.container.ssh.as_deref(),
+        &cfg.container.user,
+        cfg.devcontainer.home.as_deref(),
+    )?;
+    let mut cmd = container::build_run_command(
+        runtime,
+        image,
+        &mounts,
+        &cfg.container.env,
+        &agent_auth.env,
+        &cfg.container.network,
+        &format!("am-{slug}"),
+        &container::DevcontainerRuntime::default(),
+    );
+    cmd.extend(agent_command(agent, auto));
+    Ok(ContainerPlan {
+        cmd,
+        session: session::SessionContainer::image_mode(
+            runtime.kind.to_string(),
+            image.to_string(),
+        ),
+    })
+}
+
+/// The devcontainer path: build the repo's own config into an image, then run it with
+/// `am`'s mounts, user mapping, and network policy.
+#[allow(clippy::too_many_arguments)]
+fn plan_devcontainer(
+    slug: &str,
+    repo_root: &std::path::Path,
+    worktree: &std::path::Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    runtime: &container::ContainerRuntime,
+    agent: Option<container::KnownAgent>,
+    agent_name: Option<&str>,
+    auto: bool,
+    rebuild: bool,
+    config_path: &std::path::Path,
+) -> anyhow::Result<ContainerPlan> {
+    let json = devcontainer::parse_config(config_path)?;
+    devcontainer::check_supported(&json)?;
+    devcontainer::check_host_commands(&json, cfg.devcontainer.allow_host_commands)?;
+
+    let injected = injected_features(cfg, agent_name);
+    let image = devcontainer::image_name(config_path, &injected)?;
+    let config_hash = devcontainer::config_hash(config_path, &injected)?;
+
+    // The whole point of hashing: an unchanged config reuses its image, so the Node CLI
+    // runs once per config change rather than once per session.
+    if rebuild || !devcontainer::image_exists(&runtime.bin, &image) {
+        let cli = devcontainer::find_cli(&cfg.devcontainer.cli)?;
+        println!("Building devcontainer image {image} (this can take a few minutes)...");
+        devcontainer::build(
+            &cli,
+            worktree,
+            config_path,
+            &image,
+            &injected,
+            &runtime.bin,
+            rebuild,
+        )?;
+    }
+
+    let snippets = devcontainer::read_image_metadata(&runtime.bin, &image)?;
+    let ctx = devcontainer::SubstitutionContext::new(
+        worktree,
+        &json
+            .workspace_folder
+            .clone()
+            .unwrap_or_else(|| worktree.to_string_lossy().into_owned()),
+    );
+    let resolved = devcontainer::finalize(devcontainer::merge(&snippets)?, &json, &ctx);
+
+    // remoteUser decides where credentials must land — an image running as root keeps its
+    // config in /root, not /home/root.
+    let user = resolved
+        .remote_user
+        .clone()
+        .or_else(|| resolved.container_user.clone())
+        .unwrap_or_else(|| cfg.container.user.clone());
+    let home = container::container_home(&user, cfg.devcontainer.home.as_deref());
+
+    let trusted = devcontainer::apply_trust(&resolved, cfg);
+    let agent_auth = match agent {
+        Some(agent) => container::preflight_agent_auth(agent, &home)?,
+        None => container::AgentAuth::default(),
+    };
+    let mut mounts = container::resolve_mounts(
+        slug,
+        repo_root,
+        vcs,
+        agent_auth.mounts.clone(),
+        cfg.container.gitconfig.as_deref(),
+        cfg.container.ssh.as_deref(),
+        &user,
+        cfg.devcontainer.home.as_deref(),
+    )?;
+    mounts.container_home = home;
+
+    let mut cmd = container::build_run_command(
+        runtime,
+        &image,
+        &mounts,
+        &cfg.container.env,
+        &agent_auth.env,
+        &cfg.container.network,
+        &format!("am-{slug}"),
+        &trusted,
+    );
+    // Feature entrypoints and lifecycle hooks must run before the agent, and am overrides
+    // the image's own ENTRYPOINT to launch it — so they have to be chained explicitly.
+    let (hooks, hooks_ran) =
+        devcontainer::startup_commands(&resolved, cfg.devcontainer.skip_lifecycle);
+    let mut chain = trusted.entrypoints.clone();
+    chain.extend(hooks);
+    cmd.extend(container::compose_entrypoint_command(
+        &chain,
+        &agent_command(agent, auto),
+    ));
+
+    Ok(ContainerPlan {
+        cmd,
+        session: session::SessionContainer {
+            runtime: runtime.kind.to_string(),
+            image,
+            container_id: None,
+            mode: session::ContainerMode::Devcontainer,
+            config_path: Some(config_path.to_path_buf()),
+            config_hash: Some(config_hash),
+            remote_user: resolved.remote_user.clone(),
+            lifecycle_done: hooks_ran,
+        },
+    })
+}
+
+/// The agent invocation appended as the container command, if there is one.
+fn agent_command(agent: Option<container::KnownAgent>, auto: bool) -> Vec<String> {
+    let Some(agent) = agent else {
+        return Vec::new();
+    };
+    let mut cmd = vec![agent.to_string()];
+    if auto {
+        cmd.extend(container::agent_auto_flags(agent));
+    }
+    cmd
+}
+
+/// Features `am` injects at build time: the agent's own, plus anything configured.
+fn injected_features(
+    cfg: &config::Config,
+    agent_name: Option<&str>,
+) -> Vec<devcontainer::InjectedFeature> {
+    let mut features: Vec<devcontainer::InjectedFeature> = cfg
+        .devcontainer
+        .extra_features
+        .iter()
+        .map(|(id, options)| devcontainer::InjectedFeature::new(id, options))
+        .collect();
+
+    let wants_feature = match cfg.devcontainer.agent_install {
+        config::AgentInstall::Feature | config::AgentInstall::Auto => true,
+        config::AgentInstall::Bootstrap | config::AgentInstall::None => false,
+    };
+    if wants_feature {
+        if let Some(feature) = config::resolve_agent_feature(agent_name, cfg) {
+            features.push(devcontainer::InjectedFeature::with_defaults(feature));
+        }
+    }
+    features.sort();
+    features.dedup();
+    features
 }
 
 // ── am list ───────────────────────────────────────────────────────────────────
@@ -547,19 +808,6 @@ fn cd_cmd(path: &std::path::Path) -> String {
     format!("cd '{escaped}'")
 }
 
-/// Quote a single shell token only when it contains characters that require quoting.
-/// Safe characters (alphanumeric, common punctuation in paths/flags) are left bare.
-fn shell_quote(s: &str) -> String {
-    let needs_quoting = s.is_empty()
-        || s.chars().any(|c| {
-            !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/' | ':' | '=' | '+' | '@' | '%')
-        });
-    if needs_quoting {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    } else {
-        s.to_string()
-    }
-}
 
 /// `tmux split-window [shell-command]` runs the command in the newly created pane.
 /// Only attach the container command there when the agent pane is that new pane.
@@ -608,7 +856,8 @@ fn find_repo_root() -> anyhow::Result<(PathBuf, config::Vcs)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_quote, split_window_shell_cmd};
+    use super::split_window_shell_cmd;
+    use crate::command::shell_quote;
 
     #[test]
     fn split_window_shell_cmd_used_when_agent_is_new_pane() {
@@ -632,5 +881,104 @@ mod tests {
     fn shell_quote_leaves_safe_tokens_unquoted() {
         assert_eq!(shell_quote("podman"), "podman");
         assert_eq!(shell_quote("/tmp/foo:rw"), "/tmp/foo:rw");
+    }
+
+    // ── Agent injection ───────────────────────────────────────────────────────
+
+    use super::{agent_command, injected_features};
+    use crate::config::{AgentInstall, Config};
+    use crate::container::KnownAgent;
+
+    fn cfg_with_install(install: AgentInstall) -> Config {
+        let mut cfg = Config::default();
+        cfg.devcontainer.agent_install = install;
+        cfg
+    }
+
+    fn ids(cfg: &Config, agent: Option<&str>) -> Vec<String> {
+        injected_features(cfg, agent)
+            .into_iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    #[test]
+    fn auto_injects_the_agents_feature_when_one_is_mapped() {
+        let cfg = cfg_with_install(AgentInstall::Auto);
+        assert_eq!(
+            ids(&cfg, Some("claude")),
+            vec!["ghcr.io/anthropics/devcontainer-features/claude-code:1"]
+        );
+    }
+
+    #[test]
+    fn auto_injects_nothing_for_an_agent_with_no_published_feature() {
+        // copilot has no official Feature; it falls through to the bootstrap path.
+        let cfg = cfg_with_install(AgentInstall::Auto);
+        assert!(ids(&cfg, Some("copilot")).is_empty());
+    }
+
+    #[test]
+    fn install_none_injects_nothing_even_when_a_feature_exists() {
+        let cfg = cfg_with_install(AgentInstall::None);
+        assert!(ids(&cfg, Some("claude")).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_does_not_inject_a_build_time_feature() {
+        let cfg = cfg_with_install(AgentInstall::Bootstrap);
+        assert!(ids(&cfg, Some("claude")).is_empty());
+    }
+
+    #[test]
+    fn extra_features_are_injected_alongside_the_agents() {
+        let mut cfg = cfg_with_install(AgentInstall::Auto);
+        cfg.devcontainer
+            .extra_features
+            .insert("ghcr.io/devcontainers/features/node:1".to_string(), "{}".to_string());
+        let ids = ids(&cfg, Some("claude"));
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"ghcr.io/devcontainers/features/node:1".to_string()));
+    }
+
+    #[test]
+    fn injected_features_are_ordered_deterministically() {
+        // The image name is derived from these, so an unstable order would produce a
+        // different hash — and a needless rebuild — on every run.
+        let mut cfg = cfg_with_install(AgentInstall::Auto);
+        for id in ["zzz:1", "aaa:1", "mmm:1"] {
+            cfg.devcontainer
+                .extra_features
+                .insert(id.to_string(), "{}".to_string());
+        }
+        assert_eq!(ids(&cfg, Some("claude")), ids(&cfg, Some("claude")));
+        let sorted = {
+            let mut v = ids(&cfg, Some("claude"));
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&cfg, Some("claude")), sorted);
+    }
+
+    #[test]
+    fn no_agent_means_no_agent_feature() {
+        let cfg = cfg_with_install(AgentInstall::Auto);
+        assert!(ids(&cfg, None).is_empty());
+    }
+
+    // ── Agent command ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_command_is_empty_without_an_agent() {
+        assert!(agent_command(None, false).is_empty());
+    }
+
+    #[test]
+    fn agent_command_adds_auto_flags_only_in_auto_mode() {
+        assert_eq!(agent_command(Some(KnownAgent::Claude), false), vec!["claude"]);
+        assert_eq!(
+            agent_command(Some(KnownAgent::Claude), true),
+            vec!["claude", "--dangerously-skip-permissions"]
+        );
     }
 }

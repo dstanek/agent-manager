@@ -51,6 +51,9 @@ pub enum Commands {
         /// Run agent in autonomous mode (skips all tool approval prompts; requires container)
         #[arg(long)]
         auto: bool,
+        /// Rebuild the devcontainer image even if one already exists for this config
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// List all sessions
