@@ -69,7 +69,7 @@ jobs:
       - name: Validate Renovate token
         run: |
           if [ -z "$RENOVATE_TOKEN" ]; then
-            echo "::error::RENOVATE_TOKEN is not set. Configure a fine-grained PAT with Contents: Read and write, Pull requests: Read and write, and Issues: Read and write access to this repository."
+            echo "::error::RENOVATE_TOKEN is not set. Configure a fine-grained PAT scoped to this repository with Contents, Pull requests, Issues, Workflows and Commit statuses set to Read and write, plus Dependabot alerts Read-only. Workflows is not optional — without it every GitHub Actions bump is rejected at push."
             exit 1
           fi
 

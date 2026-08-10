@@ -119,10 +119,34 @@ has replaced it for development.
 
 ## Setup
 
-The workflow needs a `RENOVATE_TOKEN` repository secret: a fine-grained PAT with
-**Contents: Read and write**, **Pull requests: Read and write**, and **Issues:
-Read and write** on this repository. Issues access is for the dependency
-dashboard.
+The workflow needs a `RENOVATE_TOKEN` repository secret. GitHub exposes no API
+for creating personal access tokens, so this is a web UI step:
+[create a fine-grained PAT](https://github.com/settings/personal-access-tokens/new)
+scoped to this repository with the permissions Renovate documents:
+
+| Permission | Access | Why |
+|---|---|---|
+| Contents | Read and write | Push branches |
+| Pull requests | Read and write | Open and update PRs |
+| Issues | Read and write | The dependency dashboard |
+| Workflows | Read and write | Edit `.github/workflows/*.yml` |
+| Commit statuses | Read and write | Read CI results for automerge decisions |
+| Dependabot alerts | Read-only | Vulnerability-driven updates |
+| Metadata | Read-only | Required by GitHub on every fine-grained token |
+
+**Workflows is not optional.** GitHub rejects any push that touches
+`.github/workflows/` from a token lacking it, so without it every GitHub Actions
+bump fails — and it fails at push time, not at startup, so the token check in the
+workflow will not catch it.
+
+Then set the secret, which does have a `gh` command:
+
+```sh
+gh secret set RENOVATE_TOKEN --repo dstanek/agent-manager
+```
+
+A classic PAT with the `repo` and `workflow` scopes works too, and is what
+Renovate's docs suggest first — it is simply much broader.
 
 The built-in `GITHUB_TOKEN` is not used. Pull requests it creates do not trigger
 other workflows, so CI would never run on a Renovate PR.
