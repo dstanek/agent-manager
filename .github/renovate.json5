@@ -1,0 +1,89 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+    // git-cliff skips `^chore` commits (see git-cliff.toml), so dependency
+    // bumps follow the repo's Conventional Commits rule without filling the
+    // changelog with noise.
+    ":semanticCommitTypeAll(chore)",
+  ],
+
+  // The cron in .github/workflows/renovate.yml is the schedule. Deliberately no
+  // `schedule` here — a second, narrower window would only produce runs that
+  // silently do nothing.
+  timezone: "Etc/UTC",
+
+  labels: ["dependencies"],
+
+  // Cargo.lock pins every transitive crate. Without lock file maintenance a
+  // patched transitive dependency only lands when some direct dependency
+  // happens to be bumped.
+  lockFileMaintenance: {
+    enabled: true,
+    // Must overlap the workflow cron. The default ("before 4am on monday")
+    // never coincides with a 06:00 UTC run, so the job would look healthy and
+    // never open the PR.
+    schedule: ["on monday"],
+  },
+
+  ignorePaths: [
+    // Recorded devcontainer.json inputs and expected `devcontainer` CLI output.
+    // Anything in here is test data: bumping a version changes what the suite
+    // asserts, not what we ship.
+    "tests/fixtures/**",
+  ],
+
+  packageRules: [
+    {
+      description: "am-rust:latest is built locally by `make build-rust-example` and published nowhere — there is no registry to look it up in.",
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["am-rust"],
+      enabled: false,
+    },
+    {
+      description: "One PR for all non-major crate bumps; majors stay separate so they get read.",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "cargo non-major",
+    },
+    {
+      description: "Workflow actions move together and share a single CI run.",
+      matchManagers: ["github-actions"],
+      groupName: "github actions",
+    },
+    {
+      description: "Every base image bump costs a full multi-arch rebuild, so batch the non-major ones. Majors (a new Ubuntu/Alpine/Debian release) stay separate.",
+      matchManagers: ["dockerfile"],
+      matchUpdateTypes: ["minor", "patch", "digest"],
+      groupName: "container base images",
+    },
+    {
+      description: "The `node-version` in the Renovate workflow is a bare major on purpose — `renovate` declares an engine range, not a patch pin. Left alone, Renovate rewrites `24` to `24.11.0` every patch release.",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["uses-with"],
+      matchDepNames: ["node"],
+      enabled: false,
+    },
+    {
+      description: "requirements-docs.txt uses `>=` floors, which every new release already satisfies — the default range strategy would never propose anything. Bump the floor instead so the docs toolchain is actually tracked.",
+      matchManagers: ["pip_requirements"],
+      rangeStrategy: "bump",
+    },
+  ],
+
+  customManagers: [
+    {
+      customType: "regex",
+      description: "Tool versions pinned in Dockerfile ARG/ENV lines. The dockerfile manager only reads FROM/COPY --from, so these need the `# renovate:` annotation directly above them.",
+      managerFilePatterns: ["/(^|/)Dockerfile[^/]*$/"],
+      matchStrings: [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+?)(?:\\s+versioning=(?<versioning>\\S+?))?\\s*\\n\\s*(?:ARG|ENV)\\s+\\w+_VERSION[ =][\"']?(?<currentValue>[^\"'\\s]+)",
+      ],
+      versioningTemplate: "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
+      // Upstream release tags carry a leading `v` (jj tags `v0.44.0`); the ARG
+      // values do not, and the download URLs add it back themselves.
+      extractVersionTemplate: "^v?(?<version>.+)$",
+    },
+  ],
+}
