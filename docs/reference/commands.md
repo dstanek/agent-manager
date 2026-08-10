@@ -51,15 +51,20 @@ am start <slug> [OPTIONS]
 | `--agent <AGENT>` | Agent command to launch in the session's agent pane. Overrides the `agent` value from config. Must be one of: `claude`, `copilot`, `gemini`, `codex`. Unknown values are rejected with an error. See [Concepts](../concepts.md#agent-integrations) for details. |
 | `--no-container` | Disable container isolation for this session. The agent command will run directly in the tmux pane instead of inside a container. |
 | `--auto` | Launch the agent in autonomous mode (passes agent-specific flags to skip interactive prompts, e.g. `--dangerously-skip-permissions` for Claude). Requires `--agent` and container to be enabled. |
+| `--rebuild` | Rebuild the dev container image even if one already exists for this config. Only meaningful in devcontainer mode; use it after changing a file the config hash does not cover, such as something your Dockerfile `COPY`s. |
 
 **What it does**
 
-1. Validates the slug
+1. Validates the slug, detects the container runtime, and checks the selected agent's credentials — everything that can fail before anything is created
 2. Creates a git worktree at `.am/worktrees/<slug>` on a new `am/<slug>` branch (or a jj workspace if the repo uses jj)
-3. If inside tmux: opens a new window named `am-<slug>` with a split pane; sets up the agent pane and the shell pane
-4. If container is enabled: launches the container with the appropriate mounts and environment variables
-5. Sends the agent command to the agent pane
-6. Records the session in `.am/sessions.json`
+3. In devcontainer mode: discovers `.devcontainer/devcontainer.json` **inside the worktree**, builds it into `am-dc-<hash>` if that image does not already exist, and reads the built image's metadata
+4. If inside tmux: opens a new window named `am-<slug>` with a split pane; sets up the agent pane and the shell pane
+5. If container is enabled: launches the container with the appropriate mounts and environment variables
+6. Sends the agent command to the agent pane
+7. Records the session in `.am/sessions.json`
+
+Steps 3–6 are covered by a rollback: if any of them fails, the worktree and its branch are
+removed rather than left behind for you to clean up by hand.
 
 If `am start` is run outside of tmux, it creates the worktree and then launches the container directly (replacing the current shell process via `exec()`). No tmux window is created.
 
