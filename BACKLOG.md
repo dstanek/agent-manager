@@ -178,9 +178,11 @@ Depends on the decoupling item above.
       implementation consequences are in the spec's *Spike results*. Both technical questions
       came back favorable: the run path is Node-free after build, and `build` exits 1 on
       error. Only the `auto`-as-default question is still open, and that is a product call.
-- [ ] **Phase 1.** `container.mode` selection, config discovery in the worktree,
-      config-hash image caching, build step, metadata/JSON merge, run step, lifecycle
-      hooks, agent injection, trust gate, session state, docs. git and jj both.
+- [x] **Phase 1.** Done. `container.mode` selection, discovery in the worktree, config-hash
+      image caching, build step, metadata/JSON merge, run step, lifecycle hooks, agent
+      injection, trust gate, session state, docs — git and jj both. `container.mode`
+      defaults to `"image"`, so nothing changes for existing repos until someone opts in;
+      whether `"auto"` should become the default is the one open question left in the spec.
 - [ ] **Phase 2.** `userEnvProbe`, `forwardPorts`, and vendoring the CLI bundle if
       `npm install -g @devcontainers/cli` proves to be real friction (it is one
       dependency-free 1.7 MB script, so this is cheap).
@@ -189,13 +191,27 @@ Depends on the decoupling item above.
       its own crate — crates.io has no devcontainer runtime today. The run path is
       unaffected by design.
 
-Prerequisites this surfaces, worth doing regardless of devcontainer mode:
+Prerequisites this surfaced, both now done and both a fix in their own right:
 
-- [ ] `WorktreeGuard` with an explicit `commit()`, so a failed `am start` rolls the
-      worktree back instead of leaving one behind.
-- [ ] Split `cmd_start` preflight into pre-worktree checks (runtime, credentials, slug)
-      and post-worktree checks, since a devcontainer config can only be read after the
-      worktree exists.
+- [x] `WorktreeGuard` with an explicit `commit()`. A failed `am start` now rolls the
+      worktree *and its branch* back instead of leaving an orphan that `am destroy` could
+      not see, so the same slug is immediately reusable.
+- [x] Split `cmd_start` preflight into pre-worktree checks (runtime, credentials, slug) and
+      post-worktree checks, since a devcontainer config can only be read after the worktree
+      exists.
+
+Follow-ups phase 1 left behind:
+
+- [ ] `postAttachCommand` is never run — `am attach` moves tmux focus rather than attaching
+      to the container, so there is no attach event to hang it off. Needs a real
+      "exec into the running container" attach path.
+- [ ] Create-time lifecycle hooks re-run on every `am start` because containers are `--rm`.
+      Correct given ephemeral containers, but a persistent-container mode would make the
+      spec's once-per-container semantics achievable; `lifecycle_done` already records what
+      ran.
+- [ ] The config hash does not cover build-context files, only the config and the
+      Dockerfile. `--rebuild` is the workaround; a bounded context fingerprint would be
+      better.
 
 ---
 
