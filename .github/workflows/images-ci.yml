@@ -97,4 +97,7 @@ jobs:
       # in devcontainer mode, so it exercises the features and the annotated
       # JJ_VERSION together.
       - name: Build
-        run: npx --yes @devcontainers/cli devcontainer build --workspace-folder .
+        # `--package` is required: the package is @devcontainers/cli but the bin
+        # it provides is `devcontainer`, and without it npx passes "devcontainer"
+        # through as an argument to itself.
+        run: npx --yes --package @devcontainers/cli devcontainer build --workspace-folder .
