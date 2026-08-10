@@ -21,8 +21,40 @@
     "ghcr.io/devcontainers/features/node:1": {
       "version": "22"
     },
-    "ghcr.io/devcontainers/features/github-cli:1": {}
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+
+    // A container runtime, without which the two features above are inert: the
+    // devcontainers CLI shells out to `docker build`, and `am start` has nothing
+    // to run a session in.
+    //
+    // Outside-of-docker rather than a nested runtime because `am` runs session
+    // containers with `--rm` (container.rs) and names built images
+    // `am-dc-<config-hash>` so an unchanged config skips the build. A nested
+    // runtime keeps its image store inside this container, so that cache would be
+    // destroyed on every teardown and every `am start` would rebuild from scratch.
+    // Sharing the host's runtime keeps the cache on the host, where it persists.
+    //
+    // Sibling containers are the tradeoff: they outlive this one, so a crashed
+    // build can leave images behind for `podman rm`/`podman rmi`.
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      // Podman's Docker-compatible API does not implement buildkit. The CLI's
+      // `--buildkit auto` probes for buildx and uses it when present, so leaving
+      // buildx installed would make it pick a path the socket cannot serve.
+      "installDockerBuildx": false
+    }
   },
+
+  // The feature contributes this same target with `/var/run/docker.sock` as its
+  // source, which does not exist on a rootless-podman host. Config is merged after
+  // features and mounts are deduplicated by target, so this entry replaces it.
+  //
+  // The feature's socat proxy is what makes the socket reachable, not a nicety:
+  // rootless podman maps the host user to container root, so the bind-mounted
+  // socket lands owned by uid 0 while the session runs as `vscode`. The proxy
+  // re-exposes it at /var/run/docker.sock with the right ownership.
+  "mounts": [
+    "source=/run/user/1000/podman/podman.sock,target=/var/run/docker-host.sock,type=bind"
+  ],
 
   // Installed here rather than in the Dockerfile because the Node feature is
   // layered on after it. The package is a single dependency-free script, so the
