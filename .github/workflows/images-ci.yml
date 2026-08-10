@@ -1,0 +1,100 @@
+name: Image Build
+
+# ci.yml is scoped to the Rust build and its `paths` filter covers src/tests
+# only, so Dockerfile changes used to land with no checks at all — including the
+# base image and pinned-tool bumps Renovate opens. This workflow builds them.
+#
+# Kept separate from ci.yml rather than widening its filter: GitHub path filters
+# are workflow-level, so a Dockerfile-only change would otherwise spend a macOS
+# and a Windows runner on a cross-build that cannot be affected by it.
+
+on:
+  pull_request:
+    paths:
+      - 'dockerfiles/**'
+      - 'examples/Dockerfile.*'
+      - '.devcontainer/**'
+      - 'requirements-docs.txt'
+      - '.github/workflows/images-ci.yml'
+
+permissions:
+  contents: read
+  # The example images build FROM ghcr.io/dstanek/am-claude-minimal.
+  packages: read
+
+concurrency:
+  group: images-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: am-claude
+            dockerfile: dockerfiles/Dockerfile.claude
+          - name: am-claude-minimal
+            dockerfile: dockerfiles/Dockerfile.claude-minimal
+          - name: am-copilot
+            dockerfile: dockerfiles/Dockerfile.copilot
+          - name: am-copilot-minimal
+            dockerfile: dockerfiles/Dockerfile.copilot-minimal
+          # Installs requirements-docs.txt, so this gates the docs toolchain too.
+          - name: am-docs
+            dockerfile: dockerfiles/Dockerfile.docs
+          # The only consumer of the annotated GO_VERSION.
+          - name: example-golang
+            dockerfile: examples/Dockerfile.golang
+          - name: example-python
+            dockerfile: examples/Dockerfile.python
+          - name: example-rust
+            dockerfile: examples/Dockerfile.rust
+          - name: example-terraform
+            dockerfile: examples/Dockerfile.terraform
+          - name: example-terragrunt
+            dockerfile: examples/Dockerfile.terragrunt
+          # dockerfiles/Dockerfile.am-dev is deliberately absent: it builds FROM
+          # the locally-tagged am-rust:latest, which only `make build-am-dev`
+          # produces, and .devcontainer/ has replaced it for development.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # amd64 only, and never pushed — this asks "does it still build?".
+          # images.yml builds the full multi-arch set on release.
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=ci-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.name }}
+
+  devcontainer:
+    name: Build devcontainer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      # The reference CLI, not `docker build`: this is the path `am` itself takes
+      # in devcontainer mode, so it exercises the features and the annotated
+      # JJ_VERSION together.
+      - name: Build
+        run: npx --yes @devcontainers/cli devcontainer build --workspace-folder .

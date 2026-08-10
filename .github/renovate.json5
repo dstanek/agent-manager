@@ -42,6 +42,18 @@
       enabled: false,
     },
     {
+      description: "Ubuntu publishes codename tags (`questing-20260610`) alongside `25.10`, and docker versioning reads them as the newer release — it would rewrite the FROM lines to a dated codename. The `ubuntu` scheme understands YY.MM releases and ignores the rest.",
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["ubuntu"],
+      versioning: "ubuntu",
+      // Even under `ubuntu` versioning a dated rebuild tag parses as a patch of
+      // the current release, and taking it would swap the rolling release tag
+      // for a frozen snapshot. Restricting to YY.MM drops them at the version
+      // list rather than at update generation, where `enabled: false` does not
+      // reach.
+      allowedVersions: "/^\\d+\\.\\d+$/",
+    },
+    {
       description: "One PR for all non-major crate bumps; majors stay separate so they get read.",
       matchManagers: ["cargo"],
       matchUpdateTypes: ["minor", "patch"],
@@ -84,6 +96,18 @@
       // Upstream release tags carry a leading `v` (jj tags `v0.44.0`); the ARG
       // values do not, and the download URLs add it back themselves.
       extractVersionTemplate: "^v?(?<version>.+)$",
+    },
+    {
+      customType: "regex",
+      description: "Versions passed as devcontainer *feature options*. The devcontainer manager updates the feature reference (`node:1`) but never looks inside its option object, so an annotated option is the only way the Node line gets tracked.",
+      managerFilePatterns: [
+        "/(^|/)\\.devcontainer/devcontainer\\.json$/",
+        "/(^|/)\\.devcontainer\\.json$/",
+      ],
+      matchStrings: [
+        "//\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+?)(?:\\s+versioning=(?<versioning>\\S+?))?\\s*\\n\\s*\"[^\"]+\":\\s*\"(?<currentValue>[^\"]+)\"",
+      ],
+      versioningTemplate: "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
     },
   ],
 }
