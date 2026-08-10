@@ -3,7 +3,42 @@
 `am` is a single Rust binary with no non-Rust build dependencies, so it builds
 cleanly on every supported platform with a stock toolchain.
 
+## Developing in a dev container
+
+The repo ships a [`.devcontainer/`](https://github.com/dstanek/agent-manager/tree/main/.devcontainer)
+with everything the project's own checks need: the Rust toolchain with clippy and
+rustfmt, `jj`, `tmux`, the docs toolchain, Node with `@devcontainers/cli`, and
+`gh`. Open it in any editor that supports dev containers, or build it directly:
+
+```sh
+devcontainer build --workspace-folder .
+```
+
+`am` can also use it for its own sessions — the project dogfooding the feature:
+
+```toml
+# .am/config.toml
+[container]
+mode = "devcontainer"
+```
+
+`.am/` is gitignored, so that opt-in is per-checkout rather than something the
+repo can set for you.
+
+Two things are deliberately **not** in the image. There is no container runtime
+inside it, so `am start` itself has to be run on the host — the test suite mocks
+Podman and Docker via `AM_PODMAN_BIN`/`AM_DOCKER_BIN` and needs neither. And `jj`
+is pinned by `ARG JJ_VERSION` in the Dockerfile rather than tracking latest, so a
+new jj release cannot change what CI-equivalent local runs are testing against.
+
+!!! note "Rebuild after changing the docs requirements"
+    `am`'s config hash covers `devcontainer.json` and the Dockerfile, but not
+    other files in the build context. `requirements-docs.txt` is one of those, so
+    run `am start <slug> --rebuild` after changing it.
+
 ## Prerequisites
+
+Building outside a dev container needs:
 
 - [Rust](https://rustup.rs) 1.70 or later (edition 2021)
 - A C linker, which every supported platform already provides:

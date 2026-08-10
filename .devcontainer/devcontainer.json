@@ -1,0 +1,49 @@
+{
+  // Development environment for `am` itself — and the project dogfooding its own
+  // devcontainer support. `am start <slug>` with container.mode = "devcontainer"
+  // builds this and runs the session in it.
+  //
+  // Replaces the am-claude-minimal -> am-rust -> am-dev image chain, which had to
+  // be built locally and in order via `make build-am-dev`.
+  "name": "am (Agent Manager)",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    // Repo root, so the Dockerfile can read requirements-docs.txt rather than
+    // restating the docs dependencies.
+    "context": ".."
+  },
+
+  "features": {
+    // Node is here for @devcontainers/cli, which `am` shells out to in
+    // devcontainer mode. Working on that code path without it means the
+    // integration tests pass and the real thing is never exercised.
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // Installed here rather than in the Dockerfile because the Node feature is
+  // layered on after it. The package is a single dependency-free script, so the
+  // reinstall this incurs on each `am start` costs a second or so.
+  "postCreateCommand": "npm install -g @devcontainers/cli",
+
+  // mkdocs serve
+  "forwardPorts": [8000],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}
