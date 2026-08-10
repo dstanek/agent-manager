@@ -388,8 +388,14 @@ so any post-worktree failure rolls the worktree back.
 ## Phases
 
 0. ~~**Spike**~~ — **done 2026-08-09**, see *Spike results*.
-1. **Phase 1** — mode selection, discovery, hash/caching, build, merge, run, lifecycle hooks,
-   agent injection, trust gate, worktree rollback, session state, docs. **git and jj both.**
+1. ~~**Phase 1**~~ — **done 2026-08-10.** Mode selection, discovery, hash/caching, build,
+   merge, run, lifecycle hooks, agent injection, trust gate, worktree rollback, session
+   state, docs; git and jj both. Landed as `src/devcontainer.rs` plus a `DevcontainerRuntime`
+   parameter on `container::build_run_command` and a `plan_container` split in `cmd_start`.
+   Two deviations from this plan, both forced by `am` running containers with `--rm`:
+   create-time lifecycle hooks re-run on every start (the previous container's filesystem is
+   gone, so anything they installed must be reinstalled), and `postAttachCommand` is not run
+   at all because `am attach` moves tmux focus rather than attaching to the container.
 2. **Phase 2** — `userEnvProbe`, `forwardPorts`, vendored CLI bundle if friction warrants.
 3. **Phase 3** — compose, if worth owning.
 4. **Optional** — replace the build step with a native Rust feature-builder, ideally as its own
