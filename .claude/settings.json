@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(make *)",
+      "Bash(jj *)",
+      "Bash(git *)",
+      "Bash(rustup *)",
+      "Bash(ls *)",
+      "Bash(pwd)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(diff *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(chmod *)",
+      "Bash(touch *)",
+      "Bash(which *)",
+      "Bash(env)",
+      "Bash(echo *)",
+      "Bash(true)",
+      "Bash(test *)",
+      "Bash(apt-get *)",
+      "Bash(apt *)",
+      "Bash(dpkg *)",
+      "Bash(pip *)",
+      "Bash(pip3 *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ]
+  }
+}
