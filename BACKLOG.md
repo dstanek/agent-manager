@@ -124,15 +124,21 @@ built-in integration required. Depends on the decoupling above.
 
 ### `am doctor` readiness check
 
-Add a command that reports what's present/missing for a first successful
-`am start`: repo + VCS, `.am/` initialized, container runtime, an available
-image, tmux, and (per selected integration) required credentials/paths. Reuses
-the existing preflight checks in `container.rs`. Preferred over silently
-auto-bootstrapping `.am/` on `am start`.
+**Done.** `src/doctor.rs` reports repo + VCS, `.am/` initialization, git identity, tmux,
+container runtime, environment source, and per-agent credentials — and in devcontainer
+mode the CLI and its version, Node ≥ 20, the discovered config, whether the built image
+is current for the config hash, and constructs `am` refuses (`dockerComposeFile`) or drops
+(`initializeCommand`, `runArgs`).
 
-Once dev container support lands, also report: devcontainer CLI present, Node ≥ 20,
-a discovered `.devcontainer/` config, whether its built image is current, and any
-unsupported (compose) or gated (`initializeCommand`, `privileged`) constructs.
+The checks call the same functions `cmd_start` does (`detect_runtime`,
+`validate_agent_credentials`, `devcontainer::find_config`), so a passing report and a
+working `am start` cannot drift apart. Exits 1 on any failure, so it gates a setup script;
+warnings alone do not fail. It mutates nothing, which is what makes it the alternative to
+auto-bootstrapping `.am/` as a side effect of `am start`.
+
+Not covered: `privileged` and `capAdd` are label-only properties, so they cannot be
+reported until the image has been built. Only the config-visible gated constructs
+(`initializeCommand`, `runArgs`) are checked.
 
 ### Session observability in `am list`
 

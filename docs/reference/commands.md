@@ -28,6 +28,58 @@ Running `am init` in a directory that is not a git or jj repository is an error.
 
 ---
 
+## `am doctor`
+
+Report what is and is not ready for a successful `am start`, without changing anything.
+
+**Usage**
+
+```sh
+am doctor
+```
+
+**What it checks**
+
+| Section | Checks |
+|---|---|
+| Repository | Inside a git or jj repo |
+| Project setup | `.am/` initialized, git identity available |
+| tmux | Binary present, and whether you are currently inside a session |
+| Container runtime | Podman or Docker present (respects `container.runtime`) |
+| Environment | Where the environment comes from, and whether that source is usable |
+| Agent | Selected agent is known, and its credentials are present on this host |
+
+In dev container mode the Environment section additionally reports the discovered
+config, the `devcontainer` CLI and its version, Node 20+, whether the built image is
+current for the config hash, and any construct `am` will refuse (`dockerComposeFile`) or
+drop (`initializeCommand`, `runArgs`).
+
+**Output**
+
+Each check is `✓` (ready), `!` (usable, worth knowing), or `✗` (will stop `am start`),
+with the fix indented underneath:
+
+```
+Environment
+  ✓ source                 devcontainer at /path/to/.devcontainer/devcontainer.json
+  ✗ devcontainer CLI       'devcontainer' not found on PATH
+      → npm install -g @devcontainers/cli (needs Node 20+), or set container.mode = "image"
+  ✓ node                   v22.23.2 (>= 20 required)
+  ! built image            am-dc-f260010a69f5 not built yet
+      → the next 'am start' will build it — this can take a few minutes
+```
+
+**Exit code**
+
+`0` when nothing would stop `am start`, `1` otherwise. Warnings alone do not fail, so
+`am doctor && am start feat` is a usable setup gate.
+
+!!! note "Discovery uses your current checkout"
+    A session gets a fresh worktree off `HEAD`, so an *uncommitted* `devcontainer.json`
+    is not what that session will see. `am doctor` reports what is on disk now.
+
+---
+
 ## `am start <slug>`
 
 Create a new isolated agent session.

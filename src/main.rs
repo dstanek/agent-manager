@@ -3,6 +3,7 @@ mod command;
 mod config;
 mod container;
 mod devcontainer;
+mod doctor;
 mod error;
 mod messages;
 mod session;
@@ -43,6 +44,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Attach { slug } => cmd_attach(&slug),
         Commands::Run { slug, agent } => cmd_run(&slug, &agent),
         Commands::Destroy { slug, force } => cmd_destroy(&slug, force, &msgs),
+        Commands::Doctor => cmd_doctor(None),
         Commands::GenerateConfig => cmd_generate_config(),
     }
 }
@@ -789,6 +791,25 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
     session::remove_session(&repo_root, slug)?;
 
     println!("Destroyed session '{slug}'.");
+    Ok(())
+}
+
+// ── am doctor ─────────────────────────────────────────────────────────────────
+
+/// Report readiness without changing anything.
+///
+/// Exits non-zero when something would stop `am start` from working, so it is usable as a
+/// setup gate in a script. Warnings alone do not fail.
+fn cmd_doctor(agent_flag: Option<&str>) -> anyhow::Result<()> {
+    let repo = find_repo_root().ok();
+    let report = doctor::run(
+        repo.as_ref().map(|(root, vcs)| (root.as_path(), vcs.clone())),
+        agent_flag,
+    );
+    print!("{}", report.render());
+    if report.failures() > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

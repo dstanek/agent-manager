@@ -33,6 +33,14 @@ fn tmux_bin() -> Result<PathBuf> {
         .map_err(|_| AmError::TmuxError("tmux not found on PATH".to_string()).into())
 }
 
+/// Locate tmux without requiring it, for readiness reporting.
+///
+/// `am` works outside tmux — it launches the container directly — so callers that
+/// only want to *know* whether tmux is available should not have to handle an error.
+pub fn find_tmux() -> Option<PathBuf> {
+    tmux_bin().ok()
+}
+
 fn run_tmux(bin: &Path, args: &[&str]) -> Result<()> {
     command::run_command(&bin.to_string_lossy(), args, AmError::TmuxError)
 }

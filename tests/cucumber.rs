@@ -190,7 +190,14 @@ impl AmWorld {
         fs::write(
             &bin,
             format!(
+                // --version is answered before anything else and is not logged: `am
+                // doctor` probes it, and treating a probe as a build would both create
+                // the built-image marker and inflate the call count.
                 "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then\n\
+                     echo '0.88.0'\n\
+                     exit 0\n\
+                 fi\n\
                  if [ -n \"$MOCK_DEVCONTAINER_LOG\" ]; then\n\
                      echo \"$@\" >> \"$MOCK_DEVCONTAINER_LOG\"\n\
                  fi\n{body}"
@@ -560,6 +567,12 @@ async fn then_session_not_contain(world: &mut AmWorld, slug: String) {
 async fn then_file_exists(world: &mut AmWorld, rel_path: String) {
     let path = world.project_path().join(&rel_path);
     assert!(path.exists(), "expected file at {path:?} to exist");
+}
+
+#[then(expr = "the file {string} does not exist")]
+async fn then_file_absent(world: &mut AmWorld, rel_path: String) {
+    let path = world.project_path().join(&rel_path);
+    assert!(!path.exists(), "expected no file at {path:?}");
 }
 
 #[then(expr = "the file {string} contains {string}")]

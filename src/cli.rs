@@ -56,6 +56,9 @@ pub enum Commands {
         rebuild: bool,
     },
 
+    /// Report what is and is not ready for a successful `am start`
+    Doctor,
+
     /// List all sessions
     List,
 
