@@ -1,0 +1,18 @@
+{
+  // JSONC comment, and a trailing comma below, to confirm am must parse JSONC
+  "name": "am-spike",
+  "image": "mcr.microsoft.com/devcontainers/base:bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+  "containerEnv": { "AM_SPIKE": "from-devcontainer-json" },
+  "remoteEnv": { "AM_REMOTE": "remote-only" },
+  "mounts": [
+    "source=${localWorkspaceFolder}/.am-spike-mount,target=/mnt/am-spike,type=bind,consistency=cached"
+  ],
+  "remoteUser": "vscode",
+  "postCreateCommand": "echo post-create-from-json",
+  "postStartCommand": "echo post-start-from-json",
+  "waitFor": "postCreateCommand",
+}

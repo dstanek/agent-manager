@@ -1,0 +1,80 @@
+[
+  {
+    "id": "ghcr.io/devcontainers/features/common-utils:2"
+  },
+  {
+    "id": "ghcr.io/devcontainers/features/git:1",
+    "customizations": {
+      "vscode": {
+        "settings": {
+          "github.copilot.chat.codeGeneration.instructions": [
+            {
+              "text": "This dev container includes an up-to-date version of Git, built from source as needed, pre-installed and available on the `PATH`."
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "remoteUser": "vscode"
+  },
+  {
+    "id": "ghcr.io/devcontainers/features/docker-outside-of-docker:1",
+    "securityOpt": [
+      "label=disable"
+    ],
+    "entrypoint": "/usr/local/share/docker-init.sh",
+    "mounts": [
+      {
+        "source": "/var/run/docker.sock",
+        "target": "/var/run/docker-host.sock",
+        "type": "bind"
+      }
+    ],
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "ms-azuretools.vscode-containers"
+        ],
+        "settings": {
+          "github.copilot.chat.codeGeneration.instructions": [
+            {
+              "text": "This dev container includes the Docker CLI (`docker`) pre-installed and available on the `PATH` for running and managing containers using the Docker daemon on the host machine."
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "ghcr.io/devcontainers/features/sshd:1",
+    "entrypoint": "/usr/local/share/ssh-init.sh",
+    "customizations": {
+      "vscode": {
+        "settings": {
+          "github.copilot.chat.codeGeneration.instructions": [
+            {
+              "text": "This dev container includes an SSH server so that you can use an external terminal, sftp, or SSHFS to interact with it. The first time you've started the container, you will want to set a password for your user. With each connection to the container, you'll want to forward the SSH port to your local machine and use a local terminal or other tool to connect using the password you set."
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "postCreateCommand": "echo post-create-from-json",
+    "postStartCommand": "echo post-start-from-json",
+    "waitFor": "postCreateCommand",
+    "mounts": [
+      "source=${localWorkspaceFolder}/.am-spike-mount,target=/mnt/am-spike,type=bind,consistency=cached"
+    ],
+    "containerEnv": {
+      "AM_SPIKE": "from-devcontainer-json"
+    },
+    "remoteUser": "vscode",
+    "remoteEnv": {
+      "AM_REMOTE": "remote-only"
+    }
+  }
+]

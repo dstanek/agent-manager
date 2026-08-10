@@ -1,0 +1,58 @@
+[
+  {
+    "id": "ghcr.io/devcontainers/features/common-utils:2"
+  },
+  {
+    "id": "ghcr.io/devcontainers/features/git:1",
+    "customizations": {
+      "vscode": {
+        "settings": {
+          "github.copilot.chat.codeGeneration.instructions": [
+            {
+              "text": "This dev container includes an up-to-date version of Git, built from source as needed, pre-installed and available on the `PATH`."
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "remoteUser": "vscode"
+  },
+  {
+    "onCreateCommand": "echo on-create",
+    "updateContentCommand": "echo update-content",
+    "postCreateCommand": [
+      "echo",
+      "array-form"
+    ],
+    "postAttachCommand": {
+      "named": "echo named-form"
+    },
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "foo.bar"
+        ]
+      }
+    },
+    "containerUser": "root",
+    "init": true,
+    "privileged": true,
+    "capAdd": [
+      "SYS_ADMIN"
+    ],
+    "securityOpt": [
+      "seccomp=unconfined"
+    ],
+    "remoteUser": "vscode",
+    "userEnvProbe": "loginInteractiveShell",
+    "overrideCommand": false,
+    "forwardPorts": [
+      3000,
+      "db:5432"
+    ],
+    "shutdownAction": "stopContainer",
+    "updateRemoteUserUID": true
+  }
+]

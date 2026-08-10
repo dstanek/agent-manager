@@ -109,6 +109,8 @@ to "run this image, mount these creds, exec this command."
       the three, so nothing breaks for existing users.
 - [ ] Make integration optional: an unknown/custom command with no preset should
       be allowed (this is what makes the tool genuinely "harness-agnostic").
+- [ ] Blocks **Dev Container Support** (below): in devcontainer mode there is no
+      `am`-resolved image at all, so `--agent claude` must stop implying one.
 
 ### Custom-harness fast path
 
@@ -123,6 +125,10 @@ Add a command that reports what's present/missing for a first successful
 image, tmux, and (per selected integration) required credentials/paths. Reuses
 the existing preflight checks in `container.rs`. Preferred over silently
 auto-bootstrapping `.am/` on `am start`.
+
+Once dev container support lands, also report: devcontainer CLI present, Node ≥ 20,
+a discovered `.devcontainer/` config, whether its built image is current, and any
+unsupported (compose) or gated (`initializeCommand`, `privileged`) constructs.
 
 ### Session observability in `am list`
 
@@ -147,6 +153,49 @@ window still exists, and stale/broken markers.
   `destroy` kills the window outright; the `original_window_name` /
   `original_shell_dir` restore machinery is retained only to read session records
   written by older versions.
+
+---
+
+## Dev Container Support
+
+Full plan: [`specs/devcontainer-support.md`](specs/devcontainer-support.md).
+
+Let a session's environment come from the repo's own `.devcontainer/devcontainer.json`
+instead of an `am`-specific image, so projects stop maintaining a second, `am`-shaped
+image alongside the one they already describe for editors and CI.
+
+Design is a **build/run split**: delegate `devcontainer build` to the reference CLI (the
+half with all the complexity and churn — OCI feature resolution, install ordering,
+Dockerfile generation), then run the resulting image with `am`'s existing mount, user,
+network, and SELinux machinery in `container.rs`. Because `am` keeps the run path,
+host-path mirroring still applies and **both git worktrees and jj workspaces work** with
+no CLI-side workarounds. Images are keyed by a config hash, so the Node CLI runs once per
+config change rather than once per session.
+
+Depends on the decoupling item above.
+
+- [x] **Phase 0 — spike.** Done 2026-08-09 against CLI 0.88.0 + podman; results and their
+      implementation consequences are in the spec's *Spike results*. Both technical questions
+      came back favorable: the run path is Node-free after build, and `build` exits 1 on
+      error. Only the `auto`-as-default question is still open, and that is a product call.
+- [ ] **Phase 1.** `container.mode` selection, config discovery in the worktree,
+      config-hash image caching, build step, metadata/JSON merge, run step, lifecycle
+      hooks, agent injection, trust gate, session state, docs. git and jj both.
+- [ ] **Phase 2.** `userEnvProbe`, `forwardPorts`, and vendoring the CLI bundle if
+      `npm install -g @devcontainers/cli` proves to be real friction (it is one
+      dependency-free 1.7 MB script, so this is cheap).
+- [ ] **Phase 3.** Docker Compose configs (`dockerComposeFile`), if worth owning.
+- [ ] **Optional.** Replace the build step with a native Rust feature-builder, ideally as
+      its own crate — crates.io has no devcontainer runtime today. The run path is
+      unaffected by design.
+
+Prerequisites this surfaces, worth doing regardless of devcontainer mode:
+
+- [ ] `WorktreeGuard` with an explicit `commit()`, so a failed `am start` rolls the
+      worktree back instead of leaving one behind.
+- [ ] Split `cmd_start` preflight into pre-worktree checks (runtime, credentials, slug)
+      and post-worktree checks, since a devcontainer config can only be read after the
+      worktree exists.
 
 ---
 
