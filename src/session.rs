@@ -6,11 +6,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AmError;
 
+/// Where a session's image came from. Recorded so `am list` can distinguish the two and
+/// so a rebuild can tell whether the environment is still current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerMode {
+    #[default]
+    Image,
+    Devcontainer,
+}
+
+impl std::fmt::Display for ContainerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContainerMode::Image => write!(f, "image"),
+            ContainerMode::Devcontainer => write!(f, "devcontainer"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContainer {
     pub runtime: String,
     pub image: String,
     pub container_id: Option<String>,
+    /// Defaults to `Image` so records written before devcontainer support still load.
+    #[serde(default)]
+    pub mode: ContainerMode,
+    /// The devcontainer config this session was built from, if any.
+    #[serde(default)]
+    pub config_path: Option<PathBuf>,
+    /// Hash of that config, for detecting a stale environment.
+    #[serde(default)]
+    pub config_hash: Option<String>,
+    /// `remoteUser`/`containerUser` the image runs as.
+    #[serde(default)]
+    pub remote_user: Option<String>,
+    /// Which create-time lifecycle hooks have already run, so they run exactly once.
+    #[serde(default)]
+    pub lifecycle_done: Vec<String>,
+}
+
+impl SessionContainer {
+    /// A record for a plain `am`-resolved image, with no devcontainer involvement.
+    pub fn image_mode(runtime: String, image: String) -> Self {
+        Self {
+            runtime,
+            image,
+            container_id: None,
+            mode: ContainerMode::Image,
+            config_path: None,
+            config_hash: None,
+            remote_user: None,
+            lifecycle_done: Vec::new(),
+        }
+    }
 }
 
 /// VCS-specific metadata for a session (git branch and worktree path).
@@ -192,16 +242,69 @@ mod tests {
     fn sessions_roundtrip_json() {
         let tmp = TempDir::new().unwrap();
         let mut s = make_session("feat");
-        s.container = Some(SessionContainer {
-            runtime: "podman".to_string(),
-            image: "myimage:latest".to_string(),
-            container_id: Some("abc123".to_string()),
-        });
+        let mut container =
+            SessionContainer::image_mode("podman".to_string(), "myimage:latest".to_string());
+        container.container_id = Some("abc123".to_string());
+        s.container = Some(container);
         add_session(tmp.path(), s).unwrap();
 
         let loaded = load_sessions(tmp.path()).unwrap();
         let c = loaded[0].container.as_ref().unwrap();
         assert_eq!(c.runtime, "podman");
         assert_eq!(c.container_id.as_deref(), Some("abc123"));
+        assert_eq!(c.mode, ContainerMode::Image);
+    }
+
+    #[test]
+    fn devcontainer_session_roundtrips_json() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = make_session("feat");
+        s.container = Some(SessionContainer {
+            runtime: "podman".to_string(),
+            image: "am-dc-abc123".to_string(),
+            container_id: None,
+            mode: ContainerMode::Devcontainer,
+            config_path: Some(PathBuf::from(".devcontainer/devcontainer.json")),
+            config_hash: Some("abc123".to_string()),
+            remote_user: Some("vscode".to_string()),
+            lifecycle_done: vec!["postCreateCommand".to_string()],
+        });
+        add_session(tmp.path(), s).unwrap();
+
+        let loaded = load_sessions(tmp.path()).unwrap();
+        let c = loaded[0].container.as_ref().unwrap();
+        assert_eq!(c.mode, ContainerMode::Devcontainer);
+        assert_eq!(c.config_hash.as_deref(), Some("abc123"));
+        assert_eq!(c.remote_user.as_deref(), Some("vscode"));
+        assert_eq!(c.lifecycle_done, vec!["postCreateCommand".to_string()]);
+    }
+
+    #[test]
+    fn records_written_before_devcontainer_support_still_load() {
+        // Sessions on disk predate every field added for devcontainer mode; a user
+        // upgrading am must not have to destroy their running sessions.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        std::fs::write(
+            tmp.path().join(".am").join("sessions.json"),
+            r#"{"sessions":[{
+                "slug":"legacy",
+                "created_at":"2026-01-01T00:00:00Z",
+                "branch":"am/legacy",
+                "worktree_path":".am/worktrees/legacy",
+                "tmux_window":"am-legacy",
+                "agent_pane":"am-legacy.1",
+                "shell_pane":"am-legacy.0",
+                "container":{"runtime":"podman","image":"old:latest","container_id":null}
+            }]}"#,
+        )
+        .unwrap();
+
+        let loaded = load_sessions(tmp.path()).unwrap();
+
+        let c = loaded[0].container.as_ref().unwrap();
+        assert_eq!(c.mode, ContainerMode::Image);
+        assert!(c.config_hash.is_none());
+        assert!(c.lifecycle_done.is_empty());
     }
 }

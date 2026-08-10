@@ -59,6 +59,22 @@ where
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
+/// Quote a single token for a POSIX shell, leaving already-safe tokens bare.
+///
+/// Used both for `tmux send-keys` lines and for the `sh -c` script that chains
+/// devcontainer entrypoints, so the escaping rule lives in one place.
+pub fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.chars().all(|c| {
+            matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '/' | ':' | '=' | '+' | '@' | '%')
+        });
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// Execute a command and return success/failure.
 ///
 /// The `error_fn` closure is called to construct an error if the command

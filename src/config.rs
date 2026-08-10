@@ -47,12 +47,48 @@ pub enum NetworkMode {
     None,
 }
 
+/// Where a session's container environment comes from.
+///
+/// The default is `Image` rather than `Auto` on purpose: `Auto` changes what `am start`
+/// does for every repo that already has a `.devcontainer/`, and that should be an opt-in
+/// for at least one release rather than an upgrade surprise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerMode {
+    /// An `am`-resolved image (`container.image` or `agents.<name>.image`).
+    #[default]
+    Image,
+    /// The repo's own `.devcontainer/devcontainer.json`; error if there isn't one.
+    Devcontainer,
+    /// Devcontainer when a config is discovered, image otherwise.
+    Auto,
+}
+
+/// How the agent gets into a devcontainer image, which the project's own config
+/// naturally knows nothing about.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentInstall {
+    /// Inject a devcontainer Feature at build time, baked into the cached image.
+    Feature,
+    /// Install into a named volume shared across sessions. Works on any base image.
+    Bootstrap,
+    /// The devcontainer already provides the agent.
+    None,
+    /// `feature` if one is mapped for the agent, else `bootstrap`.
+    #[default]
+    Auto,
+}
+
 // ── Config structs ────────────────────────────────────────────────────────────
 
-/// Per-agent configuration (image override, etc.)
+/// Per-agent configuration (image override, devcontainer Feature, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentSettings {
     pub image: Option<String>,
+    /// Devcontainer Feature that installs this agent, injected via
+    /// `--additional-features` when `devcontainer.agent_install` selects it.
+    pub devcontainer_feature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +135,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub enabled: bool,
+    pub mode: ContainerMode,
     pub runtime: RuntimePreference,
     pub image: Option<String>,
     pub agent: Option<String>,
@@ -113,6 +150,7 @@ impl Default for ContainerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: ContainerMode::default(),
             runtime: RuntimePreference::Auto,
             image: None,
             agent: None,
@@ -125,6 +163,40 @@ impl Default for ContainerConfig {
     }
 }
 
+/// Settings that only apply when a session's environment comes from a
+/// `devcontainer.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevcontainerConfig {
+    /// Explicit config path, relative to the session worktree. `None` = discover.
+    pub path: Option<PathBuf>,
+    /// The `devcontainer` CLI binary. Overridden by `AM_DEVCONTAINER_BIN`.
+    pub cli: String,
+    pub agent_install: AgentInstall,
+    /// Whether `initializeCommand` may run on the host. Off by default —
+    /// `am` exists to isolate agents, and this is repo-controlled code.
+    pub allow_host_commands: bool,
+    /// Skip every in-container lifecycle hook.
+    pub skip_lifecycle: bool,
+    /// Override the container home derived from `remoteUser`/`containerUser`.
+    pub home: Option<PathBuf>,
+    /// Extra Features to inject at build time, as `id -> options JSON`.
+    pub extra_features: HashMap<String, String>,
+}
+
+impl Default for DevcontainerConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            cli: "devcontainer".to_string(),
+            agent_install: AgentInstall::default(),
+            allow_host_commands: false,
+            skip_lifecycle: false,
+            home: None,
+            extra_features: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub vcs: Vcs,
@@ -133,19 +205,33 @@ pub struct Config {
     pub agents: HashMap<String, AgentSettings>,
     pub tmux: TmuxConfig,
     pub container: ContainerConfig,
+    pub devcontainer: DevcontainerConfig,
 }
 
+/// Compiled-in per-agent defaults.
+///
+/// Only Claude Code has an official devcontainer Feature today; the others have no
+/// published Feature, so they fall through to the bootstrap install path.
 fn default_agent_images() -> HashMap<String, AgentSettings> {
     [
-        ("claude", "ghcr.io/dstanek/am-claude-minimal:latest"),
-        ("copilot", "ghcr.io/dstanek/am-copilot-minimal:latest"),
+        (
+            "claude",
+            Some("ghcr.io/dstanek/am-claude-minimal:latest"),
+            Some("ghcr.io/anthropics/devcontainer-features/claude-code:1"),
+        ),
+        (
+            "copilot",
+            Some("ghcr.io/dstanek/am-copilot-minimal:latest"),
+            None,
+        ),
     ]
     .into_iter()
-    .map(|(k, v)| {
+    .map(|(name, image, feature)| {
         (
-            k.to_string(),
+            name.to_string(),
             AgentSettings {
-                image: Some(v.to_string()),
+                image: image.map(str::to_string),
+                devcontainer_feature: feature.map(str::to_string),
             },
         )
     })
@@ -160,8 +246,18 @@ impl Default for Config {
             agents: default_agent_images(),
             tmux: TmuxConfig::default(),
             container: ContainerConfig::default(),
+            devcontainer: DevcontainerConfig::default(),
         }
     }
+}
+
+/// Resolve the devcontainer Feature that installs a given agent, if one is mapped.
+pub fn resolve_agent_feature<'a>(agent: Option<&str>, cfg: &'a Config) -> Option<&'a str> {
+    cfg.agents
+        .get(agent?)?
+        .devcontainer_feature
+        .as_deref()
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the container image for a given agent name.
@@ -192,6 +288,7 @@ struct FileDefaults {
 #[derive(Debug, Deserialize, Default)]
 struct FileAgentSettings {
     image: Option<String>,
+    devcontainer_feature: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -204,6 +301,7 @@ struct FileTmux {
 #[derive(Debug, Deserialize, Default)]
 struct FileContainer {
     enabled: Option<bool>,
+    mode: Option<ContainerMode>,
     runtime: Option<RuntimePreference>,
     image: Option<String>,
     agent: Option<String>,
@@ -212,6 +310,17 @@ struct FileContainer {
     gitconfig: Option<PathBuf>,
     ssh: Option<PathBuf>,
     user: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileDevcontainer {
+    path: Option<PathBuf>,
+    cli: Option<String>,
+    agent_install: Option<AgentInstall>,
+    allow_host_commands: Option<bool>,
+    skip_lifecycle: Option<bool>,
+    home: Option<PathBuf>,
+    extra_features: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -224,6 +333,8 @@ struct FileConfig {
     tmux: FileTmux,
     #[serde(default)]
     container: FileContainer,
+    #[serde(default)]
+    devcontainer: FileDevcontainer,
 }
 
 /// Overwrite `target` with `value` when present. `target` is a plain `T` (not `Option<T>`).
@@ -259,6 +370,10 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     for (name, file_agent) in file.agents {
         let entry = base.agents.entry(name).or_default();
         apply_opt_string(&mut entry.image, file_agent.image);
+        apply_opt_string(
+            &mut entry.devcontainer_feature,
+            file_agent.devcontainer_feature,
+        );
     }
 
     apply_opt(&mut base.tmux.agent_pane, file.tmux.agent_pane);
@@ -266,6 +381,7 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     apply_opt(&mut base.tmux.split_percent, file.tmux.split_percent);
 
     apply_opt(&mut base.container.enabled, file.container.enabled);
+    apply_opt(&mut base.container.mode, file.container.mode);
     apply_opt(&mut base.container.runtime, file.container.runtime);
     apply_opt_string(&mut base.container.image, file.container.image);
     apply_opt_string(&mut base.container.agent, file.container.agent);
@@ -277,6 +393,30 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
         if !u.is_empty() {
             base.container.user = u;
         }
+    }
+
+    apply_opt_some(&mut base.devcontainer.path, file.devcontainer.path);
+    if let Some(cli) = file.devcontainer.cli {
+        if !cli.is_empty() {
+            base.devcontainer.cli = cli;
+        }
+    }
+    apply_opt(
+        &mut base.devcontainer.agent_install,
+        file.devcontainer.agent_install,
+    );
+    apply_opt(
+        &mut base.devcontainer.allow_host_commands,
+        file.devcontainer.allow_host_commands,
+    );
+    apply_opt(
+        &mut base.devcontainer.skip_lifecycle,
+        file.devcontainer.skip_lifecycle,
+    );
+    apply_opt_some(&mut base.devcontainer.home, file.devcontainer.home);
+    // Features merge key-by-key so a project can add one without restating the global set.
+    if let Some(features) = file.devcontainer.extra_features {
+        base.devcontainer.extra_features.extend(features);
     }
 }
 
@@ -331,6 +471,7 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 
 [container]
 # enabled = true
+# mode = "image"         # "image" | "devcontainer" | "auto" (devcontainer when one is found)
 # runtime = "auto"       # "auto" | "podman" | "docker"
 # network = "full"       # "full" | "none"
 # env = []               # extra environment variables to pass into the container
@@ -338,6 +479,13 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 # ssh = ""               # path to SSH dir to mount (default: ~/.ssh)
 # image = ""             # override image for all agents (advanced; prefer [agents.<name>].image)
 # user = "am"            # username inside the container (used for credential mount paths)
+
+# Applies only when container.mode resolves to "devcontainer".
+[devcontainer]
+# path = ""                  # explicit devcontainer.json, relative to the worktree
+# agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
+# allow_host_commands = false # let initializeCommand run on the HOST — off by default
+# skip_lifecycle = false     # skip postCreateCommand and friends
 "#;
     std::fs::write(path, content)?;
     Ok(())
@@ -353,16 +501,21 @@ pub fn global_config_template() -> &'static str {
 # Environment variable overrides:
 #   AM_VCS, AM_AGENT
 #   AM_TMUX_AGENT_PANE, AM_TMUX_SPLIT, AM_TMUX_SPLIT_PERCENT
-#   AM_CONTAINER_ENABLED, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
+#   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
 #   AM_CONTAINER_AGENT, AM_CONTAINER_NETWORK, AM_CONTAINER_USER
+#   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS
+#   AM_DEVCONTAINER_BIN (path to the `devcontainer` CLI)
 
 [defaults]
 vcs = "git"            # "git" | "jj"
 agent = "claude"       # agent to launch; also selects the container image via [agents.<name>]
 
-# Per-agent image configuration. These are the compiled-in defaults — override here if needed.
+# Per-agent configuration. These are the compiled-in defaults — override here if needed.
+# `image` is used in container.mode = "image"; `devcontainer_feature` is injected at build
+# time in devcontainer mode when agent_install resolves to "feature".
 [agents.claude]
 image = "ghcr.io/dstanek/am-claude-minimal:latest"
+devcontainer_feature = "ghcr.io/anthropics/devcontainer-features/claude-code:1"
 
 [agents.copilot]
 image = "ghcr.io/dstanek/am-copilot-minimal:latest"
@@ -378,6 +531,10 @@ split_percent = 50     # percentage of the window given to the agent pane (1-99)
 
 [container]
 enabled = true
+mode = "image"         # where the environment comes from:
+                       #   "image"        — an am-resolved image (the default)
+                       #   "devcontainer" — the repo's .devcontainer/devcontainer.json
+                       #   "auto"         — devcontainer when one is found, image otherwise
 runtime = "auto"       # "auto" (podman first, then docker) | "podman" | "docker"
 network = "full"       # "full" (unrestricted) | "none" (no network access)
 env = []               # extra environment variables passed into the container, e.g. ["FOO=bar"]
@@ -385,6 +542,27 @@ env = []               # extra environment variables passed into the container, 
 # ssh = ""              # path to SSH dir to mount (default: ~/.ssh)
 # image = ""            # override image for all agents (advanced; prefer [agents.<name>].image above)
 # user = "am"           # username inside the container (used for credential mount paths)
+
+# Applies only when container.mode resolves to "devcontainer". Building requires the
+# `devcontainer` CLI (npm install -g @devcontainers/cli) and Node 20+. am builds the image
+# once per config change and runs it itself, so the CLI is not on the hot path.
+[devcontainer]
+# path = ""                    # explicit devcontainer.json, relative to the session worktree;
+                               # default is to discover .devcontainer/devcontainer.json
+cli = "devcontainer"           # CLI binary name or path (AM_DEVCONTAINER_BIN overrides)
+agent_install = "auto"         # how the agent gets into the image:
+                               #   "feature"   — inject the agent's devcontainer Feature at build
+                               #   "bootstrap" — install into a shared volume at run time
+                               #   "none"      — the devcontainer already provides it
+                               #   "auto"      — feature if one is mapped, else bootstrap
+allow_host_commands = false    # let initializeCommand run on YOUR HOST, outside the container.
+                               # Off by default: devcontainer.json is repo-controlled code.
+skip_lifecycle = false         # skip postCreateCommand and the other in-container hooks
+# home = ""                    # override the container home derived from remoteUser
+
+# Extra Features to inject at build time, as id -> options JSON:
+# [devcontainer.extra_features]
+# "ghcr.io/devcontainers/features/node:1" = "{}"
 "#
 }
 
@@ -438,6 +616,14 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
             _ => {}
         }
     }
+    if let Ok(val) = std::env::var("AM_CONTAINER_MODE") {
+        match val.as_str() {
+            "image" => config.container.mode = ContainerMode::Image,
+            "devcontainer" => config.container.mode = ContainerMode::Devcontainer,
+            "auto" => config.container.mode = ContainerMode::Auto,
+            _ => {}
+        }
+    }
     if let Ok(val) = std::env::var("AM_CONTAINER_RUNTIME") {
         match val.as_str() {
             "auto" => config.container.runtime = RuntimePreference::Auto,
@@ -476,6 +662,27 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
     if let Ok(val) = std::env::var("AM_CONTAINER_USER") {
         if !val.is_empty() {
             config.container.user = val;
+        }
+    }
+    if let Ok(val) = std::env::var("AM_DEVCONTAINER_PATH") {
+        if !val.is_empty() {
+            config.devcontainer.path = Some(PathBuf::from(val));
+        }
+    }
+    if let Ok(val) = std::env::var("AM_DEVCONTAINER_AGENT_INSTALL") {
+        match val.as_str() {
+            "feature" => config.devcontainer.agent_install = AgentInstall::Feature,
+            "bootstrap" => config.devcontainer.agent_install = AgentInstall::Bootstrap,
+            "none" => config.devcontainer.agent_install = AgentInstall::None,
+            "auto" => config.devcontainer.agent_install = AgentInstall::Auto,
+            _ => {}
+        }
+    }
+    if let Ok(val) = std::env::var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS") {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => config.devcontainer.allow_host_commands = true,
+            "false" | "0" | "no" => config.devcontainer.allow_host_commands = false,
+            _ => {}
         }
     }
     Ok(())
@@ -1063,5 +1270,155 @@ user = "../root"
         let err = load_with_global(None, None).unwrap_err();
 
         assert!(err.to_string().contains("../root"));
+    }
+
+    // ── Devcontainer settings ─────────────────────────────────────────────────
+
+    #[test]
+    fn container_mode_defaults_to_image() {
+        // Deliberate: "auto" would silently change am start for any repo that already
+        // has a .devcontainer/, which is not something an upgrade should do.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
+        std::env::remove_var("AM_CONTAINER_MODE");
+
+        let config = load_with_global(None, None).unwrap();
+
+        assert_eq!(config.container.mode, ContainerMode::Image);
+    }
+
+    #[test]
+    fn container_mode_reads_from_file() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
+        std::env::remove_var("AM_CONTAINER_MODE");
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[container]\nmode = \"devcontainer\"\n",
+        );
+
+        let config = load_with_global(None, Some(&path)).unwrap();
+
+        assert_eq!(config.container.mode, ContainerMode::Devcontainer);
+    }
+
+    #[test]
+    fn container_mode_env_overrides_file() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(tmp.path(), "project.toml", "[container]\nmode = \"image\"\n");
+        std::env::set_var("AM_CONTAINER_MODE", "auto");
+
+        let config = load_with_global(None, Some(&path)).unwrap();
+
+        assert_eq!(config.container.mode, ContainerMode::Auto);
+    }
+
+    #[test]
+    fn devcontainer_defaults_are_conservative() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_DEVCONTAINER_ALLOW_HOST_COMMANDS"]);
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS");
+
+        let config = load_with_global(None, None).unwrap();
+
+        assert!(!config.devcontainer.allow_host_commands);
+        assert!(!config.devcontainer.skip_lifecycle);
+        assert_eq!(config.devcontainer.agent_install, AgentInstall::Auto);
+        assert_eq!(config.devcontainer.cli, "devcontainer");
+    }
+
+    #[test]
+    fn devcontainer_section_reads_from_file() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&[
+            "AM_DEVCONTAINER_PATH",
+            "AM_DEVCONTAINER_AGENT_INSTALL",
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+        ]);
+        std::env::remove_var("AM_DEVCONTAINER_PATH");
+        std::env::remove_var("AM_DEVCONTAINER_AGENT_INSTALL");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS");
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[devcontainer]\n\
+             path = \".devcontainer/custom.json\"\n\
+             agent_install = \"bootstrap\"\n\
+             allow_host_commands = true\n",
+        );
+
+        let config = load_with_global(None, Some(&path)).unwrap();
+
+        assert_eq!(
+            config.devcontainer.path.as_deref(),
+            Some(Path::new(".devcontainer/custom.json"))
+        );
+        assert_eq!(config.devcontainer.agent_install, AgentInstall::Bootstrap);
+        assert!(config.devcontainer.allow_host_commands);
+    }
+
+    #[test]
+    fn extra_features_merge_rather_than_replace() {
+        // A project adding one Feature should not have to restate the global set.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let global = write_toml(
+            tmp.path(),
+            "global.toml",
+            "[devcontainer.extra_features]\n\"ghcr.io/x/a:1\" = \"{}\"\n",
+        );
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[devcontainer.extra_features]\n\"ghcr.io/x/b:1\" = \"{}\"\n",
+        );
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+
+        assert_eq!(config.devcontainer.extra_features.len(), 2);
+    }
+
+    #[test]
+    fn claude_maps_to_the_official_devcontainer_feature() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let config = load_with_global(None, None).unwrap();
+
+        assert_eq!(
+            resolve_agent_feature(Some("claude"), &config),
+            Some("ghcr.io/anthropics/devcontainer-features/claude-code:1")
+        );
+    }
+
+    #[test]
+    fn agents_without_a_published_feature_map_to_none() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let config = load_with_global(None, None).unwrap();
+
+        assert_eq!(resolve_agent_feature(Some("copilot"), &config), None);
+        assert_eq!(resolve_agent_feature(Some("gemini"), &config), None);
+        assert_eq!(resolve_agent_feature(None, &config), None);
+    }
+
+    #[test]
+    fn devcontainer_feature_can_be_overridden_per_agent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[agents.gemini]\ndevcontainer_feature = \"ghcr.io/me/gemini:1\"\n",
+        );
+
+        let config = load_with_global(None, Some(&path)).unwrap();
+
+        assert_eq!(
+            resolve_agent_feature(Some("gemini"), &config),
+            Some("ghcr.io/me/gemini:1")
+        );
     }
 }
