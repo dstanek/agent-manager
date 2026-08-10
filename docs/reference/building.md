@@ -14,16 +14,10 @@ rustfmt, `jj`, `tmux`, the docs toolchain, Node with `@devcontainers/cli`, and
 devcontainer build --workspace-folder .
 ```
 
-`am` can also use it for its own sessions — the project dogfooding the feature:
-
-```toml
-# .am/config.toml
-[container]
-mode = "devcontainer"
-```
-
-`.am/` is gitignored, so that opt-in is per-checkout rather than something the
-repo can set for you.
+`am` uses it for its own sessions automatically — the project dogfooding the
+feature. `container.mode` defaults to `"auto"`, so `am start <slug>` in this repo
+builds `.devcontainer/` and runs the session in it with no configuration at all.
+Set `mode = "image"` in `.am/config.toml` to opt out.
 
 Two things are deliberately **not** in the image. There is no container runtime
 inside it, so `am start` itself has to be run on the host — the test suite mocks

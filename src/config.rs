@@ -49,18 +49,19 @@ pub enum NetworkMode {
 
 /// Where a session's container environment comes from.
 ///
-/// The default is `Image` rather than `Auto` on purpose: `Auto` changes what `am start`
-/// does for every repo that already has a `.devcontainer/`, and that should be an opt-in
-/// for at least one release rather than an upgrade surprise.
+/// `Auto` is the default: a repo that has taken the trouble to describe its environment in
+/// `.devcontainer/devcontainer.json` almost certainly means for that description to be
+/// used, and preferring an `am`-specific image over it is the surprising behaviour. Repos
+/// without a config are unaffected, since `Auto` falls back to an image.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerMode {
     /// An `am`-resolved image (`container.image` or `agents.<name>.image`).
-    #[default]
     Image,
     /// The repo's own `.devcontainer/devcontainer.json`; error if there isn't one.
     Devcontainer,
     /// Devcontainer when a config is discovered, image otherwise.
+    #[default]
     Auto,
 }
 
@@ -471,7 +472,7 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 
 [container]
 # enabled = true
-# mode = "image"         # "image" | "devcontainer" | "auto" (devcontainer when one is found)
+# mode = "auto"          # "auto" (devcontainer when one is found) | "devcontainer" | "image"
 # runtime = "auto"       # "auto" | "podman" | "docker"
 # network = "full"       # "full" | "none"
 # env = []               # extra environment variables to pass into the container
@@ -531,10 +532,11 @@ split_percent = 50     # percentage of the window given to the agent pane (1-99)
 
 [container]
 enabled = true
-mode = "image"         # where the environment comes from:
-                       #   "image"        — an am-resolved image (the default)
-                       #   "devcontainer" — the repo's .devcontainer/devcontainer.json
-                       #   "auto"         — devcontainer when one is found, image otherwise
+mode = "auto"          # where the environment comes from:
+                       #   "auto"         — the repo's .devcontainer/devcontainer.json when
+                       #                    one is found, an am-resolved image otherwise
+                       #   "devcontainer" — the repo's config; error if there isn't one
+                       #   "image"        — an am-resolved image, ignoring any .devcontainer/
 runtime = "auto"       # "auto" (podman first, then docker) | "podman" | "docker"
 network = "full"       # "full" (unrestricted) | "none" (no network access)
 env = []               # extra environment variables passed into the container, e.g. ["FOO=bar"]
@@ -1275,14 +1277,29 @@ user = "../root"
     // ── Devcontainer settings ─────────────────────────────────────────────────
 
     #[test]
-    fn container_mode_defaults_to_image() {
-        // Deliberate: "auto" would silently change am start for any repo that already
-        // has a .devcontainer/, which is not something an upgrade should do.
+    fn container_mode_defaults_to_auto() {
+        // A repo that describes its environment in .devcontainer/ means for that
+        // description to be used; preferring an am-specific image over it is the
+        // surprising behaviour. Repos without a config fall back to an image.
         let _guard = ENV_MUTEX.lock().unwrap();
         let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
         std::env::remove_var("AM_CONTAINER_MODE");
 
         let config = load_with_global(None, None).unwrap();
+
+        assert_eq!(config.container.mode, ContainerMode::Auto);
+    }
+
+    #[test]
+    fn explicit_image_mode_still_overrides_the_default() {
+        // The escape hatch for a repo whose devcontainer am cannot use.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
+        std::env::remove_var("AM_CONTAINER_MODE");
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(tmp.path(), "project.toml", "[container]\nmode = \"image\"\n");
+
+        let config = load_with_global(None, Some(&path)).unwrap();
 
         assert_eq!(config.container.mode, ContainerMode::Image);
     }

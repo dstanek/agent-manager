@@ -443,7 +443,18 @@ array in every case.
 injected Feature before the `devcontainer.json` snippet, contributed no entrypoint or mounts,
 and put `claude` (2.1.197) on `PATH` for the `vscode` user.
 
-## Open questions
+## Resolved: the default mode
 
-1. **Should `auto` be the default from day one,** or `image` for one release? `auto` silently
-   changes what `am start` does for any repo that already has a `.devcontainer/`.
+**`auto` is the default.** Phase 1 shipped with `image` while this was open; it was flipped
+once the implementation existed to judge.
+
+The argument for `image` was that `auto` changes what `am start` does for any repo that
+already has a `.devcontainer/`. That reads the change the wrong way round. A repo that has
+taken the trouble to describe its environment means for that description to be used —
+preferring an `am`-specific image over it is the surprising behaviour, and it is exactly the
+duplication this feature exists to remove. Repos with no config are unaffected, because
+`auto` falls back to an image.
+
+The escape hatch is `mode = "image"`, and every error for an unsupported construct names it.
+
+No open questions remain.

@@ -109,8 +109,12 @@ to "run this image, mount these creds, exec this command."
       the three, so nothing breaks for existing users.
 - [ ] Make integration optional: an unknown/custom command with no preset should
       be allowed (this is what makes the tool genuinely "harness-agnostic").
-- [ ] Blocks **Dev Container Support** (below): in devcontainer mode there is no
-      `am`-resolved image at all, so `--agent claude` must stop implying one.
+Note: this was originally recorded as blocking **Dev Container Support**, and it
+turned out not to be. Devcontainer mode simply never resolves an `am` image —
+`config::resolve_image` is now called from exactly one place, `plan_image` — so
+`--agent claude` already stops implying an image on that path. The decoupling is
+still worth doing for the custom-harness fast path below; it is not a prerequisite
+for anything shipped.
 
 ### Custom-harness fast path
 
@@ -172,17 +176,16 @@ host-path mirroring still applies and **both git worktrees and jj workspaces wor
 no CLI-side workarounds. Images are keyed by a config hash, so the Node CLI runs once per
 config change rather than once per session.
 
-Depends on the decoupling item above.
-
 - [x] **Phase 0 — spike.** Done 2026-08-09 against CLI 0.88.0 + podman; results and their
       implementation consequences are in the spec's *Spike results*. Both technical questions
       came back favorable: the run path is Node-free after build, and `build` exits 1 on
-      error. Only the `auto`-as-default question is still open, and that is a product call.
+      error.
 - [x] **Phase 1.** Done. `container.mode` selection, discovery in the worktree, config-hash
       image caching, build step, metadata/JSON merge, run step, lifecycle hooks, agent
       injection, trust gate, session state, docs — git and jj both. `container.mode`
-      defaults to `"image"`, so nothing changes for existing repos until someone opts in;
-      whether `"auto"` should become the default is the one open question left in the spec.
+      defaults to `"auto"`: a repo that describes its environment means for that
+      description to be used, and repos without a `.devcontainer/` are unaffected because
+      `auto` falls back to an image. `mode = "image"` is the opt-out.
 - [ ] **Phase 2.** `userEnvProbe`, `forwardPorts`, and vendoring the CLI bundle if
       `npm install -g @devcontainers/cli` proves to be real friction (it is one
       dependency-free 1.7 MB script, so this is cheap).

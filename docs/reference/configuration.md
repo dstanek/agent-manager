@@ -174,7 +174,7 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | Key | Type | Default | Description | Valid Values |
 |---|---|---|---|---|
 | `enabled` | boolean | `true` | Whether to run sessions inside a container | `true`, `false` |
-| `mode` | string | `"image"` | Where the environment comes from: an `am`-resolved image, the repo's own `.devcontainer/devcontainer.json`, or whichever is available | `"image"`, `"devcontainer"`, `"auto"` |
+| `mode` | string | `"auto"` | Where the environment comes from: the repo's own `.devcontainer/devcontainer.json` when one is found, an `am`-resolved image otherwise | `"auto"`, `"devcontainer"`, `"image"` |
 | `runtime` | string | `"auto"` | Container runtime to use; `"auto"` tries Podman first, then Docker | `"auto"`, `"podman"`, `"docker"` |
 | `agent` | string | `""` | Agent to run inside the container; overrides `defaults.agent` when container mode is active | Any known agent name, e.g. `"claude"` |
 | `image` | string | `""` | Override image for all agents; takes priority over `[agents.<name>].image`; leave unset to use the per-agent default | Any valid image reference |
