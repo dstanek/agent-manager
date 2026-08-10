@@ -28,6 +28,14 @@ pub struct AmWorld {
     mock_podman_log: Option<PathBuf>,
     /// Extra environment variables injected into the next `run_am` call.
     extra_env: Vec<(String, String)>,
+    /// When Some, the `devcontainer` CLI is mocked (+ log file).
+    mock_devcontainer_bin: Option<PathBuf>,
+    mock_devcontainer_log: Option<PathBuf>,
+    /// Touched by the mock CLI on a successful build; the mock runtime reports an image
+    /// as present only once it exists, so "build" and "reuse" are distinguishable.
+    mock_image_marker: Option<PathBuf>,
+    /// The `devcontainer.metadata` label the mock runtime reports.
+    mock_label_file: Option<PathBuf>,
 }
 
 impl Default for AmWorld {
@@ -40,6 +48,10 @@ impl Default for AmWorld {
             mock_podman_bin: None,
             mock_podman_log: None,
             extra_env: Vec::new(),
+            mock_devcontainer_bin: None,
+            mock_devcontainer_log: None,
+            mock_image_marker: None,
+            mock_label_file: None,
         }
     }
 }
@@ -121,6 +133,98 @@ impl AmWorld {
         self.mock_podman_log = Some(log);
     }
 
+    /// Install a mock container runtime that understands the two devcontainer queries:
+    /// "does this image exist" and "what is its metadata label".
+    ///
+    /// The plain mock always exits 0, which would make every image look present and hide
+    /// the build step entirely.
+    fn setup_mock_devcontainer_runtime(&mut self) {
+        let bin = self.project_dir.path().join("mock_podman_dc");
+        let log = self.project_dir.path().join("mock_podman.log");
+        let marker = self.project_dir.path().join("image-built.marker");
+        let label = self.project_dir.path().join("metadata-label.json");
+        fs::write(
+            &label,
+            r#"[{"entrypoint":"/usr/local/share/init.sh","remoteUser":"vscode"}]"#,
+        )
+        .expect("write label file");
+        fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             if [ -n \"$MOCK_PODMAN_LOG\" ]; then\n\
+                 echo \"$@\" >> \"$MOCK_PODMAN_LOG\"\n\
+             fi\n\
+             if [ \"$1\" = \"image\" ] && [ \"$2\" = \"inspect\" ]; then\n\
+                 [ -f \"$MOCK_IMAGE_MARKER\" ] && exit 0\n\
+                 exit 1\n\
+             fi\n\
+             if [ \"$1\" = \"inspect\" ]; then\n\
+                 cat \"$MOCK_LABEL_FILE\" 2>/dev/null || echo '<no value>'\n\
+                 exit 0\n\
+             fi\n\
+             exit 0\n",
+        )
+        .expect("write mock podman");
+        #[cfg(unix)]
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod mock podman");
+        self.mock_podman_bin = Some(bin);
+        self.mock_podman_log = Some(log);
+        self.mock_image_marker = Some(marker);
+        self.mock_label_file = Some(label);
+    }
+
+    /// Install a mock `devcontainer` CLI. `succeed = false` reproduces the real failure
+    /// shape: exit 1 with an error JSON on stdout.
+    fn setup_mock_devcontainer_cli(&mut self, succeed: bool) {
+        let bin = self.project_dir.path().join("mock_devcontainer");
+        let log = self.project_dir.path().join("mock_devcontainer.log");
+        let body = if succeed {
+            "touch \"$MOCK_IMAGE_MARKER\"\n\
+             echo '{\"outcome\":\"success\"}'\n\
+             exit 0\n"
+        } else {
+            "echo '{\"outcome\":\"error\",\"message\":\"Command failed: podman pull nope\",\
+             \"description\":\"An error occurred building the container.\"}'\n\
+             exit 1\n"
+        };
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"$MOCK_DEVCONTAINER_LOG\" ]; then\n\
+                     echo \"$@\" >> \"$MOCK_DEVCONTAINER_LOG\"\n\
+                 fi\n{body}"
+            ),
+        )
+        .expect("write mock devcontainer");
+        #[cfg(unix)]
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
+            .expect("chmod mock devcontainer");
+        self.mock_devcontainer_bin = Some(bin);
+        self.mock_devcontainer_log = Some(log);
+    }
+
+    /// Write a devcontainer config and commit it, so it appears in session worktrees.
+    ///
+    /// Committing matters: `git worktree add` checks out a branch, so an uncommitted
+    /// config would simply not exist in the worktree am discovers against.
+    fn write_devcontainer_config(&mut self, body: &str) {
+        let dir = self.project_path().join(".devcontainer");
+        fs::create_dir_all(&dir).expect("create .devcontainer");
+        fs::write(dir.join("devcontainer.json"), body).expect("write devcontainer.json");
+        let project = self.project_path().to_path_buf();
+        run_git(&["add", "-A"], &project);
+        run_git(
+            &[
+                "commit",
+                "--no-verify",
+                "-m",
+                "chore: add devcontainer config",
+            ],
+            &project,
+        );
+    }
+
     /// Run the `am` binary with `args`, capturing stdout + stderr.
     fn run_am(&mut self, args: &[&str]) {
         let dir = self.project_path().to_path_buf();
@@ -139,6 +243,20 @@ impl AmWorld {
             }
         } else {
             cmd.env("AM_CONTAINER_ENABLED", "false");
+        }
+
+        // Devcontainer mocks, when the scenario set them up.
+        if let Some(ref bin) = self.mock_devcontainer_bin.clone() {
+            cmd.env("AM_DEVCONTAINER_BIN", bin);
+            if let Some(ref log) = self.mock_devcontainer_log.clone() {
+                cmd.env("MOCK_DEVCONTAINER_LOG", log);
+            }
+        }
+        if let Some(ref marker) = self.mock_image_marker.clone() {
+            cmd.env("MOCK_IMAGE_MARKER", marker);
+        }
+        if let Some(ref label) = self.mock_label_file.clone() {
+            cmd.env("MOCK_LABEL_FILE", label);
         }
 
         // Tmux setup: mock when available; simulate no-tmux otherwise.
@@ -286,6 +404,40 @@ async fn given_mock_container(world: &mut AmWorld) {
 }
 
 // ── When ──────────────────────────────────────────────────────────────────────
+
+#[given("I am using a mock devcontainer CLI")]
+async fn given_mock_devcontainer(world: &mut AmWorld) {
+    world.setup_mock_devcontainer_runtime();
+    world.setup_mock_devcontainer_cli(true);
+}
+
+#[given("I am using a mock devcontainer CLI that fails")]
+async fn given_failing_devcontainer(world: &mut AmWorld) {
+    world.setup_mock_devcontainer_runtime();
+    world.setup_mock_devcontainer_cli(false);
+}
+
+#[given("the repo has a devcontainer config")]
+async fn given_devcontainer_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\n  // JSONC is normal in configs written for editors\n  \
+         \"name\": \"test\",\n  \"image\": \"debian:bookworm\",\n}",
+    );
+}
+
+#[given("the repo has a devcontainer config using docker compose")]
+async fn given_compose_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\"name\":\"test\",\"dockerComposeFile\":\"docker-compose.yml\",\"service\":\"app\"}",
+    );
+}
+
+#[given("the repo has a devcontainer config with an initializeCommand")]
+async fn given_initialize_command_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\"name\":\"test\",\"image\":\"debian:bookworm\",\"initializeCommand\":\"./setup.sh\"}",
+    );
+}
 
 #[when(expr = "I run {string}")]
 async fn when_run(world: &mut AmWorld, cmd: String) {
@@ -447,6 +599,33 @@ async fn then_podman_log_contains(world: &mut AmWorld, text: String) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+#[then(expr = "the mock devcontainer log contains {string}")]
+async fn then_devcontainer_log_contains(world: &mut AmWorld, text: String) {
+    let log = world
+        .mock_devcontainer_log
+        .as_ref()
+        .expect("mock devcontainer CLI was not set up for this scenario");
+    let contents = fs::read_to_string(log).unwrap_or_default();
+    assert!(
+        contents.contains(&text),
+        "devcontainer log missing {text:?}\n--- log ---\n{contents}"
+    );
+}
+
+#[then(expr = "the mock devcontainer CLI was called {int} time(s)")]
+async fn then_devcontainer_called_times(world: &mut AmWorld, expected: usize) {
+    let log = world
+        .mock_devcontainer_log
+        .as_ref()
+        .expect("mock devcontainer CLI was not set up for this scenario");
+    let contents = fs::read_to_string(log).unwrap_or_default();
+    let calls = contents.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        calls, expected,
+        "expected {expected} CLI call(s), got {calls}\n--- log ---\n{contents}"
+    );
+}
 
 fn run_git(args: &[&str], dir: &PathBuf) {
     let status = Command::new("git")
