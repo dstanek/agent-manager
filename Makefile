@@ -3,9 +3,9 @@ ifeq ($(DOCKER),)
 $(error "Neither podman nor docker found on PATH")
 endif
 
-.PHONY: images build-claude build-claude-minimal build-copilot build-copilot-minimal build-rust-example build-am-dev build-docs-image docs docs-serve
+.PHONY: images build-claude build-claude-minimal build-copilot build-copilot-minimal build-rust-example build-docs-image docs docs-serve
 
-images: build-claude build-claude-minimal build-copilot build-copilot-minimal build-am-dev
+images: build-claude build-claude-minimal build-copilot build-copilot-minimal
 
 build-claude:
 	$(DOCKER) build -f dockerfiles/Dockerfile.claude -t am-claude:latest .
@@ -22,9 +22,6 @@ build-copilot-minimal:
 build-rust-example: build-claude
 	$(DOCKER) build --build-arg BASE_IMAGE=am-claude:latest \
 	    -f examples/Dockerfile.rust -t am-rust:latest .
-
-build-am-dev: build-rust-example
-	$(DOCKER) build -f dockerfiles/Dockerfile.am-dev -t am-dev:latest .
 
 build-docs-image:
 	$(DOCKER) build -f dockerfiles/Dockerfile.docs -t am-docs:latest .
