@@ -93,18 +93,19 @@ USER am
 WORKDIR /workspace
 ```
 
-### Developing `am` itself
+### Extending an image for one project
 
-The `am` project uses `dockerfiles/Dockerfile.am-dev` to develop and test `am` inside a Claude Code container. It extends `am-rust:latest` (the Rust example image built from `examples/Dockerfile.rust`) and only adds the project-specific configuration on top:
+`dockerfiles/Dockerfile.am-dev` is a worked example of this pattern. It extends
+`am-rust:latest` (built from `examples/Dockerfile.rust`) and adds only what one
+project needs on top — a git identity for tests that run `git commit`, and a
+pre-fetched Cargo registry so incremental builds start warm:
 
 ```dockerfile
 FROM am-rust:latest
 
-# Configure git identity — required by `am` tests that run `git commit`
 RUN git config --global user.email "dev@example.com" \
  && git config --global user.name "Dev"
 
-# Pre-fetch Cargo dependencies so incremental builds are fast.
 WORKDIR /workspace
 COPY --chown=am:am Cargo.toml Cargo.lock ./
 RUN mkdir -p src tests \
@@ -119,6 +120,15 @@ Build it with:
 ```sh
 make build-am-dev   # also builds am-rust:latest as a dependency
 ```
+
+!!! note "`am` itself now develops in a dev container"
+    This three-image chain is kept as an example of the layering pattern, but it
+    is no longer how the project builds its own environment — `.devcontainer/`
+    is. See [Dev Containers](devcontainers.md) and
+    [Building from Source](../reference/building.md#developing-in-a-dev-container).
+    That switch is the argument for this whole page in miniature: one checked-in
+    file that editors, CI, and `am` all read beats three Dockerfiles that have to
+    be built locally and in order.
 
 ---
 
