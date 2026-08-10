@@ -177,6 +177,74 @@ pub fn remove_git_worktree(slug: &str, repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Rollback ──────────────────────────────────────────────────────────────────
+
+/// Owns a freshly created worktree until the session that needs it is fully set up.
+///
+/// Anything can fail between creating a worktree and recording the session — building a
+/// devcontainer image, a declined trust prompt, tmux. Without this, each of those left an
+/// orphaned worktree and branch behind that the user had to clean up by hand, because
+/// `am destroy` only knows about recorded sessions.
+///
+/// Call [`WorktreeGuard::commit`] once the session is recorded; dropping without it rolls
+/// the worktree back.
+pub struct WorktreeGuard<'a> {
+    slug: String,
+    repo_root: &'a Path,
+    vcs: crate::config::Vcs,
+    path: PathBuf,
+    committed: bool,
+}
+
+impl<'a> WorktreeGuard<'a> {
+    /// Create the worktree (or jj workspace) for `slug` and guard it.
+    pub fn create(slug: &str, repo_root: &'a Path, vcs: crate::config::Vcs) -> Result<Self> {
+        let path = match vcs {
+            crate::config::Vcs::Git => create_git_worktree(slug, repo_root)?,
+            crate::config::Vcs::Jj => create_jj_workspace(slug, repo_root)?,
+        };
+        Ok(Self {
+            slug: slug.to_string(),
+            repo_root,
+            vcs,
+            path,
+            committed: false,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Give up ownership: the worktree is now the session's, and will survive the drop.
+    pub fn commit(mut self) -> PathBuf {
+        self.committed = true;
+        self.path.clone()
+    }
+}
+
+impl Drop for WorktreeGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let result = match self.vcs {
+            crate::config::Vcs::Git => remove_git_worktree(&self.slug, self.repo_root),
+            crate::config::Vcs::Jj => remove_jj_workspace(&self.slug, self.repo_root),
+        };
+        // Report rather than panic: this runs while an error is already propagating, and
+        // a panic here would replace the real failure with a less useful one.
+        if let Err(e) = result {
+            eprintln!(
+                "warning: could not roll back worktree {}: {e}\n\
+                 Remove it manually before retrying 'am start {}'.",
+                self.path.display(),
+                self.slug
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,7 +278,16 @@ mod tests {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["commit", "--allow-empty", "-m", "initial commit"])
+            // --no-verify: a developer's global init.templatedir can install a commit-msg
+            // hook into every `git init`, including these fixtures. Test repos must not
+            // depend on the machine's git configuration.
+            .args([
+                "commit",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "initial commit",
+            ])
             .output()
             .unwrap();
     }
@@ -460,5 +537,76 @@ mod tests {
     fn git_worktree_has_changes_returns_false_for_nonexistent_path() {
         let tmp = TempDir::new().unwrap();
         assert!(!git_worktree_has_changes(&tmp.path().join("no-such-dir")));
+    }
+
+    // ── WorktreeGuard ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn guard_rolls_back_the_worktree_when_dropped_uncommitted() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        let path = {
+            let guard =
+                WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git).unwrap();
+            let path = guard.path().to_path_buf();
+            assert!(path.exists(), "worktree should exist inside the guard's scope");
+            path
+        };
+
+        assert!(!path.exists(), "worktree should be gone after an uncommitted drop");
+    }
+
+    #[test]
+    fn guard_rollback_also_removes_the_branch() {
+        // Leaving am/<slug> behind makes the next `am start <slug>` fail with a confusing
+        // "branch already exists" rather than retrying cleanly.
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        drop(WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git).unwrap());
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["branch", "--list", "am/feat"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn committed_guard_leaves_the_worktree_in_place() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        let path = WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git)
+            .unwrap()
+            .commit();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn guard_can_be_retried_after_a_rollback() {
+        // The point of rolling back: the same slug is immediately usable again.
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        drop(WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git).unwrap());
+        let second = WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git);
+
+        assert!(second.is_ok(), "retry failed: {:?}", second.err());
+        assert!(second.unwrap().commit().exists());
+    }
+
+    #[test]
+    fn guard_reports_the_created_path() {
+        let tmp = TempDir::new().unwrap();
+        init_repo_with_commit(tmp.path());
+
+        let guard = WorktreeGuard::create("feat", tmp.path(), crate::config::Vcs::Git).unwrap();
+
+        assert_eq!(guard.path(), tmp.path().join(".am/worktrees/feat"));
     }
 }
