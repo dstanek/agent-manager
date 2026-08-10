@@ -5,9 +5,6 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -43,7 +40,7 @@ jobs:
             packages: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,7 +75,7 @@ jobs:
           echo "ARTIFACT_NAME=${artifact}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT_PATH }}
@@ -104,7 +101,7 @@ jobs:
 
       - name: Upload .deb artifact
         if: matrix.packages == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: deb-${{ matrix.target }}
           path: "*.deb"
@@ -112,7 +109,7 @@ jobs:
 
       - name: Upload .rpm artifact
         if: matrix.packages == true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rpm-${{ matrix.target }}
           path: "*.rpm"
@@ -127,14 +124,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Get version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: false
@@ -186,28 +183,28 @@ jobs:
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download macOS aarch64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: am-aarch64-apple-darwin
           path: artifacts
 
       - name: Download macOS x86_64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: am-x86_64-apple-darwin
           path: artifacts
 
       - name: Download Linux x86_64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: am-x86_64-unknown-linux-gnu
           path: artifacts
 
       - name: Download Linux aarch64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: am-aarch64-unknown-linux-gnu
           path: artifacts
@@ -227,7 +224,7 @@ jobs:
           fi
 
       - name: Clone tap repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: dstanek/homebrew-am
           token: ${{ env.HOMEBREW_TAP_TOKEN }}
