@@ -71,6 +71,7 @@ Environment variables override both the global and project configs and are usefu
 | `AM_TMUX_SPLIT` | `tmux.split` | `horizontal`, `vertical` | `AM_TMUX_SPLIT=vertical` |
 | `AM_TMUX_SPLIT_PERCENT` | `tmux.split_percent` | integer 1–99 (error if out of range) | `AM_TMUX_SPLIT_PERCENT=30` |
 | `AM_CONTAINER_ENABLED` | `container.enabled` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_CONTAINER_ENABLED=false` |
+| `AM_CONTAINER_MODE` | `container.mode` | `image`, `devcontainer`, `auto` | `AM_CONTAINER_MODE=devcontainer` |
 | `AM_CONTAINER_RUNTIME` | `container.runtime` | `auto`, `podman`, `docker` | `AM_CONTAINER_RUNTIME=docker` |
 | `AM_CONTAINER_AGENT` | `container.agent` | known agent name | `AM_CONTAINER_AGENT=claude` |
 | `AM_CONTAINER_IMAGE` | `container.image` | any non-empty string | `AM_CONTAINER_IMAGE=my-image:latest` |
@@ -78,6 +79,9 @@ Environment variables override both the global and project configs and are usefu
 | `AM_CONTAINER_USER` | `container.user` | safe username (`[a-z_][a-z0-9_-]*`, error if invalid) | `AM_CONTAINER_USER=am` |
 | `AM_CONTAINER_GITCONFIG` | `container.gitconfig` | file path | `AM_CONTAINER_GITCONFIG=/custom/.gitconfig` |
 | `AM_CONTAINER_SSH` | `container.ssh` | directory path | `AM_CONTAINER_SSH=/custom/.ssh` |
+| `AM_DEVCONTAINER_PATH` | `devcontainer.path` | path relative to the worktree | `AM_DEVCONTAINER_PATH=.devcontainer/ci.json` |
+| `AM_DEVCONTAINER_AGENT_INSTALL` | `devcontainer.agent_install` | `feature`, `bootstrap`, `none`, `auto` | `AM_DEVCONTAINER_AGENT_INSTALL=none` |
+| `AM_DEVCONTAINER_ALLOW_HOST_COMMANDS` | `devcontainer.allow_host_commands` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_DEVCONTAINER_ALLOW_HOST_COMMANDS=true` |
 | `CLAUDE_CONFIG_DIR` | (none) | directory path | `CLAUDE_CONFIG_DIR=/custom/.claude` |
 
 !!! note "Mount path customization"
@@ -94,6 +98,7 @@ These variables redirect `am` to a specific binary instead of searching `PATH`. 
 | `AM_DOCKER_BIN` | `docker` (from PATH) | Path or name of the Docker binary |
 | `AM_JJ_BIN` | `jj` (from PATH) | Path or name of the Jujutsu binary |
 | `AM_GH_BIN` | `gh` (from PATH) | Path or name of the GitHub CLI binary (used for Copilot auth) |
+| `AM_DEVCONTAINER_BIN` | `devcontainer` (from PATH) | Path or name of the Dev Containers CLI (used only in devcontainer mode) |
 
 If set to a bare name (e.g. `AM_TMUX_BIN=tmux3`), `am` searches PATH for that name. If set to an absolute path, it uses that path directly and errors if the file does not exist.
 
@@ -127,14 +132,18 @@ Per-agent configuration. `am` ships with compiled-in image defaults for `claude`
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `image` | string | see below | Container image to use when this agent is selected |
+| `image` | string | see below | Container image to use when this agent is selected (used in `container.mode = "image"`) |
+| `devcontainer_feature` | string | see below | Dev Container Feature that installs this agent, injected at build time in devcontainer mode |
 
 **Compiled-in defaults:**
 
-| Agent | Default image |
-|---|---|
-| `claude` | `ghcr.io/dstanek/am-claude-minimal:latest` |
-| `copilot` | `ghcr.io/dstanek/am-copilot-minimal:latest` |
+| Agent | Default image | Default Feature |
+|---|---|---|
+| `claude` | `ghcr.io/dstanek/am-claude-minimal:latest` | `ghcr.io/anthropics/devcontainer-features/claude-code:1` |
+| `copilot` | `ghcr.io/dstanek/am-copilot-minimal:latest` | — |
+
+Only Claude Code publishes an official Feature today. Agents without one fall through to the
+`bootstrap` install path in devcontainer mode.
 
 Example — override the claude image and add a gemini entry:
 
@@ -165,6 +174,7 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | Key | Type | Default | Description | Valid Values |
 |---|---|---|---|---|
 | `enabled` | boolean | `true` | Whether to run sessions inside a container | `true`, `false` |
+| `mode` | string | `"image"` | Where the environment comes from: an `am`-resolved image, the repo's own `.devcontainer/devcontainer.json`, or whichever is available | `"image"`, `"devcontainer"`, `"auto"` |
 | `runtime` | string | `"auto"` | Container runtime to use; `"auto"` tries Podman first, then Docker | `"auto"`, `"podman"`, `"docker"` |
 | `agent` | string | `""` | Agent to run inside the container; overrides `defaults.agent` when container mode is active | Any known agent name, e.g. `"claude"` |
 | `image` | string | `""` | Override image for all agents; takes priority over `[agents.<name>].image`; leave unset to use the per-agent default | Any valid image reference |
@@ -172,7 +182,58 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | `env` | list of strings | `[]` | Extra environment variables passed into the container from the host shell | e.g. `["ANTHROPIC_API_KEY", "FOO=bar"]` |
 | `gitconfig` | path | `""` | Host path to a gitconfig file to mount into the container; defaults to `.am/gitconfig` in the repo root | Any valid file path |
 | `ssh` | path | `""` | Host path to an SSH directory to mount into the container; defaults to `~/.ssh` | Any valid directory path |
-| `user` | string | `"am"` | Username used when building credential mount paths inside the container, such as `/home/<user>/.ssh` and `/home/<user>/.gitconfig` | safe username (`[a-z_][a-z0-9_-]*`) |
+| `user` | string | `"am"` | Username used when building credential mount paths inside the container, such as `/home/<user>/.ssh` and `/home/<user>/.gitconfig`. In devcontainer mode the image's `remoteUser` takes precedence, and `root` resolves to `/root` rather than `/home/root` | safe username (`[a-z_][a-z0-9_-]*`) |
 
 !!! note "Image selection"
     In most cases you do not need to set `container.image`. `am` resolves the image from the active agent via `[agents.<name>].image`, with built-in defaults for `claude` and `copilot`. Set `container.image` only when you want a single image to apply regardless of which agent is selected.
+
+### `[devcontainer]`
+
+Applies only when `container.mode` resolves to `devcontainer`. Building requires the
+reference CLI (`npm install -g @devcontainers/cli`) and Node 20+; `am` builds an image once
+per config change and runs it itself, so the CLI is not invoked on every session.
+
+| Key | Type | Default | Description | Valid Values |
+|---|---|---|---|---|
+| `path` | path | `""` | Explicit `devcontainer.json`, relative to the session worktree; unset means discover | Any path inside the worktree |
+| `cli` | string | `"devcontainer"` | CLI binary name or path (`AM_DEVCONTAINER_BIN` overrides) | Any binary name or path |
+| `agent_install` | string | `"auto"` | How the agent gets into the image | `"feature"`, `"bootstrap"`, `"none"`, `"auto"` |
+| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, and `runArgs` are honoured | `true`, `false` |
+| `skip_lifecycle` | boolean | `false` | Skip `postCreateCommand` and the other in-container hooks | `true`, `false` |
+| `home` | path | `""` | Override the container home derived from `remoteUser` | Any absolute path |
+| `extra_features` | table | `{}` | Extra Features to inject at build time, as `id = options-JSON` | e.g. `"ghcr.io/devcontainers/features/node:1" = "{}"` |
+
+**Discovery order**, relative to the session *worktree* (not the repo root — the config is a
+checked-in, branch-specific file):
+
+1. `devcontainer.path`, if set
+2. `.devcontainer/devcontainer.json`
+3. `.devcontainer.json`
+4. `.devcontainer/<folder>/devcontainer.json` — only when exactly one exists; several is an
+   error listing the candidates
+
+**Image caching.** The built image is named `am-dc-<hash>`, where the hash covers the config
+bytes, the referenced Dockerfile, and any injected Features. Sessions sharing a config share
+an image, and an unchanged config skips the build entirely.
+
+!!! warning "Other build-context files are not hashed"
+    Hashing an arbitrary build context is unbounded work — `"context": ".."` means the whole
+    repo. Editing a file that your Dockerfile `COPY`s will not trigger a rebuild on its own;
+    run `am start <slug> --rebuild` when that happens.
+
+!!! danger "`initializeCommand` runs on your host"
+    Of the six lifecycle hooks, `initializeCommand` is the only one that runs outside the
+    container — on your machine, with your privileges — and `devcontainer.json` is
+    repo-controlled code that arrives with a `git pull`. `am` refuses to run it unless
+    `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, and `runArgs`;
+    without it those are dropped with a note rather than failing the session.
+
+**Lifecycle hooks.** `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, and
+`postStartCommand` run inside the container before the agent starts. Because `am` runs
+containers with `--rm`, every `am start` creates a fresh container and the create-time hooks
+run each time — the previous container's filesystem is gone, so anything they installed must
+be reinstalled. `postAttachCommand` is not run: `am attach` moves tmux focus, it does not
+attach to the container.
+
+**Not yet supported.** Configs using `dockerComposeFile` are rejected with a pointer to
+`container.mode = "image"`. `userEnvProbe` and `forwardPorts` are parsed but not applied.

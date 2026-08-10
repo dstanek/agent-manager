@@ -49,6 +49,7 @@ nav:
     - Claude Code: guides/claude-code.md
     - GitHub Copilot: guides/github-copilot.md
     - Custom Images: guides/custom-images.md
+    - Dev Containers: guides/devcontainers.md
     - Troubleshooting: guides/troubleshooting.md
     - CI/CD Integration: guides/ci-cd-integration.md
   - Reference:

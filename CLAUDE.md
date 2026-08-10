@@ -23,8 +23,9 @@ make build-copilot       # Build Copilot Docker image
 - `command.rs` — subprocess helpers (`run_command`, `run_built_command`, and output variants); shared stderr/status error formatting
 - `config.rs` — layered config: CLI flags → env vars → `.am/config.toml` → `~/.config/am/config.toml` → defaults
 - `error.rs` — `AmError` enum via `thiserror`; all functions return `anyhow::Result<T>`
+- `devcontainer.rs` — Dev Container support: JSONC config parsing, `devcontainer.metadata` label parsing and merge, variable substitution, config hashing, `devcontainer build` delegation, trust gate
 - `session.rs` — session CRUD; state in `.am/sessions.json`
-- `worktree.rs` — git (`git worktree add`) and jj (`jj workspace add`) operations; VCS detection (`find_repo_root`) is in `main.rs`
+- `worktree.rs` — git (`git worktree add`) and jj (`jj workspace add`) operations plus `WorktreeGuard` rollback; VCS detection (`find_repo_root`) is in `main.rs`
 - `tmux.rs` — tmux window/pane management
 - `container.rs` — Podman/Docker lifecycle; mount resolution; agent auth presets
 - `main.rs` — command handlers (`cmd_init`, `cmd_start`, `cmd_list`, `cmd_attach`, `cmd_run`, `cmd_destroy`, `cmd_generate_config`)
@@ -33,12 +34,16 @@ make build-copilot       # Build Copilot Docker image
 
 **Container mounts:** both git and jj repos mirror the host path structure inside the container (worktree and VCS dirs are mounted at the same absolute paths). No `GIT_DIR`/`GIT_WORK_TREE` env vars are injected. See `container.rs`.
 
-**Agent auth presets** (`claude`, `copilot`, `gemini`, `codex`) provide credentials at runtime via mounts and/or environment variables. Unknown agent names are rejected early with a clear error listing valid agents.
+**Agent auth presets** (`claude`, `copilot`, `gemini`, `codex`) provide credentials at runtime via mounts and/or environment variables. Unknown agent names are rejected early with a clear error listing valid agents. Mount targets are derived from `ContainerMounts::container_home`, not from the username — a devcontainer's `remoteUser` may be `root`, whose home is `/root`.
+
+**Dev Container mode** (`container.mode = "devcontainer" | "auto"`, default `"image"`): `am` delegates `devcontainer build` to the reference CLI and keeps the run path. The built image's `devcontainer.metadata` label carries feature contributions *and* the whole `devcontainer.json`; only `runArgs`, `workspaceFolder`, `workspaceMount`, `initializeCommand`, `dockerComposeFile`, and `name` are read from the file itself. Images are named `am-dc-<config-hash>` so an unchanged config skips the build. Real CLI output for tests is in `tests/fixtures/devcontainer/`.
 
 ## Testing
 
 - `tempfile` crate for isolated test directories
-- Mock tmux via `AM_TMUX_BIN`; mock container runtimes via `AM_PODMAN_BIN`/`AM_DOCKER_BIN`
+- Mock tmux via `AM_TMUX_BIN`; mock container runtimes via `AM_PODMAN_BIN`/`AM_DOCKER_BIN`; mock the Dev Containers CLI via `AM_DEVCONTAINER_BIN`
+- Tests that write a mock script and then exec it must hold a mutex — a concurrent fork elsewhere inherits the open write descriptor and the exec fails with `ETXTBSY`
+- Test git fixtures commit with `--no-verify`: a developer's global `init.templatedir` can install a `commit-msg` hook into every `git init`
 - Tests mutating env vars use a mutex to serialize execution
 
 **After every code change:** run `cargo test` and `cargo clippy -- -D warnings`. Fix any failures before proceeding.
