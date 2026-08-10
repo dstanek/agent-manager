@@ -24,6 +24,8 @@ inside it, so `am start` itself has to be run on the host — the test suite moc
 Podman and Docker via `AM_PODMAN_BIN`/`AM_DOCKER_BIN` and needs neither. And `jj`
 is pinned by `ARG JJ_VERSION` in the Dockerfile rather than tracking latest, so a
 new jj release cannot change what CI-equivalent local runs are testing against.
+Renovate proposes that bump as a pull request — see
+[Dependency Updates](dependency-updates.md).
 
 !!! note "Rebuild after changing the docs requirements"
     `am`'s config hash covers `devcontainer.json` and the Dockerfile, but not

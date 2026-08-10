@@ -1,0 +1,84 @@
+name: Renovate
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. `.github/renovate.json5` deliberately has no `schedule`
+    # of its own, so this cron is the only thing deciding when dependency PRs
+    # appear — change the cadence here, not there.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Renovate log level'
+        type: choice
+        options:
+          - info
+          - debug
+          - trace
+        default: info
+      dryRun:
+        description: 'Dry run — log what would happen without opening branches or PRs'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/renovate.json5'
+      - '.github/workflows/renovate.yml'
+  pull_request:
+    paths:
+      - '.github/renovate.json5'
+      - '.github/workflows/renovate.yml'
+
+# Renovate writes branches; two concurrent runs would fight over them.
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v7
+        with:
+          # The renovate package requires Node 24.
+          node-version: '24'
+
+      # A malformed config makes the scheduled run fail silently a week later.
+      # --strict also rejects unknown fields, which is where typos hide.
+      - name: Validate renovate.json5
+        run: npx --yes --package renovate renovate-config-validator --strict
+
+  renovate:
+    name: Run Renovate
+    needs: validate
+    # A pull request touching the config gets validated, not executed.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate Renovate token
+        run: |
+          if [ -z "$RENOVATE_TOKEN" ]; then
+            echo "::error::RENOVATE_TOKEN is not set. Configure a fine-grained PAT with Contents: Read and write, Pull requests: Read and write, and Issues: Read and write access to this repository."
+            exit 1
+          fi
+
+      - uses: renovatebot/github-action@v46.2.2
+        with:
+          token: ${{ env.RENOVATE_TOKEN }}
+        env:
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # Renovate deletes this option when it is the string "null", so the
+          # scheduled runs (where `inputs` is empty) are never dry runs.
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun && 'full' || 'null' }}

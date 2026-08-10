@@ -11,6 +11,7 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # Keep in step with the jj version the project is developed against.
+# renovate: datasource=github-releases depName=jj-vcs/jj
 ARG JJ_VERSION=0.44.0
 
 # tmux — `am` drives tmux, and it is needed to exercise a session by hand.

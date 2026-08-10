@@ -58,6 +58,7 @@ nav:
     - Configuration: reference/configuration.md
     - Commit Trailers: reference/commit-trailers.md
     - Building from Source: reference/building.md
+    - Dependency Updates: reference/dependency-updates.md
 
 plugins:
   - search
