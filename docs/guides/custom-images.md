@@ -95,10 +95,8 @@ WORKDIR /workspace
 
 ### Extending an image for one project
 
-`dockerfiles/Dockerfile.am-dev` is a worked example of this pattern. It extends
-`am-rust:latest` (built from `examples/Dockerfile.rust`) and adds only what one
-project needs on top — a git identity for tests that run `git commit`, and a
-pre-fetched Cargo registry so incremental builds start warm:
+Layer project-specific setup on top — a git identity for tests that run
+`git commit`, a pre-fetched dependency cache so incremental builds start warm:
 
 ```dockerfile
 FROM am-rust:latest
@@ -108,27 +106,26 @@ RUN git config --global user.email "dev@example.com" \
 
 WORKDIR /workspace
 COPY --chown=am:am Cargo.toml Cargo.lock ./
-RUN mkdir -p src tests \
+RUN mkdir -p src \
  && echo 'fn main() {}' > src/main.rs \
- && echo 'fn main() {}' > tests/cucumber.rs \
  && cargo fetch \
- && rm -rf src tests
+ && rm -rf src
 ```
 
-Build it with:
+Build `am-rust:latest` first:
 
 ```sh
-make build-am-dev   # also builds am-rust:latest as a dependency
+make build-rust-example   # also builds am-claude:latest as a dependency
 ```
 
-!!! note "`am` itself now develops in a dev container"
-    This three-image chain is kept as an example of the layering pattern, but it
-    is no longer how the project builds its own environment — `.devcontainer/`
-    is. See [Dev Containers](devcontainers.md) and
-    [Building from Source](../reference/building.md#developing-in-a-dev-container).
-    That switch is the argument for this whole page in miniature: one checked-in
-    file that editors, CI, and `am` all read beats three Dockerfiles that have to
-    be built locally and in order.
+!!! tip "Consider a dev container instead"
+    If your project already has — or could have — a `.devcontainer/`, you do not
+    need any of this. `am` builds and runs that directly, and one checked-in file
+    that editors, CI, and `am` all read beats a chain of Dockerfiles that must be
+    built locally and in order. `am` itself made exactly that switch: it used to
+    ship a `Dockerfile.am-dev` on top of two more images, and now develops in its
+    own [dev container](devcontainers.md). Use a custom image when you need
+    something a devcontainer cannot express, not by default.
 
 ---
 
@@ -179,10 +176,10 @@ Set the agent and override its image in `.am/config.toml`:
 agent = "claude"
 
 [agents.claude]
-image = "am-dev:latest"
+image = "my-project:latest"
 ```
 
-The `[agents.<name>]` entry tells `am` both which credential mount preset to use and which image to run. The image name does not have to match the agent name — an image named `am-dev` can still use the `claude` preset.
+The `[agents.<name>]` entry tells `am` both which credential mount preset to use and which image to run. The image name does not have to match the agent name — an image named `my-project` can still use the `claude` preset.
 
 ---
 
@@ -201,7 +198,7 @@ When you update `Cargo.toml`, `package.json`, `requirements.txt`, or similar man
 Before using an image with `am`, verify it works standalone:
 
 ```sh
-podman run --rm -it am-dev:latest bash
+podman run --rm -it my-project:latest bash
 # inside the container:
 cargo --version
 claude --version
