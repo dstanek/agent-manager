@@ -17,25 +17,31 @@ npm install -g @devcontainers/cli
 Running the container is entirely `am`'s own code and needs nothing beyond your usual
 Podman or Docker.
 
-## Turning it on
+## Choosing a mode
+
+`am` uses your devcontainer automatically when it finds one, so there is usually nothing to
+turn on. To be explicit, or to opt out:
 
 ```toml
 # .am/config.toml
 [container]
-mode = "devcontainer"
+mode = "devcontainer"   # or "image" to ignore .devcontainer/ entirely
 ```
 
 Three modes are available:
 
 | Mode | Behaviour |
 |---|---|
-| `image` (default) | Use an `am`-resolved image. Any `.devcontainer/` in the repo is ignored. |
+| `auto` (default) | Use the repo's config when one is found, otherwise fall back to an image. |
 | `devcontainer` | Use the repo's config; error if there isn't one. |
-| `auto` | Use the repo's config when one is found, otherwise fall back to an image. |
+| `image` | Use an `am`-resolved image. Any `.devcontainer/` in the repo is ignored. |
 
-`image` is the default deliberately: switching to `auto` changes what `am start` does for
-every repo that already has a `.devcontainer/`, and that should be your decision rather than
-an upgrade surprise.
+`auto` is the default because a repo that has taken the trouble to describe its environment
+almost certainly means for that description to be used — preferring an `am`-specific image
+over it is the surprising behaviour. Repos with no `.devcontainer/` are unaffected.
+
+If `am` cannot use your devcontainer, `mode = "image"` is the escape hatch, and the error
+messages for unsupported constructs point at it.
 
 ## What happens on `am start`
 

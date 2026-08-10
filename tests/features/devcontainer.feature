@@ -79,6 +79,24 @@ Feature: Dev container sessions
     And the output contains "allow_host_commands"
     And the mock devcontainer CLI was called 0 times
 
+  # container.mode defaults to "auto", so a repo that describes its environment gets it
+  # used with no configuration at all. This is the scenario that would catch the default
+  # being flipped back by accident.
+  Scenario: a devcontainer config is used with no configuration at all
+    Given I am using a mock devcontainer CLI
+    And the repo has a devcontainer config
+    When I run "am start my-feature"
+    Then the command succeeds
+    And the output contains "from devcontainer.json"
+    And the mock devcontainer CLI was called 1 time
+
+  Scenario: repos without a devcontainer config are unaffected by the default
+    Given I am using a mock devcontainer CLI
+    When I run "am start my-feature"
+    Then the command succeeds
+    And the mock devcontainer CLI was called 0 times
+    And the session file contains "my-feature"
+
   Scenario: image mode ignores a devcontainer config entirely
     Given I am using a mock devcontainer CLI
     And the repo has a devcontainer config
