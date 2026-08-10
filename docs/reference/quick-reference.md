@@ -9,6 +9,7 @@ One-page guide to common `am` commands, workflows, and configurations.
 | Command | Purpose |
 |---------|---------|
 | `am init` | Initialize am in current repo |
+| `am doctor` | Report what is/isn't ready for `am start` |
 | `am start <slug>` | Create a new agent session |
 | `am list` | Show all active sessions |
 | `am attach <slug>` | Switch to existing session |

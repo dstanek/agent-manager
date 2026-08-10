@@ -23,12 +23,13 @@ make build-copilot       # Build Copilot Docker image
 - `command.rs` — subprocess helpers (`run_command`, `run_built_command`, and output variants); shared stderr/status error formatting
 - `config.rs` — layered config: CLI flags → env vars → `.am/config.toml` → `~/.config/am/config.toml` → defaults
 - `error.rs` — `AmError` enum via `thiserror`; all functions return `anyhow::Result<T>`
+- `doctor.rs` — `am doctor` readiness checks; reuses `cmd_start`'s own preflight functions so a passing report and a working `am start` cannot drift apart
 - `devcontainer.rs` — Dev Container support: JSONC config parsing, `devcontainer.metadata` label parsing and merge, variable substitution, config hashing, `devcontainer build` delegation, trust gate
 - `session.rs` — session CRUD; state in `.am/sessions.json`
 - `worktree.rs` — git (`git worktree add`) and jj (`jj workspace add`) operations plus `WorktreeGuard` rollback; VCS detection (`find_repo_root`) is in `main.rs`
 - `tmux.rs` — tmux window/pane management
 - `container.rs` — Podman/Docker lifecycle; mount resolution; agent auth presets
-- `main.rs` — command handlers (`cmd_init`, `cmd_start`, `cmd_list`, `cmd_attach`, `cmd_run`, `cmd_destroy`, `cmd_generate_config`)
+- `main.rs` — command handlers (`cmd_init`, `cmd_start`, `cmd_list`, `cmd_attach`, `cmd_run`, `cmd_destroy`, `cmd_doctor`, `cmd_generate_config`)
 
 **VCS detection:** checks `.jj/` first, falls back to `.git`, errors if neither found.
 

@@ -157,6 +157,10 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 
 ## Troubleshooting
 
+Start with `am doctor`. It reports the discovered config, the CLI and its version, Node,
+whether the built image is current, and any construct `am` will refuse or drop — which
+covers most of what follows before you have to guess.
+
 **"devcontainer CLI not found"** — install `@devcontainers/cli` globally, point
 `devcontainer.cli` (or `AM_DEVCONTAINER_BIN`) at it, or switch to `container.mode = "image"`.
 
