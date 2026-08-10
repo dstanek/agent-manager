@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -41,8 +39,15 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: am-x86_64-unknown-linux-gnu
+          path: target/debug/am
+          if-no-files-found: error
+
   cross-build:
-    name: Release build (${{ matrix.target }})
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     # Linux is already build-checked by the `test` job. This job catches
     # macOS/Windows-specific compile breakage on PRs instead of only at release
@@ -66,5 +71,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build (release, no packaging)
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: am-${{ matrix.target }}
+          path: target/${{ matrix.target }}/debug/am${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}
+          if-no-files-found: error
