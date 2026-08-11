@@ -200,7 +200,6 @@ impl Default for DevcontainerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub vcs: Vcs,
     pub agent: Option<String>,
     /// Per-agent settings (image, etc.). Compiled-in defaults for known agents.
     pub agents: HashMap<String, AgentSettings>,
@@ -242,7 +241,6 @@ fn default_agent_images() -> HashMap<String, AgentSettings> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            vcs: Vcs::Git,
             agent: None,
             agents: default_agent_images(),
             tmux: TmuxConfig::default(),
@@ -282,7 +280,6 @@ pub fn resolve_image<'a>(agent: Option<&str>, cfg: &'a Config) -> Option<&'a str
 
 #[derive(Debug, Deserialize, Default)]
 struct FileDefaults {
-    vcs: Option<Vcs>,
     agent: Option<String>,
 }
 
@@ -364,7 +361,6 @@ fn apply_opt_string(target: &mut Option<String>, value: Option<String>) {
 }
 
 fn apply_file_config(base: &mut Config, file: FileConfig) {
-    apply_opt(&mut base.vcs, file.defaults.vcs);
     apply_opt_string(&mut base.agent, file.defaults.agent);
 
     // Merge agents: file entries extend/override the compiled-in defaults.
@@ -442,6 +438,16 @@ fn dirs_path() -> Option<PathBuf> {
     Some(base.join("am"))
 }
 
+/// Returns the global state directory: `$XDG_STATE_HOME/am` if set,
+/// otherwise `~/.local/state/am`.
+/// Returns `None` only if neither `XDG_STATE_HOME` nor `HOME` is set.
+pub fn global_state_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("am"))
+}
+
 /// Write the default project config file at `path` (creates parent directories as needed).
 /// The file is written as a fully-commented-out template so it never silently overrides
 /// global or compiled-in defaults.
@@ -455,7 +461,6 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 # Run `am generate-config` to see the full global config template with all options documented.
 
 [defaults]
-# vcs = "git"            # "git" | "jj"
 # agent = "claude"       # agent to launch, e.g. "claude" | "copilot" — also selects the container image
 
 # Override the container image for a specific agent (built-in defaults shown):
@@ -500,7 +505,7 @@ pub fn global_config_template() -> &'static str {
 # Precedence (highest wins): CLI flags > environment variables > project config (.am/config.toml) > global config
 #
 # Environment variable overrides:
-#   AM_VCS, AM_AGENT
+#   AM_AGENT
 #   AM_TMUX_AGENT_PANE, AM_TMUX_SPLIT, AM_TMUX_SPLIT_PERCENT
 #   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
 #   AM_CONTAINER_AGENT, AM_CONTAINER_NETWORK, AM_CONTAINER_USER
@@ -508,7 +513,6 @@ pub fn global_config_template() -> &'static str {
 #   AM_DEVCONTAINER_BIN (path to the `devcontainer` CLI)
 
 [defaults]
-vcs = "git"            # "git" | "jj"
 agent = "claude"       # agent to launch; also selects the container image via [agents.<name>]
 
 # Per-agent configuration. These are the compiled-in defaults — override here if needed.
@@ -575,13 +579,6 @@ skip_lifecycle = false         # skip postCreateCommand and the other in-contain
 /// physical constraints (e.g. split_percent must be 1–99) return an error
 /// rather than silently falling back, matching the behaviour of TOML parsing.
 fn apply_env_vars(config: &mut Config) -> Result<()> {
-    if let Ok(val) = std::env::var("AM_VCS") {
-        match val.as_str() {
-            "git" => config.vcs = Vcs::Git,
-            "jj" => config.vcs = Vcs::Jj,
-            _ => {}
-        }
-    }
     if let Ok(val) = std::env::var("AM_AGENT") {
         if !val.is_empty() {
             config.agent = Some(val);
@@ -795,7 +792,6 @@ mod tests {
         let config =
             load_with_global(Some(&nonexistent_global), Some(&nonexistent_project)).unwrap();
 
-        assert_eq!(config.vcs, Vcs::Git);
         assert!(config.agent.is_none());
         assert_eq!(config.tmux.split_percent, 50);
         assert!(config.container.enabled);
@@ -1069,6 +1065,45 @@ image = "myorg/am-claude:project"
                 .and_then(|a| a.image.as_deref()),
             Some("ghcr.io/dstanek/am-copilot-minimal:latest")
         );
+    }
+
+    #[test]
+    fn global_state_dir_uses_xdg_state_home() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let xdg_dir = tmp.path().join("xdg_state");
+        std::env::set_var("XDG_STATE_HOME", &xdg_dir);
+        std::env::remove_var("HOME");
+
+        let path = global_state_dir();
+        assert_eq!(path, Some(xdg_dir.join("am")));
+    }
+
+    #[test]
+    fn global_state_dir_falls_back_to_home_local_state() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let path = global_state_dir();
+        assert_eq!(
+            path,
+            Some(tmp.path().join(".local").join("state").join("am"))
+        );
+    }
+
+    #[test]
+    fn global_state_dir_returns_none_without_home_or_xdg() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("HOME");
+
+        let path = global_state_dir();
+        assert_eq!(path, None);
     }
 
     #[test]

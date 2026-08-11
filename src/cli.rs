@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 fn validate_slug(s: &str) -> Result<String, String> {
@@ -59,8 +61,11 @@ pub enum Commands {
     /// Report what is and is not ready for a successful `am start`
     Doctor,
 
-    /// List all sessions
-    List,
+    /// List sessions (default: current repo; --all shows all repos)
+    List {
+        #[arg(long, help = "Show sessions from all repos")]
+        all: bool,
+    },
 
     /// Attach tmux focus to an existing session
     Attach {
@@ -87,6 +92,28 @@ pub enum Commands {
 
     /// Print a global config template with all options and defaults to stdout
     GenerateConfig,
+
+    /// Manage session records in the global store
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommands {
+    /// Remove a session record (and attempt container/tmux cleanup)
+    Rm {
+        #[arg(value_parser = validate_slug)]
+        slug: String,
+        /// Repository root containing this session (required when not inside a repo,
+        /// or when the slug exists in multiple repos)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[cfg(test)]

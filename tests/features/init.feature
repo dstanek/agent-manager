@@ -5,8 +5,7 @@ Feature: am init — initialize am in a repo
     When I run "am init"
     Then the command succeeds
     And the file ".am/config.toml" exists
-    And the file ".am/sessions.json" exists
-    And the file ".gitignore" contains ".am/"
+    And the file ".gitignore" contains ".am/worktrees/"
 
   Scenario: init is idempotent when run twice
     Given a git repository

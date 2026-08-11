@@ -18,6 +18,8 @@ const AM_BIN: &str = env!("CARGO_BIN_EXE_am");
 pub struct AmWorld {
     /// Isolated temporary directory — serves as the project root.
     project_dir: TempDir,
+    /// Isolated temporary directory for global state (XDG_STATE_HOME).
+    state_dir: TempDir,
     /// Output from the most recent `am` invocation.
     last_output: Option<Output>,
     /// When Some, TMUX is mocked using this binary (+ log file).
@@ -42,6 +44,7 @@ impl Default for AmWorld {
     fn default() -> Self {
         Self {
             project_dir: TempDir::new().expect("create temp dir"),
+            state_dir: TempDir::new().expect("create state dir"),
             last_output: None,
             mock_tmux_bin: None,
             mock_tmux_log: None,
@@ -59,6 +62,11 @@ impl Default for AmWorld {
 impl AmWorld {
     fn project_path(&self) -> &Path {
         self.project_dir.path()
+    }
+
+    /// Path to the global sessions file: $state_dir/am/sessions.json
+    fn global_sessions_path(&self) -> PathBuf {
+        self.state_dir.path().join("am").join("sessions.json")
     }
 
     /// Install a mock tmux binary that logs every invocation to a file.
@@ -236,7 +244,9 @@ impl AmWorld {
     fn run_am(&mut self, args: &[&str]) {
         let dir = self.project_path().to_path_buf();
         let mut cmd = Command::new(AM_BIN);
-        cmd.args(args).current_dir(&dir);
+        cmd.args(args)
+            .current_dir(&dir)
+            .env("XDG_STATE_HOME", self.state_dir.path());
 
         // Container setup: use mock podman when available; disable otherwise.
         if let Some(ref podman_bin) = self.mock_podman_bin.clone() {
@@ -297,6 +307,7 @@ impl AmWorld {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("XDG_STATE_HOME", self.state_dir.path())
             .env("AM_CONTAINER_ENABLED", "false");
 
         if let Some(ref tmux_bin) = self.mock_tmux_bin.clone() {
@@ -541,7 +552,7 @@ async fn then_worktree_gone(world: &mut AmWorld, rel_path: String) {
 
 #[then(expr = "the session file contains {string}")]
 async fn then_session_contains(world: &mut AmWorld, slug: String) {
-    let sessions_path = world.project_path().join(".am").join("sessions.json");
+    let sessions_path = world.global_sessions_path();
     let content = fs::read_to_string(&sessions_path)
         .unwrap_or_else(|_| panic!("sessions.json not found at {sessions_path:?}"));
     assert!(
@@ -552,7 +563,7 @@ async fn then_session_contains(world: &mut AmWorld, slug: String) {
 
 #[then(expr = "the session file does not contain {string}")]
 async fn then_session_not_contain(world: &mut AmWorld, slug: String) {
-    let sessions_path = world.project_path().join(".am").join("sessions.json");
+    let sessions_path = world.global_sessions_path();
     if !sessions_path.exists() {
         return; // no file → no session → assertion trivially satisfied
     }

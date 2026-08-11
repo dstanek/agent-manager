@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, SessionCommands};
 use command::shell_quote;
 
 fn main() {
@@ -40,12 +40,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             auto,
             rebuild,
         } => cmd_start(&slug, agent.as_deref(), no_container, auto, rebuild),
-        Commands::List => cmd_list(),
+        Commands::List { all } => cmd_list(all),
         Commands::Attach { slug } => cmd_attach(&slug),
         Commands::Run { slug, agent } => cmd_run(&slug, &agent),
         Commands::Destroy { slug, force } => cmd_destroy(&slug, force, &msgs),
         Commands::Doctor => cmd_doctor(None),
         Commands::GenerateConfig => cmd_generate_config(),
+        Commands::Session { command } => match command {
+            SessionCommands::Rm { slug, repo, force } => {
+                cmd_session_rm(&slug, repo.as_deref(), force)
+            }
+        },
     }
 }
 
@@ -65,39 +70,37 @@ fn cmd_init() -> anyhow::Result<()> {
         println!(".am/config.toml already exists, skipping");
     }
 
-    let sessions_path = am_dir.join("sessions.json");
-    if !sessions_path.exists() {
-        std::fs::write(&sessions_path, "{\"sessions\":[]}\n")?;
-        println!("Created .am/sessions.json");
-    }
-
-    let gitconfig_path = am_dir.join("gitconfig");
-    if !gitconfig_path.exists() {
-        let name = read_git_config("user.name").unwrap_or_default();
-        let email = read_git_config("user.email").unwrap_or_default();
-        let content = format!("[user]\n\tname = {name}\n\temail = {email}\n");
-        std::fs::write(&gitconfig_path, content)?;
-        println!("Created .am/gitconfig");
-    } else {
-        println!(".am/gitconfig already exists, skipping");
-    }
-
     let gitignore_path = repo_root.join(".gitignore");
-    let already_ignored = if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path)?;
-        content
-            .lines()
-            .any(|l| l.trim() == ".am/" || l.trim() == ".am")
+    let gitignore_content = if gitignore_path.exists() {
+        std::fs::read_to_string(&gitignore_path)?
     } else {
-        false
+        String::new()
     };
-    if !already_ignored {
+
+    // Check for old-style broad .am/ entry and print advisory.
+    let has_old_am_entry = gitignore_content
+        .lines()
+        .any(|l| l.trim() == ".am/" || l.trim() == ".am");
+    if has_old_am_entry {
+        println!(
+            "Note: .am/ is in .gitignore; .am/config.toml is now committable — \
+             you may want to narrow this to .am/worktrees/"
+        );
+    }
+
+    // Check if .am/worktrees/ is already present.
+    let worktrees_already_ignored = gitignore_content
+        .lines()
+        .any(|l| l.trim() == ".am/worktrees/" || l.trim() == ".am/worktrees");
+    if worktrees_already_ignored {
+        println!(".am/worktrees/ already in .gitignore, skipping");
+    } else {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&gitignore_path)?;
-        file.write_all(b".am/\n")?;
-        println!("Added .am/ to .gitignore");
+        file.write_all(b".am/worktrees/\n")?;
+        println!("Added .am/worktrees/ to .gitignore");
     }
 
     println!("am initialized. Run 'am start <slug>' to create your first session.");
@@ -114,7 +117,14 @@ fn cmd_start(
     rebuild: bool,
 ) -> anyhow::Result<()> {
     let (repo_root, vcs) = find_repo_root()?;
-    let sessions = session::load_sessions(&repo_root)?;
+
+    // Migration: transparently move old per-repo sessions to the global store.
+    // Ignore migration errors — they are warnings, not blockers.
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("warning: session migration failed: {e}");
+    }
+
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
 
     if session::find_session(&sessions, slug).is_some() {
         return Err(error::AmError::SlugAlreadyExists(slug.to_string()).into());
@@ -151,15 +161,15 @@ fn cmd_start(
         .map(container::KnownAgent::parse)
         .transpose()?;
 
-    // 4. Require am init when using containers
-    if cfg.container.enabled && !no_container {
-        let gitconfig_path = repo_root.join(".am").join("gitconfig");
-        if !gitconfig_path.exists() && cfg.container.gitconfig.is_none() {
-            return Err(anyhow::anyhow!(
-                ".am/gitconfig not found — run 'am init' first to create the project configuration"
-            ));
-        }
-    }
+    // 4. Generate gitconfig in the global state directory.
+    //    This replaces the old .am/gitconfig check — we generate it unconditionally.
+    let state_dir = config::global_state_dir()
+        .ok_or(error::AmError::GlobalStateDirNotFound)?;
+    std::fs::create_dir_all(&state_dir)?;
+    let name = read_git_config("user.name").unwrap_or_default();
+    let email = read_git_config("user.email").unwrap_or_default();
+    let gitconfig_path = state_dir.join("gitconfig");
+    std::fs::write(&gitconfig_path, format!("[user]\n\tname = {name}\n\temail = {email}\n"))?;
 
     // 5. Container runtime and host-side credentials. Everything checkable without a
     //    worktree is checked here; a devcontainer config only exists once the worktree
@@ -258,6 +268,7 @@ fn cmd_start(
         slug: slug.to_string(),
         created_at: chrono::Utc::now(),
         auto,
+        repo_root: repo_root.clone(),
         vcs: session::VcsMetadata {
             branch: format!("am/{slug}"),
             worktree_path: worktree_path.clone(),
@@ -280,7 +291,7 @@ fn cmd_start(
     // the user can run 'am destroy <slug>' to clean up.
     if let Some(ref cmd) = container_cmd {
         if !tmux::is_in_tmux() {
-            session::add_session(&repo_root, new_session)?;
+            session::add_session_global(new_session)?;
             guard.commit();
             println!("Started session '{slug}'");
             println!("  worktree:  {}", worktree_path.display());
@@ -312,7 +323,7 @@ fn cmd_start(
         .container
         .as_ref()
         .map(|c| (c.mode, c.image.clone()));
-    session::add_session(&repo_root, new_session)?;
+    session::add_session_global(new_session)?;
     guard.commit();
 
     println!("Started session '{slug}'");
@@ -594,9 +605,25 @@ fn injected_features(
 
 // ── am list ───────────────────────────────────────────────────────────────────
 
-fn cmd_list() -> anyhow::Result<()> {
-    let (repo_root, _) = find_repo_root()?;
-    let sessions = session::load_sessions(&repo_root)?;
+fn cmd_list(all: bool) -> anyhow::Result<()> {
+    if all {
+        cmd_list_all()
+    } else {
+        cmd_list_repo()
+    }
+}
+
+fn cmd_list_repo() -> anyhow::Result<()> {
+    let (repo_root, _) = find_repo_root().map_err(|e| {
+        anyhow::anyhow!("{e}\nRun 'am list --all' to see sessions from all repos.")
+    })?;
+
+    // Migration: transparently move old per-repo sessions to the global store.
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("warning: session migration failed: {e}");
+    }
+
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
 
     if sessions.is_empty() {
         println!("No active sessions. Run 'am start <slug>' to begin.");
@@ -643,11 +670,94 @@ fn cmd_list() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_list_all() -> anyhow::Result<()> {
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    let sessions = session::load_all_sessions()?;
+
+    if sessions.is_empty() {
+        println!("No sessions found across any repo.");
+        return Ok(());
+    }
+
+    // Sort: non-stale first (by repo_root, then created_at), stale last.
+    let mut sessions = sessions;
+    sessions.sort_by(|a, b| {
+        let a_stale = !a.repo_root.exists();
+        let b_stale = !b.repo_root.exists();
+        a_stale
+            .cmp(&b_stale)
+            .then_with(|| a.repo_root.cmp(&b.repo_root))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+
+    let abbrev_home = |p: &std::path::Path| -> String {
+        if let Some(ref home) = home_dir {
+            if let Ok(rel) = p.strip_prefix(home) {
+                return format!("~/{}", rel.display());
+            }
+        }
+        p.display().to_string()
+    };
+
+    let slug_w = sessions
+        .iter()
+        .map(|s| s.slug.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let repo_w = sessions
+        .iter()
+        .map(|s| abbrev_home(&s.repo_root).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let path_w = sessions
+        .iter()
+        .map(|s| s.vcs.worktree_path.display().to_string().len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    println!(
+        "{:<repo_w$}  {:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  {:<7}  CREATED",
+        "REPO", "SLUG", "CONTAINER", "AUTO", "WORKTREE", "WINDOW", "STATUS",
+    );
+    println!("{}", "-".repeat(repo_w + slug_w + 9 + 4 + path_w + 10 + 7 + 19 + 14));
+
+    for s in &sessions {
+        let container = s
+            .container
+            .as_ref()
+            .map(|c| c.runtime.as_str())
+            .unwrap_or("—");
+        let auto = if s.auto { "yes" } else { "—" };
+        let created = s.created_at.format("%Y-%m-%d %H:%M").to_string();
+        let status = if s.repo_root.exists() { "" } else { "stale" };
+        let repo = abbrev_home(&s.repo_root);
+        println!(
+            "{:<repo_w$}  {:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  {:<7}  {}",
+            repo,
+            s.slug,
+            container,
+            auto,
+            s.vcs.worktree_path.display(),
+            s.tmux.tmux_window,
+            status,
+            created,
+        );
+    }
+    Ok(())
+}
+
 // ── am attach ────────────────────────────────────────────────────────────────
 
 fn cmd_attach(slug: &str) -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
-    let sessions = session::load_sessions(&repo_root)?;
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("warning: session migration failed: {e}");
+    }
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
 
     let s = session::find_session(&sessions, slug)
         .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?;
@@ -697,7 +807,10 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
 
 fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
-    let sessions = session::load_sessions(&repo_root)?;
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("warning: session migration failed: {e}");
+    }
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
 
     let s = session::find_session(&sessions, slug)
         .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?;
@@ -716,7 +829,10 @@ fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
 
 fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Result<()> {
     let (repo_root, vcs) = find_repo_root()?;
-    let sessions = session::load_sessions(&repo_root)?;
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("warning: session migration failed: {e}");
+    }
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
 
     let s = session::find_session(&sessions, slug)
         .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?;
@@ -788,7 +904,7 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
     }
 
     // Remove session record
-    session::remove_session(&repo_root, slug)?;
+    session::remove_session_global(&repo_root, slug)?;
 
     println!("Destroyed session '{slug}'.");
     Ok(())
@@ -810,6 +926,131 @@ fn cmd_doctor(agent_flag: Option<&str>) -> anyhow::Result<()> {
     if report.failures() > 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+// ── am session rm ─────────────────────────────────────────────────────────────
+
+fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> anyhow::Result<()> {
+    // Resolve repo_root.
+    let repo_root: std::path::PathBuf = if let Some(r) = repo {
+        // Use provided --repo path as-is (need not exist — could be stale).
+        if r.is_absolute() {
+            r.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(r)
+        }
+    } else {
+        // No --repo: try to find the repo root from CWD.
+        match find_repo_root() {
+            Ok((root, _)) => {
+                // We're inside a repo. Check if slug matches this repo.
+                if let Err(e) = session::migrate_sessions(&root) {
+                    eprintln!("warning: session migration failed: {e}");
+                }
+                let all = session::load_all_sessions()?;
+                let for_this_repo: Vec<_> = all
+                    .iter()
+                    .filter(|s| s.repo_root == root && s.slug == slug)
+                    .collect();
+                if !for_this_repo.is_empty() {
+                    // Slug matches current repo — use it.
+                    root
+                } else {
+                    // Slug not in current repo; look across all repos.
+                    let matching: Vec<_> = all
+                        .iter()
+                        .filter(|s| s.slug == slug)
+                        .collect();
+                    if matching.is_empty() {
+                        return Err(error::AmError::SlugNotFound(slug.to_string()).into());
+                    } else if matching.len() == 1 {
+                        matching[0].repo_root.clone()
+                    } else {
+                        let repos: Vec<_> = matching
+                            .iter()
+                            .map(|s| format!("  {}", s.repo_root.display()))
+                            .collect();
+                        return Err(anyhow::anyhow!(
+                            "slug '{}' exists in multiple repos:\n{}\nUse --repo <path> to specify which one.",
+                            slug,
+                            repos.join("\n")
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                // Not inside a repo — look across all sessions for this slug.
+                let all = session::load_all_sessions()?;
+                let matching: Vec<_> = all.iter().filter(|s| s.slug == slug).collect();
+                if matching.is_empty() {
+                    return Err(error::AmError::SlugNotFound(slug.to_string()).into());
+                } else if matching.len() == 1 {
+                    matching[0].repo_root.clone()
+                } else {
+                    let repos: Vec<_> = matching
+                        .iter()
+                        .map(|s| format!("  {}", s.repo_root.display()))
+                        .collect();
+                    return Err(anyhow::anyhow!(
+                        "slug '{}' exists in multiple repos:\n{}\nUse --repo <path> to specify which one.",
+                        slug,
+                        repos.join("\n")
+                    ));
+                }
+            }
+        }
+    };
+
+    // Find the session in the global store.
+    let all = session::load_all_sessions()?;
+    let s = all
+        .iter()
+        .find(|s| s.repo_root == repo_root && s.slug == slug)
+        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?
+        .clone();
+
+    // Confirmation prompt (unless --force).
+    if !force {
+        print!(
+            "Remove session '{}' from {}? [y/N] ",
+            slug,
+            repo_root.display()
+        );
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Best-effort container cleanup.
+    if let Some(ref sc) = s.container {
+        let pref = match sc.runtime.as_str() {
+            "docker" => config::RuntimePreference::Docker,
+            _ => config::RuntimePreference::Podman,
+        };
+        if let Ok(rt) = container::detect_runtime(pref) {
+            if let Err(e) = container::stop_container(&rt, &format!("am-{slug}")) {
+                eprintln!("warning: container cleanup failed: {e}");
+            }
+            if let Err(e) = container::remove_container(&rt, &format!("am-{slug}")) {
+                eprintln!("warning: container cleanup failed: {e}");
+            }
+        }
+    }
+
+    // Best-effort tmux cleanup.
+    if let Err(e) = tmux::kill_window(&s.tmux.tmux_window) {
+        eprintln!("warning: tmux cleanup failed: {e}");
+    }
+
+    // Remove the record from the global store.
+    session::remove_session_global(&repo_root, slug)?;
+
+    println!("Removed session '{slug}'.");
     Ok(())
 }
 

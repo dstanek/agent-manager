@@ -240,31 +240,36 @@ fn check_project_setup(report: &mut Report, repo_root: &Path, cfg: &Config) {
         format!("initialized at {}", am_dir.display()),
     ));
 
-    // cmd_start requires a gitconfig when containers are on, unless one is configured
-    // elsewhere — mirror that condition exactly rather than always demanding the file.
-    let gitconfig = cfg
-        .container
-        .gitconfig
-        .clone()
-        .unwrap_or_else(|| am_dir.join("gitconfig"));
-    if gitconfig.exists() {
+    // am start generates a gitconfig from git config at session start time.
+    // Check that git identity is available so the generated gitconfig will be useful.
+    let has_name = std::process::Command::new("git")
+        .args(["config", "--global", "user.name"])
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success() && !o.stdout.is_empty());
+    let has_email = std::process::Command::new("git")
+        .args(["config", "--global", "user.email"])
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success() && !o.stdout.is_empty());
+    if has_name && has_email {
         report.checks.push(Check::ok(
             PROJECT,
             "git identity",
-            format!("{}", gitconfig.display()),
+            "user.name and user.email configured",
         ));
     } else if cfg.container.enabled {
-        report.checks.push(Check::fail(
+        report.checks.push(Check::warn(
             PROJECT,
             "git identity",
-            format!("{} not found", gitconfig.display()),
-            "run 'am init', or set container.gitconfig to an existing file",
+            "user.name or user.email not set in git config",
+            "run 'git config --global user.name \"Your Name\"' and 'git config --global user.email you@example.com'",
         ));
     } else {
         report.checks.push(Check::warn(
             PROJECT,
             "git identity",
-            format!("{} not found", gitconfig.display()),
+            "user.name or user.email not set in git config",
             "not required while container.enabled = false",
         ));
     }
@@ -778,20 +783,11 @@ mod tests {
     fn initialised_project_reports_ok() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
-        std::fs::write(tmp.path().join(".am").join("gitconfig"), "").unwrap();
         let report = run(Some((tmp.path(), Vcs::Git)), None);
         assert_eq!(find(&report, ".am/").status, Status::Ok);
-        assert_eq!(find(&report, "git identity").status, Status::Ok);
-    }
-
-    #[test]
-    fn missing_gitconfig_fails_only_because_containers_need_it() {
-        let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
-        let report = run(Some((tmp.path(), Vcs::Git)), None);
-        let check = find(&report, "git identity");
-        assert_eq!(check.status, Status::Fail);
-        assert!(check.hint.as_deref().unwrap().contains("am init"));
+        // git identity check depends on the test runner's actual git config,
+        // so we only verify the check exists, not its status.
+        find(&report, "git identity");
     }
 
     // ── Agent ─────────────────────────────────────────────────────────────────
