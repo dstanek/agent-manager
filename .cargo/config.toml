@@ -1,0 +1,20 @@
+[env]
+# Run the test binaries single-threaded.
+#
+# Several tests write a mock executable and immediately exec it (the tmux,
+# container-runtime, and Dev Containers CLI mocks). If any other thread in the
+# same test process forks while that file is still open for writing, the child
+# inherits the write descriptor, and our exec fails with ETXTBSY until the child
+# reaches its own exec and CLOEXEC drops it. Closing the descriptor in the
+# writing thread does not close the copy the child received.
+#
+# Per-module mutexes cannot fix this: the contended resource is the process-wide
+# file descriptor table, and the forking thread is usually in another module
+# (worktree's real git/jj calls, container's mock runtimes). Measured at roughly
+# 1-2 failures in 8 parallel runs, and 0 in 8 serialized runs.
+#
+# The suite takes well under a second, so serializing costs nothing today. If
+# that stops being true, the better fix is moving the exec-mock tests into their
+# own integration target so they no longer share a process with the fork-heavy
+# ones.
+RUST_TEST_THREADS = "1"
