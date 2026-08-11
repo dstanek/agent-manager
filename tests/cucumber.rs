@@ -87,6 +87,8 @@ pub struct AmWorld {
     /// When Some, the `devcontainer` CLI is mocked (+ log file).
     mock_devcontainer_bin: Option<PathBuf>,
     mock_devcontainer_log: Option<PathBuf>,
+    /// Which builder the scenario pins, via `AM_DEVCONTAINER_BUILDER`.
+    devcontainer_builder: Option<&'static str>,
     /// Touched by the mock CLI on a successful build; the mock runtime reports an image
     /// as present only once it exists, so "build" and "reuse" are distinguishable.
     mock_image_marker: Option<PathBuf>,
@@ -114,6 +116,7 @@ impl Default for AmWorld {
             extra_env: Vec::new(),
             mock_devcontainer_bin: None,
             mock_devcontainer_log: None,
+            devcontainer_builder: None,
             mock_image_marker: None,
             mock_label_file: None,
             isolated_home: None,
@@ -310,11 +313,15 @@ impl AmWorld {
         self.mock_podman_log = Some(log);
     }
 
-    /// Install a mock container runtime that understands the two devcontainer queries:
-    /// "does this image exist" and "what is its metadata label".
+    /// Install a mock container runtime that understands the devcontainer queries:
+    /// "does this image exist", "what is its metadata label", and "what user does it run as".
     ///
     /// The plain mock always exits 0, which would make every image look present and hide
     /// the build step entirely.
+    ///
+    /// The two `inspect` formats have to be told apart: `am`'s own builder asks for
+    /// `.Config.User` as well as the metadata label, and answering both with the label JSON
+    /// would silently make the image user a blob of JSON.
     fn setup_mock_devcontainer_runtime(&mut self) {
         let bin = self.project_dir.path().join("mock_podman_dc");
         let log = self.project_dir.path().join("mock_podman.log");
@@ -336,7 +343,14 @@ impl AmWorld {
                  exit 1\n\
              fi\n\
              if [ \"$1\" = \"inspect\" ]; then\n\
+                 case \"$*\" in\n\
+                     *Config.User*) echo 'root'; exit 0 ;;\n\
+                 esac\n\
                  cat \"$MOCK_LABEL_FILE\" 2>/dev/null || echo '<no value>'\n\
+                 exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"build\" ]; then\n\
+                 touch \"$MOCK_IMAGE_MARKER\"\n\
                  exit 0\n\
              fi\n\
              exit 0\n",
@@ -454,6 +468,15 @@ impl AmWorld {
                 cmd.env("MOCK_DEVCONTAINER_LOG", log);
             }
         }
+        if let Some(builder) = self.devcontainer_builder {
+            cmd.env("AM_DEVCONTAINER_BUILDER", builder);
+        }
+        // Keep am's own builder off the developer's real cache: it stages build inputs under
+        // the feature cache, and a test must not write there.
+        cmd.env(
+            "AM_FEATURE_CACHE",
+            self.project_dir.path().join("feature-cache"),
+        );
         if let Some(ref marker) = self.mock_image_marker.clone() {
             cmd.env("MOCK_IMAGE_MARKER", marker);
         }
@@ -817,16 +840,35 @@ async fn given_record_global_config(world: &mut AmWorld) {
 
 // ── When ──────────────────────────────────────────────────────────────────────
 
+/// Pins `builder = "cli"`: a scenario that mocks the CLI is a scenario about the CLI path,
+/// and under the default (`auto`) `am`'s own builder would handle these configs instead.
 #[given("I am using a mock devcontainer CLI")]
 async fn given_mock_devcontainer(world: &mut AmWorld) {
     world.setup_mock_devcontainer_runtime();
     world.setup_mock_devcontainer_cli(true);
+    world.devcontainer_builder = Some("cli");
 }
 
 #[given("I am using a mock devcontainer CLI that fails")]
 async fn given_failing_devcontainer(world: &mut AmWorld) {
     world.setup_mock_devcontainer_runtime();
     world.setup_mock_devcontainer_cli(false);
+    world.devcontainer_builder = Some("cli");
+}
+
+/// The CLI is still mocked so a scenario can assert it was *not* reached.
+#[given("I am using am's own devcontainer builder")]
+async fn given_native_builder(world: &mut AmWorld) {
+    world.setup_mock_devcontainer_runtime();
+    world.setup_mock_devcontainer_cli(true);
+    world.devcontainer_builder = Some("auto");
+}
+
+#[given("I am using am's own devcontainer builder with no fallback")]
+async fn given_strict_native_builder(world: &mut AmWorld) {
+    world.setup_mock_devcontainer_runtime();
+    world.setup_mock_devcontainer_cli(true);
+    world.devcontainer_builder = Some("native");
 }
 
 #[given("the repo has a devcontainer config")]
@@ -841,6 +883,16 @@ async fn given_devcontainer_config(world: &mut AmWorld) {
 async fn given_compose_config(world: &mut AmWorld) {
     world.write_devcontainer_config(
         "{\"name\":\"test\",\"dockerComposeFile\":\"docker-compose.yml\",\"service\":\"app\"}",
+    );
+}
+
+/// A Feature vendored in the repo — the cheapest construct that `am`'s builder does not
+/// implement, so it is what the fallback scenarios use.
+#[given("the repo has a devcontainer config using a local feature")]
+async fn given_local_feature_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\"name\":\"test\",\"image\":\"debian:bookworm\",\
+         \"features\":{\"./vendored-feature\":{}}}",
     );
 }
 

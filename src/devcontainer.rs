@@ -27,6 +27,8 @@ use crate::color;
 
 use crate::error::AmError;
 
+pub mod native;
+
 // Path handling strategy: keep Path/PathBuf internally, convert at argv boundaries.
 // See CLAUDE.md. Container-side paths are Strings because they are the *container's*
 // namespace, not the host filesystem's, and never get opened locally.
@@ -247,7 +249,8 @@ pub enum ComposeFile {
 /// The subset of `devcontainer.json` that does **not** survive into the image label.
 ///
 /// Everything else deliberately comes from the label instead, so this struct stays small.
-/// `build` is included only to locate the Dockerfile for hashing.
+/// `image` and `build` are what the native builder needs to resolve a base image; in CLI mode
+/// `build` is used only to locate the Dockerfile for hashing.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevcontainerJson {
@@ -258,6 +261,7 @@ pub struct DevcontainerJson {
     pub workspace_mount: Option<String>,
     pub initialize_command: Option<LifecycleCommand>,
     pub docker_compose_file: Option<ComposeFile>,
+    pub image: Option<String>,
     pub build: Option<BuildSection>,
 }
 
@@ -265,6 +269,11 @@ pub struct DevcontainerJson {
 #[serde(rename_all = "camelCase")]
 pub struct BuildSection {
     pub dockerfile: Option<String>,
+    /// Build context, relative to the config file. Defaults to the Dockerfile's directory.
+    pub context: Option<String>,
+    #[serde(default)]
+    pub args: BTreeMap<String, serde_json::Value>,
+    pub target: Option<String>,
 }
 
 /// Parse a `devcontainer.json`. The file is JSONC — comments and trailing commas are
@@ -652,6 +661,77 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
 }
 
 // ── Build step ────────────────────────────────────────────────────────────────
+
+/// Everything a builder needs to turn a config into an image.
+///
+/// Both builders take the same request and return the same thing — an image name — which is
+/// what keeps the run path from having to know which one produced it.
+pub struct BuildRequest<'a> {
+    pub worktree: &'a Path,
+    pub config_path: &'a Path,
+    pub json: &'a DevcontainerJson,
+    pub image: &'a str,
+    pub injected: &'a [InjectedFeature],
+    pub no_cache: bool,
+}
+
+/// Build the image with whichever builder the config selects.
+///
+/// In [`crate::config::Builder::Auto`] an unsupported construct is a fallback, not an error:
+/// `am` says what it could not handle and hands off to the reference CLI. In
+/// [`crate::config::Builder::Native`] the same condition is fatal, so that a config which
+/// silently costs a Node dependency is visible rather than invisible.
+pub fn build_image(
+    req: &BuildRequest,
+    cfg: &crate::config::Config,
+    runtime_bin: &Path,
+) -> Result<String> {
+    use crate::config::Builder;
+
+    if cfg.devcontainer.builder == Builder::Cli {
+        return build_with_cli(req, cfg, runtime_bin);
+    }
+
+    // The native builder needs the config as raw JSON: the properties it copies into the
+    // metadata label are deliberately not modelled, so they can pass through untouched.
+    let text = std::fs::read_to_string(req.config_path)
+        .with_context(|| format!("reading {}", req.config_path.display()))?;
+    let raw: serde_json::Value = serde_json_lenient::from_str(&text)
+        .map_err(|e| AmError::ConfigError(e.to_string()))?;
+
+    match native::build(req, runtime_bin, &raw)? {
+        Ok(image) => Ok(image),
+        Err(reason) if cfg.devcontainer.builder == Builder::Native => {
+            Err(AmError::DevcontainerBuildFailed(format!(
+                "am's own builder cannot handle this config: {reason}\n\
+                 Set devcontainer.builder = \"auto\" to fall back to the reference CLI"
+            ))
+            .into())
+        }
+        Err(reason) => {
+            println!("Falling back to the devcontainer CLI: {reason}.");
+            build_with_cli(req, cfg, runtime_bin)
+        }
+    }
+}
+
+/// Delegate to `@devcontainers/cli`.
+fn build_with_cli(
+    req: &BuildRequest,
+    cfg: &crate::config::Config,
+    runtime_bin: &Path,
+) -> Result<String> {
+    let cli = find_cli(&cfg.devcontainer.cli)?;
+    build(
+        &cli,
+        req.worktree,
+        req.config_path,
+        req.image,
+        req.injected,
+        runtime_bin,
+        req.no_cache,
+    )
+}
 
 /// Locate the `devcontainer` CLI.
 ///

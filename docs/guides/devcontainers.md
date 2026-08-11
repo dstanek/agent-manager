@@ -7,15 +7,33 @@ too — there is no second, `am`-shaped image to maintain.
 
 ## Requirements
 
-Building needs the reference CLI and Node 20+:
+Nothing beyond your usual Podman or Docker. `am` builds the image itself — resolving
+Features from their registries, generating the Dockerfile, and handing the build to your
+container runtime.
+
+Some configs still need the reference CLI, and `am` falls back to it automatically when it
+sees one:
+
+- `dockerComposeFile`
+- `overrideFeatureInstallOrder`, or a Feature that uses `dependsOn`
+- a Feature referenced by local path (`./my-feature`) or by tarball URL
+
+If you hit one, `am` tells you which construct caused it, and the CLI needs Node 20+:
 
 ```sh
 npm install -g @devcontainers/cli
 ```
 
-`am` calls it once per config change, not once per session, so it stays off the hot path.
-Running the container is entirely `am`'s own code and needs nothing beyond your usual
-Podman or Docker.
+Either way a build happens once per config change, not once per session, so it stays off
+the hot path.
+
+If you would rather never depend on Node, make the fallback an error instead:
+
+```toml
+# .am/config.toml
+[devcontainer]
+builder = "native"   # "auto" (default) | "native" | "cli"
+```
 
 ## Choosing a mode
 
@@ -161,8 +179,14 @@ Start with `am doctor`. It reports the discovered config, the CLI and its versio
 whether the built image is current, and any construct `am` will refuse or drop — which
 covers most of what follows before you have to guess.
 
-**"devcontainer CLI not found"** — install `@devcontainers/cli` globally, point
-`devcontainer.cli` (or `AM_DEVCONTAINER_BIN`) at it, or switch to `container.mode = "image"`.
+**"devcontainer CLI not found"** — your config uses something `am` cannot build itself, so
+it tried to fall back. Install `@devcontainers/cli` globally, point `devcontainer.cli` (or
+`AM_DEVCONTAINER_BIN`) at it, or switch to `container.mode = "image"`. `am doctor` reports
+this as "not needed" when the config is one `am` can build on its own.
+
+**"am's own builder cannot handle this config"** — you set `builder = "native"`, which turns
+the CLI fallback into an error. The message names the construct; set `builder = "auto"` to
+fall back instead.
 
 **The build succeeded but the agent isn't found** — the image has no agent and
 `agent_install` resolved to `none`. Check that your agent has a mapped Feature, or set

@@ -1092,19 +1092,21 @@ fn plan_devcontainer(
     let image = devcontainer::image_name(config_path, &injected)?;
     let config_hash = devcontainer::config_hash(config_path, &injected)?;
 
-    // The whole point of hashing: an unchanged config reuses its image, so the Node CLI
-    // runs once per config change rather than once per session.
+    // The whole point of hashing: an unchanged config reuses its image, so a build runs once
+    // per config change rather than once per session.
     if rebuild || !devcontainer::image_exists(&runtime.bin, &image) {
-        let cli = devcontainer::find_cli(&cfg.devcontainer.cli)?;
         println!("Building devcontainer image {image} (this can take a few minutes)...");
-        devcontainer::build(
-            &cli,
-            worktree,
-            config_path,
-            &image,
-            &injected,
+        devcontainer::build_image(
+            &devcontainer::BuildRequest {
+                worktree,
+                config_path,
+                json: &json,
+                image: &image,
+                injected: &injected,
+                no_cache: rebuild,
+            },
+            cfg,
             &runtime.bin,
-            rebuild,
         )?;
     }
 
