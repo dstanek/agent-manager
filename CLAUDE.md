@@ -33,7 +33,7 @@ make build-copilot       # Build Copilot Docker image
 
 **VCS detection:** checks `.jj/` first, falls back to `.git`, errors if neither found.
 
-**Container mounts:** both git and jj repos mirror the host path structure inside the container (worktree and VCS dirs are mounted at the same absolute paths). No `GIT_DIR`/`GIT_WORK_TREE` env vars are injected. See `container.rs`.
+**Container mounts:** both git and jj repos mirror the host path structure inside the container (worktree and VCS dirs are mounted at the same absolute paths). No `GIT_DIR`/`GIT_WORK_TREE` env vars are injected. The host's `$SSH_AUTH_SOCK` follows the same mirroring rule when `container.ssh_agent` is on (default), because mounting `~/.ssh` alone cannot authenticate a passphrase-protected or agent-only key; it is the one mount never relabelled under SELinux, since the socket belongs to a host process. See `container.rs`.
 
 **Agent auth presets** (`claude`, `copilot`, `gemini`, `codex`) provide credentials at runtime via mounts and/or environment variables. `codex` accepts either an `OPENAI_API_KEY` or an interactive sign-in mounted from `~/.codex`, and only fails preflight when neither exists — an agent with two authentication paths must not be validated as if it had one. Unknown agent names are rejected early with a clear error listing valid agents. Mount targets are derived from `ContainerMounts::container_home`, not from the username — a devcontainer's `remoteUser` may be `root`, whose home is `/root`.
 

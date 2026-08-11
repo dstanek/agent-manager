@@ -102,6 +102,9 @@ pub struct ContainerMounts {
     pub colocated_git_host: Option<PathBuf>, // .git for colocated jj+git repos
     pub gitconfig_host: PathBuf,             // $XDG_STATE_HOME/am/gitconfig (or override)
     pub ssh_host: PathBuf,                   // ~/.ssh
+    /// The host's `SSH_AUTH_SOCK`, when `container.ssh_agent` is on and the variable is
+    /// set. `None` disables forwarding entirely.
+    pub ssh_agent_sock: Option<PathBuf>,
     pub agent_auth: Vec<AgentAuthMount>,
     /// Home directory inside the container. Derived from the configured container user
     /// unless a devcontainer's `remoteUser` or an explicit override says otherwise.
@@ -241,6 +244,17 @@ fn home_dir() -> Result<PathBuf> {
     })
 }
 
+/// The host's SSH agent socket, if there is one.
+///
+/// Not an error when unset: plenty of hosts have no agent running, and a session that
+/// cannot reach one is only degraded, not broken.
+fn ssh_auth_sock() -> Option<PathBuf> {
+    std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_mounts(
     slug: &str,
@@ -249,6 +263,7 @@ pub fn resolve_mounts(
     agent_auth: Vec<AgentAuthMount>,
     gitconfig: Option<&Path>,
     ssh: Option<&Path>,
+    ssh_agent: bool,
     container_user: &str,
     home_override: Option<&Path>,
 ) -> Result<ContainerMounts> {
@@ -284,6 +299,7 @@ pub fn resolve_mounts(
         colocated_git_host,
         gitconfig_host,
         ssh_host,
+        ssh_agent_sock: ssh_agent.then(ssh_auth_sock).flatten(),
         agent_auth,
         container_home: container_home(container_user, home_override),
     })
@@ -694,6 +710,25 @@ pub fn build_run_command(
         ));
     }
 
+    // SSH agent socket — same path inside the container as on the host, so SSH_AUTH_SOCK
+    // carries over unchanged. Read-write, because connecting to a unix socket needs it.
+    //
+    // Deliberately not relabelled even under SELinux: the socket belongs to the host's
+    // agent process, and `:z` would rewrite the label on a file the host still needs.
+    if let Some(sock) = &mounts.ssh_agent_sock {
+        if sock.exists() {
+            cmd.push("-v".to_string());
+            cmd.push(mount_str(
+                sock,
+                &sock.to_string_lossy(),
+                MountMode::ReadWrite,
+                false,
+            ));
+            cmd.push("-e".to_string());
+            cmd.push(format!("SSH_AUTH_SOCK={}", sock.to_string_lossy()));
+        }
+    }
+
     // Agent auth mounts — only mount if the path exists
     for auth in &mounts.agent_auth {
         if auth.host_path.exists() {
@@ -929,6 +964,7 @@ mod tests {
             colocated_git_host: None,
             gitconfig_host: tmp.join(".gitconfig"),
             ssh_host: tmp.join(".ssh"),
+            ssh_agent_sock: None,
             agent_auth: vec![],
             container_home: "/home/am".to_string(),
         }
@@ -1025,7 +1061,17 @@ mod tests {
 
         let repo_root = tmp.path().join("repo");
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Git, vec![], None, None, "am", None).unwrap();
+            resolve_mounts(
+            "feat",
+            &repo_root,
+            &Vcs::Git,
+            vec![],
+            None,
+            None,
+            false,
+            "am",
+            None,
+        ).unwrap();
 
         assert_eq!(mounts.worktree_host, repo_root.join(".am/worktrees/feat"));
         assert_eq!(mounts.vcs_host, repo_root.join(".git"));
@@ -1049,7 +1095,17 @@ mod tests {
         let repo_root = tmp.path().join("repo");
         std::fs::create_dir_all(repo_root.join(".git")).unwrap();
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am", None).unwrap();
+            resolve_mounts(
+            "feat",
+            &repo_root,
+            &Vcs::Jj,
+            vec![],
+            None,
+            None,
+            false,
+            "am",
+            None,
+        ).unwrap();
 
         assert_eq!(mounts.colocated_git_host, Some(repo_root.join(".git")));
 
@@ -1064,7 +1120,17 @@ mod tests {
 
         let repo_root = tmp.path().join("repo");
         let mounts =
-            resolve_mounts("feat", &repo_root, &Vcs::Jj, vec![], None, None, "am", None).unwrap();
+            resolve_mounts(
+            "feat",
+            &repo_root,
+            &Vcs::Jj,
+            vec![],
+            None,
+            None,
+            false,
+            "am",
+            None,
+        ).unwrap();
 
         assert_eq!(mounts.colocated_git_host, None);
 
@@ -1112,6 +1178,7 @@ mod tests {
             agent_auth.mounts,
             None,
             None,
+            false,
             "am",
             None,
         )
@@ -1124,6 +1191,154 @@ mod tests {
         );
 
         std::env::remove_var("HOME");
+    }
+
+    // ── SSH agent forwarding ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_mounts_picks_up_the_host_ssh_agent_socket() {
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("SSH_AUTH_SOCK", "/run/user/1000/keyring/ssh");
+
+        let mounts = resolve_mounts(
+            "feat",
+            &tmp.path().join("repo"),
+            &Vcs::Git,
+            vec![],
+            None,
+            None,
+            true,
+            "am",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mounts.ssh_agent_sock,
+            Some(PathBuf::from("/run/user/1000/keyring/ssh"))
+        );
+
+        std::env::remove_var("SSH_AUTH_SOCK");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_mounts_skips_the_ssh_agent_when_disabled() {
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("SSH_AUTH_SOCK", "/run/user/1000/keyring/ssh");
+
+        let mounts = resolve_mounts(
+            "feat",
+            &tmp.path().join("repo"),
+            &Vcs::Git,
+            vec![],
+            None,
+            None,
+            false,
+            "am",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(mounts.ssh_agent_sock, None);
+
+        std::env::remove_var("SSH_AUTH_SOCK");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_mounts_tolerates_a_host_with_no_agent() {
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        // Empty is what a shell leaves behind after `unset`-then-export patterns, and it
+        // must read the same as absent — an empty mount source is a runtime error.
+        std::env::set_var("SSH_AUTH_SOCK", "");
+
+        let mounts = resolve_mounts(
+            "feat",
+            &tmp.path().join("repo"),
+            &Vcs::Git,
+            vec![],
+            None,
+            None,
+            true,
+            "am",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(mounts.ssh_agent_sock, None);
+
+        std::env::remove_var("SSH_AUTH_SOCK");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn build_run_command_forwards_the_ssh_agent_at_the_host_path() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("agent.sock");
+        std::fs::write(&sock, "").unwrap();
+        let mut mounts = make_mounts(tmp.path());
+        mounts.ssh_agent_sock = Some(sock.clone());
+
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+
+        let joined = cmd.join(" ");
+        let sock = sock.to_string_lossy();
+        // Same path on both sides, so SSH_AUTH_SOCK carries over unchanged.
+        assert!(
+            joined.contains(&format!("{sock}:{sock}:rw")),
+            "expected a read-write mount at the host path, got: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("-e SSH_AUTH_SOCK={sock}")),
+            "expected SSH_AUTH_SOCK to be set, got: {joined}"
+        );
+        // Podman on Linux relabels every other mount; this one must be left alone or the
+        // host's own agent loses access to its socket.
+        assert!(
+            !joined.contains(&format!("{sock}:rw,z")),
+            "the agent socket must not be relabelled, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_run_command_skips_a_stale_ssh_agent_socket() {
+        let tmp = TempDir::new().unwrap();
+        let mut mounts = make_mounts(tmp.path());
+        // A path left over from a dead agent. Forwarding it would set SSH_AUTH_SOCK to
+        // something that cannot be connected to, which is worse than leaving it unset.
+        mounts.ssh_agent_sock = Some(tmp.path().join("gone.sock"));
+
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+
+        assert!(
+            !cmd.join(" ").contains("SSH_AUTH_SOCK"),
+            "a missing socket must not be forwarded"
+        );
     }
 
     // ── build_run_command ─────────────────────────────────────────────────────
