@@ -365,6 +365,9 @@ async fn given_git_repo(world: &mut AmWorld) {
     run_git(&["init"], &dir);
     run_git(&["config", "user.email", "test@example.com"], &dir);
     run_git(&["config", "user.name", "Test"], &dir);
+    // git's auto-gc detaches into the background and its invoker does not wait for
+    // it, so without an init to reap the orphan every scenario leaks a zombie.
+    run_git(&["config", "gc.auto", "0"], &dir);
     // An initial commit is required so that `am start` can resolve HEAD.
     run_git(
         &["commit", "--allow-empty", "-m", "chore: initial commit"],

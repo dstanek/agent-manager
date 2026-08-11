@@ -255,14 +255,31 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Init a repo and make an initial commit so HEAD exists.
-    fn init_repo_with_commit(dir: &Path) {
+    /// `git init` plus the settings every fixture repo needs, without a commit.
+    ///
+    /// gc.auto=0: git's automatic gc detaches into the background and its invoker
+    /// exits without waiting for it. In a container whose PID 1 is not an init,
+    /// nothing reaps the orphan, so each fixture repo leaks a zombie and the suite
+    /// eventually exhausts the cgroup PID limit. Test repos are throwaway and have
+    /// nothing worth collecting anyway.
+    fn init_bare_repo(dir: &Path) {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .arg("init")
             .output()
             .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["config", "gc.auto", "0"])
+            .output()
+            .unwrap();
+    }
+
+    /// Init a repo and make an initial commit so HEAD exists.
+    fn init_repo_with_commit(dir: &Path) {
+        init_bare_repo(dir);
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -402,12 +419,7 @@ mod tests {
     fn create_git_worktree_errors_on_unborn_branch() {
         let tmp = TempDir::new().unwrap();
         // Init repo but make NO initial commit — HEAD is unborn
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .arg("init")
-            .output()
-            .unwrap();
+        init_bare_repo(tmp.path());
 
         let err = create_git_worktree("feat", tmp.path()).unwrap_err();
         assert!(
