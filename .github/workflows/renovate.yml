@@ -38,6 +38,19 @@ concurrency:
 permissions:
   contents: read
 
+# The validator and the scheduled run must agree on the Renovate major, or a
+# config using a newer schema validates green here and fails at runtime — the
+# delayed failure the validate job exists to prevent. The action's own
+# `renovate-version` default floats independently, so both read this instead.
+#
+# Deliberately the major only: Renovate ships several releases a week, and a full
+# version pin would open a PR for each one while changing nothing that matters.
+env:
+  # npm versioning, because a bare major is a range there rather than an invalid
+  # semver — so this is rewritten to `45`, never to a full version.
+  # renovate: datasource=npm depName=renovate versioning=npm
+  RENOVATE_VERSION: 44
+
 jobs:
   validate:
     name: Validate config
@@ -53,7 +66,7 @@ jobs:
       # A malformed config makes the scheduled run fail silently a week later.
       # --strict also rejects unknown fields, which is where typos hide.
       - name: Validate renovate.json5
-        run: npx --yes --package renovate renovate-config-validator --strict
+        run: npx --yes --package "renovate@${RENOVATE_VERSION}" renovate-config-validator --strict
 
   renovate:
     name: Run Renovate
@@ -76,6 +89,7 @@ jobs:
       - uses: renovatebot/github-action@v46.2.2
         with:
           token: ${{ env.RENOVATE_TOKEN }}
+          renovate-version: ${{ env.RENOVATE_VERSION }}
         env:
           LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
           RENOVATE_REPOSITORIES: ${{ github.repository }}
