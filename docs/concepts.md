@@ -119,6 +119,8 @@ Container isolation can be disabled per-session with `--no-container`, or turned
 
 Containers run with `--rm -it`: they are automatically removed when the tmux pane is closed or when the container's main process exits.
 
+They also run with `--init`, so a minimal init process sits at PID 1 and reaps orphaned processes. Without it PID 1 would be the agent, which only waits on children it started; anything the kernel re-parents to it would linger as a zombie holding a process-ID slot. git's automatic garbage collection detaches into the background exactly this way, so a long session doing ordinary git work would slowly exhaust the container's process limit. In Dev Container mode this is left to the config's own [`init` property](https://containers.dev/implementors/json_reference/) — `am` does not override it.
+
 ---
 
 ## Modes
