@@ -46,13 +46,10 @@ Auth mount preset for Google Gemini CLI.
 
 ### README
 
-Write `README.md` at the repo root covering:
-1. What it is — one-paragraph overview
-2. Install — `cargo install --path .` and eventual binary download placeholder
-3. Quick start — `am init` → `am start feat --agent claude` → `am attach feat` → `am destroy feat`
-4. Configuration — pointer to `config.md`; minimal `~/.config/am/config.toml` example
-5. Supported agents — table: claude, codex, copilot, gemini
-6. Example Dockerfile — minimal image that installs `claude` and works with `am`
+**Done.** `README.md` covers all six: overview, install, quick start, configuration,
+supported agents, and an example Dockerfile. The configuration section points at
+`docs/reference/configuration.md` rather than the `config.md` named here, which never
+existed at the repo root.
 
 ### Error message audit
 
@@ -149,6 +146,11 @@ Make `am list` operator-oriented by surfacing higher-level state: which
 integration/command is active, whether the container is alive, whether the tmux
 window still exists, and stale/broken markers.
 
+Partly landed: `am list --all` reports a `stale` marker when a session's repository no
+longer exists, and `am session rm` cleans those records up. Still storage-derived,
+though — the marker is a `Path::exists` check on the record, not a liveness probe. The
+container and tmux window are still never queried.
+
 ### Docs: separate the fast path from the custom path; tone down future features
 
 - [ ] Split docs into a **fast supported-integration path** and an
@@ -223,6 +225,42 @@ Follow-ups phase 1 left behind:
 - [ ] The config hash does not cover build-context files, only the config and the
       Dockerfile. `--rebuild` is the workaround; a bounded context fingerprint would be
       better.
+
+---
+
+## Open follow-ups (2026-08-11)
+
+Left behind by the config, container-lifecycle, and output work of 2026-08-11.
+
+- [ ] **Decide whether a session worktree should use its own `.am/config.toml`.**
+      `find_repo_root` deliberately walks past worktrees and jj workspaces to the main
+      repository, so only the root copy is ever read — but `.am/config.toml` is committed,
+      which puts an inert copy in every worktree. `am doctor` now warns that the file is
+      never read; the underlying question of which file *should* win is unanswered.
+- [ ] **Verify Codex end to end.** The `~/.codex` mount and the two-credential preflight
+      are covered by unit tests, but no authenticated Codex session has been run — the
+      dev container has no `codex` binary. Needs one real `am start <slug> --agent codex`.
+- [ ] **Confirm the `container.agent` removal before release.** It is committed as
+      `feat(config)!` with a `BREAKING CHANGE:` footer. The key was a second name for
+      `defaults.agent` that inverted the documented precedence, and a stale one is now
+      reported by the unknown-key warning rather than silently ignored — but it is still a
+      config key that existed in a shipped version.
+- [ ] **Move the exec-mock tests to their own test target.** The suite is serialized via
+      `RUST_TEST_THREADS = "1"` in `.cargo/config.toml` because a test that writes a mock
+      executable and immediately execs it races with any other thread that forks. Splitting
+      those tests into a separate target would let the rest run in parallel again; the
+      serialization is the cheap fix, not the structural one.
+
+Decided against, recorded so it is not re-proposed:
+
+- **`deny_unknown_fields` on the config structs.** Unknown keys are warned about instead.
+  Rejecting them would break a teammate running an older `am` the moment someone commits a
+  key their binary predates, and `.am/config.toml` is meant to be committed and shared. It
+  would also turn every future key removal into a breaking change.
+- **`am init` warning about unknown config keys.** The config it writes is fully commented
+  out and cannot be wrong yet, so the warning would only ever fire when re-running `init`
+  over an existing file. The real gap it exposed — `am attach` loading config without
+  warning — was fixed instead by routing every load through one helper.
 
 ---
 
