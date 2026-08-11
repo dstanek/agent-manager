@@ -32,6 +32,10 @@ impl std::fmt::Display for ContainerMode {
 pub struct SessionContainer {
     pub runtime: String,
     pub image: String,
+    /// Runtime name used to address this container. Unlike a tmux title, this
+    /// is globally unique across repositories.
+    #[serde(default)]
+    pub container_name: Option<String>,
     pub container_id: Option<String>,
     /// Defaults to `Image` so records written before devcontainer support still load.
     #[serde(default)]
@@ -56,6 +60,7 @@ impl SessionContainer {
         Self {
             runtime,
             image,
+            container_name: None,
             container_id: None,
             mode: ContainerMode::Image,
             config_path: None,
@@ -76,7 +81,11 @@ pub struct VcsMetadata {
 /// Tmux-specific metadata for a session (window and pane names, original state).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxMetadata {
+    /// Human-facing tmux window title. Titles are allowed to collide.
     pub tmux_window: String,
+    /// Stable tmux target (for example `@42`) used for programmatic actions.
+    #[serde(default)]
+    pub tmux_window_id: Option<String>,
     pub agent_pane: String,
     pub shell_pane: String,
     /// The window name before `am start` renamed it (new-style sessions only).
@@ -210,6 +219,18 @@ pub fn remove_session_global(repo_root: &Path, slug: &str) -> Result<()> {
     save_global_sessions(&sessions)
 }
 
+/// Replace an existing session after mutable runtime metadata changes.
+pub fn update_session_global(session: Session) -> Result<()> {
+    let _lock = lock_global_sessions()?;
+    let mut sessions = load_all_sessions()?;
+    let existing = sessions
+        .iter_mut()
+        .find(|s| s.repo_root == session.repo_root && s.slug == session.slug)
+        .ok_or_else(|| AmError::SlugNotFound(session.slug.clone()))?;
+    *existing = session;
+    save_global_sessions(&sessions)
+}
+
 /// Migrate sessions from an old per-repo file into the global store.
 ///
 /// Reads `<repo_root>/.am/sessions.json`, sets `repo_root` on each record,
@@ -321,6 +342,7 @@ mod tests {
             },
             tmux: TmuxMetadata {
                 tmux_window: format!("am-{slug}"),
+                tmux_window_id: None,
                 agent_pane: format!("am-{slug}.1"),
                 shell_pane: format!("am-{slug}.0"),
                 original_window_name: None,
@@ -388,6 +410,7 @@ mod tests {
         s.container = Some(SessionContainer {
             runtime: "podman".to_string(),
             image: "am-dc-abc123".to_string(),
+            container_name: Some("am-feat-deadbe".to_string()),
             container_id: None,
             mode: ContainerMode::Devcontainer,
             config_path: Some(PathBuf::from(".devcontainer/devcontainer.json")),
