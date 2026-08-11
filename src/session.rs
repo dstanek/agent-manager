@@ -1,7 +1,9 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config;
@@ -128,6 +130,22 @@ pub fn global_sessions_path() -> Option<PathBuf> {
     config::global_state_dir().map(|d| d.join("sessions.json"))
 }
 
+/// Acquire an exclusive interprocess lock for the global sessions file.
+/// The returned `File` handle acts as the lock guard — dropping it releases the lock.
+fn lock_global_sessions() -> Result<File> {
+    let path = global_sessions_path().ok_or(AmError::GlobalStateDirNotFound)?;
+    let lock_path = path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_file = File::create(&lock_path)
+        .with_context(|| format!("creating lock file {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
 /// Load all sessions from the global store.
 /// Returns an empty `Vec` if the file does not exist.
 pub fn load_all_sessions() -> Result<Vec<Session>> {
@@ -167,6 +185,7 @@ fn save_global_sessions(sessions: &[Session]) -> Result<()> {
 /// Add a session to the global store.
 /// Errors with `SlugAlreadyExists` if `(repo_root, slug)` already exists.
 pub fn add_session_global(session: Session) -> Result<()> {
+    let _lock = lock_global_sessions()?;
     let mut sessions = load_all_sessions()?;
     if sessions
         .iter()
@@ -181,6 +200,7 @@ pub fn add_session_global(session: Session) -> Result<()> {
 /// Remove a session from the global store by `(repo_root, slug)`.
 /// Errors with `SlugNotFound` if not found.
 pub fn remove_session_global(repo_root: &Path, slug: &str) -> Result<()> {
+    let _lock = lock_global_sessions()?;
     let mut sessions = load_all_sessions()?;
     let before = sessions.len();
     sessions.retain(|s| !(s.repo_root == repo_root && s.slug == slug));
@@ -230,7 +250,8 @@ pub fn migrate_sessions(repo_root: &Path) -> Result<usize> {
         return Ok(0);
     }
 
-    // Load the global store; on error, propagate so we don't delete the old file.
+    // Lock and load the global store; on error, propagate so we don't delete the old file.
+    let _lock = lock_global_sessions()?;
     let mut global = load_all_sessions()?;
 
     let mut migrated = 0usize;
