@@ -187,7 +187,15 @@ fn save_global_sessions(sessions: &[Session]) -> Result<()> {
         sessions: sessions.to_vec(),
     };
     let text = serde_json::to_string_pretty(&file)?;
-    std::fs::write(&path, text)?;
+
+    // Write to a temporary file in the same directory, then rename into place.
+    // rename() is atomic on the same filesystem, so readers never see a
+    // partially-written sessions.json.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, text)
+        .with_context(|| format!("writing temporary sessions file {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
