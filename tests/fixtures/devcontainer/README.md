@@ -53,3 +53,36 @@ present: if a future CLI release starts emitting them, `am` can drop a dependenc
 
 Both input configs use JSONC — comments and a trailing comma — which the CLI accepted. Any
 parser we pick has to as well.
+
+## `native/` — fixtures for `am`'s own builder
+
+Captured the same way, from `@devcontainers/cli` 0.88.0 driving Docker on 2026-08-11. These
+exist so `am`'s builder can be diffed against the reference implementation rather than against
+our reading of the spec.
+
+| File | What it is |
+| --- | --- |
+| `git-devcontainer.json` | Input: a plain base image plus one registry Feature |
+| `cli-git-label.json` | The label the CLI produced from it |
+| `features-devcontainer.json` | Input: a base image that *already carries a label*, two Features with an `installsAfter` relationship, and a `${localWorkspaceFolder}` in `containerEnv` |
+| `cli-features-label.json` | Its label — the authority on base-image inheritance and on variables surviving the build |
+| `git-oci-manifest.json` | The OCI manifest for `ghcr.io/devcontainers/features/git:1` |
+| `git-devcontainer-feature.json` | That Feature's own `devcontainer-feature.json` |
+| `cli-Dockerfile.extended` | The Dockerfile the CLI generates to install Features |
+| `cli-Dockerfile.buildContent` | Its throwaway `FROM scratch` content image |
+| `cli-builtin.env`, `cli-git_0-features.env`, `cli-git_0-install-wrapper.sh` | The Feature install contract: the env files and the generated wrapper that sources them |
+
+### What these catch
+
+- **`cli-*-label.json`** are compared byte-for-byte by the `#[ignore]`d differential tests in
+  `src/devcontainer/native/mod.rs`. Run them with
+  `cargo test --bin am -- --ignored` (add `AM_TEST_NO_CACHE=1` to force a cold build).
+  They need Docker and network access to ghcr.io, which is why they are not in `cargo test`.
+- **Key order is part of the comparison.** The CLI emits metadata properties in *schema* order,
+  not the order the config declares them — a `devcontainer.json` writing `remoteUser` before
+  `containerEnv` still yields `containerEnv` first. `METADATA_KEYS` in `native/feature.rs`
+  encodes that order, and `cli-features-label.json` is what pins it.
+- **`cli-Dockerfile.extended`** documents the install contract `am` reproduces: where Features
+  are copied, the `_CONTAINER_USER`/`_REMOTE_USER` env files, and the `getent` home probe.
+  `am` deliberately generates a *simpler* Dockerfile (one stage, not three) — this fixture is
+  the reference for the parts that must not diverge, not a target to match line for line.

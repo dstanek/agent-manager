@@ -458,3 +458,65 @@ duplication this feature exists to remove. Repos with no config are unaffected, 
 The escape hatch is `mode = "image"`, and every error for an unsupported construct names it.
 
 No open questions remain.
+
+---
+
+# Phase N: `am` builds the image itself
+
+The original decision above — *delegate the build, own the run* — was right about where the
+seam goes and wrong about how much lives on the build side. This phase moves the common case
+across that seam, keeping the CLI as a fallback.
+
+## What the spike found
+
+Reverse-engineering `@devcontainers/cli` 0.88.0 with `--log-level trace` (it leaves its
+generated Dockerfile and staged Feature tree in `/tmp/devcontainercli-vscode/`) turned the
+"real project" estimate into something much smaller:
+
+1. **Feature resolution needs no layer download.** The OCI manifest's `dev.containers.metadata`
+   annotation carries the whole `devcontainer-feature.json` — options with defaults,
+   `installsAfter`, `customizations`. Ordering and option resolution are decidable from three
+   small GETs. Blobs are needed only for the install itself.
+2. **The registry protocol is three requests**, and following the `WWW-Authenticate` challenge
+   rather than hardcoding ghcr's token endpoint makes it work against any registry. No OCI
+   client library, and no async runtime dragged into a synchronous codebase — `ureq` + `tar`.
+3. **Dockerfile generation is templating.** Docker does the real work. The CLI's three-stage
+   content-image dance exists because it must accommodate arbitrary user build contexts; `am`
+   resolves the base image first and owns the context, so one stage is equivalent.
+4. **The layer is a plain tar** despite the `.tgz` in its title annotation — sniff magic bytes.
+5. **Metadata properties are emitted in schema order, not declaration order.** A config writing
+   `remoteUser` before `containerEnv` still produces `containerEnv` first. This is invisible to
+   `merge()` and matters only for byte-comparison, which is precisely why it is worth pinning.
+
+## Why this is safe to do incrementally
+
+The label is the entire contract. Both builders emit the same `devcontainer.metadata`, and
+`merge`/`finalize`/the trust gate/the run path are shared and cannot tell them apart. That
+makes the correctness question empirical rather than argued: build the same config both ways
+and diff the label. Two `#[ignore]`d differential tests in `src/devcontainer/native/mod.rs` do
+exactly that, against labels captured from real CLI runs, and both match byte for byte —
+including a base image that carries its own inherited label and a `${localWorkspaceFolder}`
+that has to survive Docker's variable expansion to be substituted later by the run path.
+
+## Scope
+
+Implemented natively: a base `image` or `build.dockerfile`, and Features pulled from an OCI
+registry ordered by `installsAfter` with an alphabetical tie-break.
+
+Falls back to the CLI, naming the construct: `dockerComposeFile`,
+`overrideFeatureInstallOrder`, Features using `dependsOn`, and Features referenced by local
+path or tarball URL. `devcontainer.builder = "native"` turns the fallback into an error, for
+users who want a guarantee that no config silently reintroduces Node.
+
+## Known gaps
+
+- **`dependsOn` is the main one.** It needs round-trip resolution — a dependency can pull in
+  Features the config never named — which changes the shape of the resolver rather than adding
+  to it. It is the obvious next increment.
+- **Registry auth is anonymous only.** Private Feature registries need `docker config.json`
+  credentials and credential helpers; today they fall back to the CLI only if the ref happens
+  to be non-registry, otherwise they fail with the registry's own 401 text.
+- **The build-context hash gap is unchanged.** `config_hash` still does not cover files the
+  Dockerfile `COPY`s. The native builder now knows the context and could close this — a
+  git-aware hash of tracked files under it — but that is a separate change affecting both
+  builders, so it was left alone.

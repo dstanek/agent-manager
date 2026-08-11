@@ -595,11 +595,26 @@ fn check_devcontainer_mode(
     agent_name: Option<&str>,
     config_path: &Path,
 ) {
-    // The CLI is only needed to *build*. An already-built image means a session can start
-    // without it, so a missing CLI is not automatically fatal.
+    let json_text = std::fs::read_to_string(config_path).unwrap_or_default();
+    let raw: serde_json::Value =
+        serde_json_lenient::from_str(&json_text).unwrap_or(serde_json::Value::Null);
+
+    // Whether the CLI matters at all depends on the builder *and* on this particular config:
+    // under `auto`, a config am can build itself never touches Node, so reporting a missing
+    // CLI as a failure would send the user to install something they do not need.
+    let needs_cli = match cfg.devcontainer.builder {
+        config::Builder::Cli => true,
+        config::Builder::Native => false,
+        config::Builder::Auto => match devcontainer::parse_config(config_path) {
+            Ok(parsed) => devcontainer::native::check_static(&parsed, &raw).is_err(),
+            // An unparseable config is reported separately below; assume the worst here.
+            Err(_) => true,
+        },
+    };
+
     let cli = devcontainer::find_cli(&cfg.devcontainer.cli);
-    match &cli {
-        Ok(path) => {
+    match (&cli, needs_cli) {
+        (Ok(path), _) => {
             let version = probe_version(path, "--version").unwrap_or_else(|| "unknown".to_string());
             report.checks.push(Check::ok(
                 ENVIRONMENT,
@@ -607,16 +622,22 @@ fn check_devcontainer_mode(
                 format!("{version} at {}", path.display()),
             ));
         }
-        Err(_) => report.checks.push(Check::fail(
+        (Err(_), true) => report.checks.push(Check::fail(
             ENVIRONMENT,
             "devcontainer CLI",
             format!("'{}' not found on PATH", cfg.devcontainer.cli),
             "npm install -g @devcontainers/cli (needs Node 20+), or set \
              container.mode = \"image\"",
         )),
+        (Err(_), false) => report.checks.push(Check::ok(
+            ENVIRONMENT,
+            "devcontainer CLI",
+            "not needed — am builds this config itself".to_string(),
+        )),
     }
 
-    check_node(report, cli.is_ok());
+    // Node only matters if the CLI is what will run.
+    check_node(report, cli.is_ok() || !needs_cli);
 
     let json = match devcontainer::parse_config(config_path) {
         Ok(json) => json,
