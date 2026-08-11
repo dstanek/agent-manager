@@ -60,7 +60,7 @@ jobs:
           # the locally-tagged am-rust:latest, which only `make build-am-dev`
           # produces, and .devcontainer/ has replaced it for development.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -87,7 +87,7 @@ jobs:
     name: Build devcontainer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
