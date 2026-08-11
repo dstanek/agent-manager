@@ -109,13 +109,13 @@ mod tests {
 
     #[test]
     fn run_command_success() {
-        let result = run_command("true", &[], |msg| TestError(msg));
+        let result = run_command("true", &[], TestError);
         assert!(result.is_ok());
     }
 
     #[test]
     fn run_command_failure() {
-        let result = run_command("false", &[], |msg| TestError(msg));
+        let result = run_command("false", &[], TestError);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("status"));
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn run_command_error_includes_binary_name() {
-        let result = run_command("nonexistent-binary-xyz", &[], |msg| TestError(msg));
+        let result = run_command("nonexistent-binary-xyz", &[], TestError);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("nonexistent-binary-xyz"));
