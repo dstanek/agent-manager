@@ -7,6 +7,14 @@ Feature: am init — initialize am in a repo
     And the file ".am/config.toml" exists
     And the file ".gitignore" contains ".am/worktrees/"
 
+  Scenario: init appends correctly when .gitignore lacks a trailing newline
+    Given a git repository
+    And the file ".gitignore" contains "target/" without a trailing newline
+    When I run "am init"
+    Then the command succeeds
+    And the file ".gitignore" contains ".am/worktrees/"
+    And the file ".gitignore" does not contain "target/.am/worktrees/"
+
   Scenario: init is idempotent when run twice
     Given a git repository
     And am init has been run

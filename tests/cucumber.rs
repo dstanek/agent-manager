@@ -79,6 +79,9 @@ impl AmWorld {
              if [ -n \"$MOCK_TMUX_LOG\" ]; then\n\
                  echo \"$@\" >> \"$MOCK_TMUX_LOG\"\n\
              fi\n\
+             if [ \"$1\" = \"new-window\" ]; then\n\
+                 echo \"@1\"\n\
+             fi\n\
              exit 0\n",
         )
         .expect("write mock_tmux");
@@ -107,6 +110,9 @@ impl AmWorld {
                 "#!/bin/sh\n\
                  if [ -n \"$MOCK_TMUX_LOG\" ]; then\n\
                      echo \"$@\" >> \"$MOCK_TMUX_LOG\"\n\
+                 fi\n\
+                 if [ \"$1\" = \"new-window\" ]; then\n\
+                     echo \"@1\"\n\
                  fi\n\
                  if [ \"$1\" = \"select-window\" ] && [ ! -f \"{flag_str}\" ]; then\n\
                      touch \"{flag_str}\"\n\
@@ -468,6 +474,19 @@ async fn when_run(world: &mut AmWorld, cmd: String) {
     world.run_am(args);
 }
 
+#[given(expr = "the file {string} contains {string} without a trailing newline")]
+async fn given_file_without_trailing_newline(
+    world: &mut AmWorld,
+    rel_path: String,
+    content: String,
+) {
+    let path = world.project_path().join(&rel_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&path, &content).unwrap();
+}
+
 #[given(expr = "I have set env {string} to {string}")]
 async fn given_env_var(world: &mut AmWorld, key: String, value: String) {
     world.extra_env.push((key, value));
@@ -593,6 +612,16 @@ async fn then_file_contains(world: &mut AmWorld, rel_path: String, text: String)
     assert!(
         content.contains(&text),
         "expected {path:?} to contain {text:?}\ngot:\n{content}",
+    );
+}
+
+#[then(expr = "the file {string} does not contain {string}")]
+async fn then_file_does_not_contain(world: &mut AmWorld, rel_path: String, text: String) {
+    let path = world.project_path().join(&rel_path);
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    assert!(
+        !content.contains(&text),
+        "expected {path:?} to NOT contain {text:?}\ngot:\n{content}",
     );
 }
 
