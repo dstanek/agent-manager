@@ -54,11 +54,28 @@ appended to the comment when the default (`semver`) is wrong. Upstream tags with
 a leading `v` are stripped, since the download URLs in these Dockerfiles add it
 back themselves.
 
-Two versions are annotated this way today:
+The same manager also reads a bare shell assignment in a workflow `run:` block,
+so a version pinned in CI is annotated identically:
+
+```yaml
+run: |
+  # renovate: datasource=github-releases depName=jj-vcs/jj
+  JJ_VERSION=0.44.0
+```
+
+Three versions are annotated this way today:
 
 - `JJ_VERSION` in `.devcontainer/Dockerfile` — the jj release the project is
-  developed and tested against
+  developed against
+- `JJ_VERSION` in `.github/workflows/ci.yml` — the same release, used by the
+  cucumber suite's "a jj repository" step
 - `GO_VERSION` in `examples/Dockerfile.golang`
+
+The two jj pins are the reason one manager covers both file types. They name the
+same `depName`, so Renovate bumps them in a single PR. Split across two managers
+they would still update, but nothing would stop one landing without the other —
+and a CI that tests against a different jj than local development is exactly what
+the pin exists to prevent.
 
 A second custom manager does the same for devcontainer **feature options**. The
 `devcontainer` manager updates the feature reference (`node:1`) but never looks
