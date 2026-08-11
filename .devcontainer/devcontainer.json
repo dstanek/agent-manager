@@ -25,7 +25,7 @@
       // this to "24", not "24.19.0" — the feature keeps resolving the latest
       // patch itself.
       // renovate: datasource=node-version depName=node versioning=node
-      "version": "22"
+      "version": "24"
     },
     "ghcr.io/devcontainers/features/github-cli:1": {},
 
