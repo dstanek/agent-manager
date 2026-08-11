@@ -241,7 +241,7 @@ For a complete list, see [Configuration Reference](configuration.md#environment-
 | `authentication error` | Credentials not set up | Run `claude auth login` (or `gh auth login` for Copilot) |
 | `permission denied` | Container user permission issue | Usually a mount path problem; check troubleshooting guide |
 
-See [Troubleshooting Guide](troubleshooting.md) for detailed solutions.
+See [Troubleshooting Guide](../guides/troubleshooting.md) for detailed solutions.
 
 ---
 
@@ -318,4 +318,4 @@ env = []
 - **Getting started?** → Read [Installation](../getting-started/installation.md)
 - **More detail?** → See [Commands Reference](commands.md)
 - **Troubleshooting?** → Check [Troubleshooting Guide](../guides/troubleshooting.md)
-- **Advanced topics?** → Explore [Guides](../guides/index.md)
+- **Advanced topics?** → Explore [Custom Images](../guides/custom-images.md) and [Dev Containers](../guides/devcontainers.md)

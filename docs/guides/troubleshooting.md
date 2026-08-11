@@ -482,8 +482,6 @@ If you encounter an issue not covered here:
 1. Check the agent-specific guide:
    - [Claude Code](claude-code.md)
    - [GitHub Copilot](github-copilot.md)
-   - [Gemini](gemini.md)
-   - [Codex](codex.md)
 
 2. Review your configuration with `am generate-config` to verify settings are correct.
 
