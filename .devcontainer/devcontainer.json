@@ -18,7 +18,7 @@
     // Node is here for @devcontainers/cli, which `am` shells out to in
     // devcontainer mode. Working on that code path without it means the
     // integration tests pass and the real thing is never exercised.
-    "ghcr.io/devcontainers/features/node:1": {
+    "ghcr.io/devcontainers/features/node:2": {
       // The feature version above is managed by Renovate's devcontainer manager;
       // the Node line it installs is not, so it carries its own annotation.
       // `node` versioning reads a bare major as a range, so Renovate rewrites
