@@ -87,10 +87,13 @@
   customManagers: [
     {
       customType: "regex",
-      description: "Tool versions pinned in Dockerfile ARG/ENV lines. The dockerfile manager only reads FROM/COPY --from, so these need the `# renovate:` annotation directly above them.",
-      managerFilePatterns: ["/(^|/)Dockerfile[^/]*$/"],
+      description: "Tool versions pinned in a `*_VERSION` assignment — a Dockerfile ARG/ENV, or a plain shell variable in a workflow `run:` block. No built-in manager reads either (the dockerfile manager only handles FROM/COPY --from), so both need the `# renovate:` annotation directly above them. Keeping one manager for both is deliberate: jj is pinned in .devcontainer/Dockerfile and ci.yml, and the pins are only worth having if they move together.",
+      managerFilePatterns: [
+        "/(^|/)Dockerfile[^/]*$/",
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/",
+      ],
       matchStrings: [
-        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+?)(?:\\s+versioning=(?<versioning>\\S+?))?\\s*\\n\\s*(?:ARG|ENV)\\s+\\w+_VERSION[ =][\"']?(?<currentValue>[^\"'\\s]+)",
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+?)(?:\\s+versioning=(?<versioning>\\S+?))?\\s*\\n\\s*(?:(?:ARG|ENV)\\s+)?\\w+_VERSION\\s*[= ]\\s*[\"']?(?<currentValue>[^\"'\\s]+)",
       ],
       versioningTemplate: "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
       // Upstream release tags carry a leading `v` (jj tags `v0.44.0`); the ARG
