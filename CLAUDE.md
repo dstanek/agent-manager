@@ -37,7 +37,7 @@ make build-copilot       # Build Copilot Docker image
 
 **Agent auth presets** (`claude`, `copilot`, `gemini`, `codex`) provide credentials at runtime via mounts and/or environment variables. Unknown agent names are rejected early with a clear error listing valid agents. Mount targets are derived from `ContainerMounts::container_home`, not from the username — a devcontainer's `remoteUser` may be `root`, whose home is `/root`.
 
-**Dev Container mode** (`container.mode = "devcontainer" | "auto"`, default `"image"`): `am` delegates `devcontainer build` to the reference CLI and keeps the run path. The built image's `devcontainer.metadata` label carries feature contributions *and* the whole `devcontainer.json`; only `runArgs`, `workspaceFolder`, `workspaceMount`, `initializeCommand`, `dockerComposeFile`, and `name` are read from the file itself. Images are named `am-dc-<config-hash>` so an unchanged config skips the build. Real CLI output for tests is in `tests/fixtures/devcontainer/`.
+**Dev Container mode** (`container.mode = "image" | "devcontainer" | "auto"`, default `"auto"` — devcontainer when a `.devcontainer/devcontainer.json` is found, an `am`-resolved image otherwise): `am` delegates `devcontainer build` to the reference CLI and keeps the run path. The built image's `devcontainer.metadata` label carries feature contributions *and* the whole `devcontainer.json`; only `runArgs`, `workspaceFolder`, `workspaceMount`, `initializeCommand`, `dockerComposeFile`, and `name` are read from the file itself. Images are named `am-dc-<config-hash>` so an unchanged config skips the build. Real CLI output for tests is in `tests/fixtures/devcontainer/`.
 
 ## Testing
 
