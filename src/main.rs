@@ -444,6 +444,7 @@ fn plan_image(
         agent_auth.mounts.clone(),
         cfg.container.gitconfig.as_deref(),
         cfg.container.ssh.as_deref(),
+        cfg.container.ssh_agent,
         &cfg.container.user,
         cfg.devcontainer.home.as_deref(),
     )?;
@@ -539,6 +540,7 @@ fn plan_devcontainer(
         agent_auth.mounts.clone(),
         cfg.container.gitconfig.as_deref(),
         cfg.container.ssh.as_deref(),
+        cfg.container.ssh_agent,
         &user,
         cfg.devcontainer.home.as_deref(),
     )?;

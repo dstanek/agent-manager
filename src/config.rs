@@ -143,7 +143,14 @@ pub struct ContainerConfig {
     pub env: Vec<String>,
     pub gitconfig: Option<PathBuf>, // None = ~/.gitconfig
     pub ssh: Option<PathBuf>,       // None = ~/.ssh
-    pub user: String,               // container username (default: "am")
+    /// Forward the host's `SSH_AUTH_SOCK` into the container.
+    ///
+    /// On by default. Mounting `~/.ssh` is not enough on its own: a passphrase-protected
+    /// key cannot be decrypted without a prompt, and keys held only in an agent
+    /// (1Password, gnome-keyring, a FIDO token) never appear in `~/.ssh` at all. Without
+    /// this the failure is silent until a `git push` inside the session fails.
+    pub ssh_agent: bool,
+    pub user: String, // container username (default: "am")
 }
 
 impl Default for ContainerConfig {
@@ -157,6 +164,7 @@ impl Default for ContainerConfig {
             env: Vec::new(),
             gitconfig: None,
             ssh: None,
+            ssh_agent: true,
             user: "am".to_string(),
         }
     }
@@ -219,10 +227,6 @@ fn default_agent_images() -> HashMap<String, AgentSettings> {
         (
             "claude",
             Some("ghcr.io/dstanek/am-claude-minimal:latest"),
-            // An external OCI artifact shipped as a default, so it needs an
-            // annotation: Renovate's devcontainer manager only reads
-            // devcontainer.json and cannot see a reference in Rust source.
-            // renovate: datasource=docker depName=ghcr.io/anthropics/devcontainer-features/claude-code
             Some("ghcr.io/anthropics/devcontainer-features/claude-code:1"),
         ),
         (
@@ -319,6 +323,7 @@ struct FileContainer {
     env: Option<Vec<String>>,
     gitconfig: Option<PathBuf>,
     ssh: Option<PathBuf>,
+    ssh_agent: Option<bool>,
     user: Option<String>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
@@ -455,6 +460,7 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     apply_opt(&mut base.container.env, file.container.env);
     apply_opt_some(&mut base.container.gitconfig, file.container.gitconfig);
     apply_opt_some(&mut base.container.ssh, file.container.ssh);
+    apply_opt(&mut base.container.ssh_agent, file.container.ssh_agent);
     if let Some(u) = file.container.user {
         if !u.is_empty() {
             base.container.user = u;
@@ -552,6 +558,7 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 # env = []               # extra environment variables to pass into the container
 # gitconfig = ""         # path to gitconfig to mount (default: ~/.gitconfig)
 # ssh = ""               # path to SSH dir to mount (default: ~/.ssh)
+# ssh_agent = true       # forward the host's SSH_AUTH_SOCK into the container
 # image = ""             # override image for all agents (advanced; prefer [agents.<name>].image)
 # user = "am"            # username inside the container (used for credential mount paths)
 
@@ -577,7 +584,7 @@ pub fn global_config_template() -> &'static str {
 #   AM_AGENT
 #   AM_TMUX_AGENT_PANE, AM_TMUX_SPLIT, AM_TMUX_SPLIT_PERCENT
 #   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
-#   AM_CONTAINER_NETWORK, AM_CONTAINER_USER
+#   AM_CONTAINER_NETWORK, AM_CONTAINER_SSH_AGENT, AM_CONTAINER_USER
 #   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS
 #   AM_DEVCONTAINER_BIN (path to the `devcontainer` CLI)
 
@@ -615,6 +622,8 @@ network = "full"       # "full" (unrestricted) | "none" (no network access)
 env = []               # extra environment variables passed into the container, e.g. ["FOO=bar"]
 # gitconfig = ""        # path to gitconfig to mount (default: ~/.gitconfig)
 # ssh = ""              # path to SSH dir to mount (default: ~/.ssh)
+ssh_agent = true       # forward the host's SSH_AUTH_SOCK, so a passphrase-protected or
+                       #   agent-only key still works for git push inside the session
 # image = ""            # override image for all agents (advanced; prefer [agents.<name>].image above)
 # user = "am"           # username inside the container (used for credential mount paths)
 
@@ -720,6 +729,13 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
     if let Ok(val) = std::env::var("AM_CONTAINER_SSH") {
         if !val.is_empty() {
             config.container.ssh = Some(PathBuf::from(val));
+        }
+    }
+    if let Ok(val) = std::env::var("AM_CONTAINER_SSH_AGENT") {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => config.container.ssh_agent = true,
+            "false" | "0" | "no" => config.container.ssh_agent = false,
+            _ => {}
         }
     }
     if let Ok(val) = std::env::var("AM_CONTAINER_USER") {

@@ -47,7 +47,7 @@ am doctor
 | Repository | Inside a git or jj repo |
 | Project setup | `.am/` initialized, git identity available |
 | tmux | Binary present, and whether you are currently inside a session |
-| Container runtime | Podman or Docker present (respects `container.runtime`) |
+| Container runtime | Podman or Docker present (respects `container.runtime`); whether an SSH agent will be forwarded |
 | Environment | Where the environment comes from, and whether that source is usable |
 | Agent | Selected agent is known, and its credentials are present on this host |
 

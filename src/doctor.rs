@@ -208,6 +208,7 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
     check_tmux(&mut report);
 
     let runtime = check_runtime(&mut report, &cfg);
+    check_ssh_agent(&mut report, &cfg);
     let agent_name = effective_agent(agent_flag, &cfg);
 
     if let Some(root) = repo_root {
@@ -462,6 +463,49 @@ fn check_runtime(report: &mut Report, cfg: &Config) -> Option<container::Contain
 }
 
 /// Where the environment comes from, and whether that source is usable.
+/// Report whether a session will be able to authenticate over SSH.
+///
+/// Worth its own check because the failure is otherwise invisible until a `git push`
+/// fails inside a session: mounting `~/.ssh` looks like it should be enough, but a
+/// passphrase-protected key cannot be decrypted without a prompt, and keys held only in
+/// an agent never appear in `~/.ssh` at all.
+fn check_ssh_agent(report: &mut Report, cfg: &Config) {
+    if !cfg.container.enabled {
+        return;
+    }
+
+    if !cfg.container.ssh_agent {
+        report.checks.push(Check::ok(
+            RUNTIME,
+            "ssh agent",
+            "not forwarded (container.ssh_agent = false)",
+        ));
+        return;
+    }
+
+    match std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty()) {
+        Some(sock) if Path::new(&sock).exists() => report.checks.push(Check::ok(
+            RUNTIME,
+            "ssh agent",
+            format!("forwarding {sock}"),
+        )),
+        Some(sock) => report.checks.push(Check::warn(
+            RUNTIME,
+            "ssh agent",
+            format!("SSH_AUTH_SOCK points at {sock}, which does not exist"),
+            "the agent is not running — start one and `ssh-add` your key, or SSH from \
+             inside a session will fall back to the keys in ~/.ssh",
+        )),
+        None => report.checks.push(Check::warn(
+            RUNTIME,
+            "ssh agent",
+            "no SSH_AUTH_SOCK on the host, so nothing to forward",
+            "only an unencrypted key in ~/.ssh will authenticate inside a session; start \
+             an agent and `ssh-add` your key to push from one",
+        )),
+    }
+}
+
 fn check_environment(
     report: &mut Report,
     repo_root: &Path,
@@ -806,6 +850,69 @@ mod tests {
 
     fn has(report: &Report, name: &str) -> bool {
         report.checks.iter().any(|c| c.name == name)
+    }
+
+    // ── ssh agent ────────────────────────────────────────────────────────────
+
+    fn ssh_agent_report(enabled: bool, sock: Option<&str>) -> Report {
+        let mut cfg = Config::default();
+        cfg.container.ssh_agent = enabled;
+        match sock {
+            Some(s) => std::env::set_var("SSH_AUTH_SOCK", s),
+            None => std::env::remove_var("SSH_AUTH_SOCK"),
+        }
+        let mut report = Report::default();
+        check_ssh_agent(&mut report, &cfg);
+        std::env::remove_var("SSH_AUTH_SOCK");
+        report
+    }
+
+    #[test]
+    fn ssh_agent_reports_a_live_socket_as_ok() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("agent.sock");
+        std::fs::write(&sock, "").unwrap();
+
+        let report = ssh_agent_report(true, Some(&sock.to_string_lossy()));
+
+        let check = find(&report, "ssh agent");
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("forwarding"), "{}", check.detail);
+    }
+
+    #[test]
+    fn ssh_agent_warns_when_the_host_has_no_agent() {
+        let report = ssh_agent_report(true, None);
+
+        let check = find(&report, "ssh agent");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.hint.unwrap().contains("ssh-add"));
+    }
+
+    #[test]
+    fn ssh_agent_warns_when_the_socket_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        let gone = tmp.path().join("gone.sock");
+
+        let report = ssh_agent_report(true, Some(&gone.to_string_lossy()));
+
+        let check = find(&report, "ssh agent");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("does not exist"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn ssh_agent_opted_out_is_reported_without_a_warning() {
+        // Off is a choice, not a problem — an agent on the host must not turn it into one.
+        let report = ssh_agent_report(false, Some("/run/user/1000/keyring/ssh"));
+
+        let check = find(&report, "ssh agent");
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.detail.contains("not forwarded"), "{}", check.detail);
     }
 
     // ── Color ────────────────────────────────────────────────────────────────
