@@ -467,7 +467,7 @@ fn plan_image(
         &agent_auth.env,
         &cfg.container.network,
         container_name,
-        &container::DevcontainerRuntime::default(),
+        &container::DevcontainerRuntime::image_mode(),
     );
     cmd.extend(agent_command(agent, auto));
     Ok(ContainerPlan {

@@ -154,6 +154,23 @@ pub struct DevcontainerRuntime {
     pub user: Option<String>,
 }
 
+impl DevcontainerRuntime {
+    /// Runtime flags for image mode, where there is no devcontainer config to read them
+    /// from.
+    ///
+    /// `init` is on: without an init process, PID 1 is the agent, which only waits on
+    /// children it spawned itself. Anything the kernel re-parents to it — git's auto-gc
+    /// detaches on purpose, and long agent sessions run a lot of git — stays a zombie
+    /// holding a PID slot until the container exits. In devcontainer mode this is the
+    /// config's call, and `am` leaves it alone.
+    pub fn image_mode() -> Self {
+        Self {
+            init: true,
+            ..Self::default()
+        }
+    }
+}
+
 // ── Runtime detection ─────────────────────────────────────────────────────────
 
 fn find_bin(name: &str, env_override: &str) -> Option<PathBuf> {
@@ -1612,6 +1629,55 @@ mod tests {
         );
         assert!(!cmd.iter().any(|a| a.starts_with("JJ_USER=")));
         assert!(!cmd.iter().any(|a| a.starts_with("JJ_EMAIL=")));
+    }
+
+    #[test]
+    fn image_mode_runs_an_init_process() {
+        let tmp = TempDir::new().unwrap();
+        let mounts = make_mounts(tmp.path());
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::image_mode(),
+        );
+        assert!(cmd.contains(&"--init".to_string()));
+    }
+
+    #[test]
+    fn devcontainer_mode_leaves_init_to_the_config() {
+        let tmp = TempDir::new().unwrap();
+        let mounts = make_mounts(tmp.path());
+        let without = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+        assert!(!without.contains(&"--init".to_string()));
+
+        let with = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime {
+                init: true,
+                ..DevcontainerRuntime::default()
+            },
+        );
+        assert!(with.contains(&"--init".to_string()));
     }
 
     #[test]
