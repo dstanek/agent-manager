@@ -182,9 +182,13 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | `image` | string | `""` | Override image for all agents; takes priority over `[agents.<name>].image`; leave unset to use the per-agent default | Any valid image reference |
 | `network` | string | `"full"` | Network access mode for the container | `"full"` (unrestricted internet access), `"none"` (no network) |
 | `env` | list of strings | `[]` | Extra environment variables passed into the container from the host shell | e.g. `["ANTHROPIC_API_KEY", "FOO=bar"]` |
-| `gitconfig` | path | `""` | Host path to a gitconfig file to mount into the container; defaults to `$XDG_STATE_HOME/am/gitconfig`, which `am start` regenerates from your host `user.name` and `user.email` | Any valid file path |
+| `gitconfig` | path | `""` | Host path to a gitconfig file to mount into the container; defaults to `$XDG_STATE_HOME/am/gitconfig`, which `am start` regenerates from your host `user.name` and `user.email`. Also the source for the `JJ_USER`/`JJ_EMAIL` variables described below | Any valid file path |
 | `ssh` | path | `""` | Host path to an SSH directory to mount into the container; defaults to `~/.ssh` | Any valid directory path |
 | `user` | string | `"am"` | Username used when building credential mount paths inside the container, such as `/home/<user>/.ssh` and `/home/<user>/.gitconfig`. In devcontainer mode the image's `remoteUser` takes precedence, and `root` resolves to `/root` rather than `/home/root` | safe username (`[a-z_][a-z0-9_-]*`) |
+
+!!! note "jj identity"
+
+    jj does not read git's identity, so a `jj` commit made inside a session container would otherwise be recorded with an empty committer — which jj refuses to push. When the mounted gitconfig supplies both a name and an email, `am` passes them into the container as `JJ_USER` and `JJ_EMAIL`. If either is missing from the gitconfig, neither variable is set, since a half-configured identity produces the same unpushable commit while looking correct. An explicit `JJ_USER`/`JJ_EMAIL` from `container.env`, a devcontainer, or your host environment takes precedence.
 
 !!! note "Image selection"
     In most cases you do not need to set `container.image`. `am` resolves the image from the active agent via `[agents.<name>].image`, with built-in defaults for `claude` and `copilot`. Set `container.image` only when you want a single image to apply regardless of which agent is selected.
