@@ -48,6 +48,8 @@ nav:
   - Guides:
     - Claude Code: guides/claude-code.md
     - GitHub Copilot: guides/github-copilot.md
+    - Gemini: guides/gemini.md
+    - Codex: guides/codex.md
     - Session Lifecycle: guides/session-lifecycle.md
     - Custom Images: guides/custom-images.md
     - Dev Containers: guides/devcontainers.md
