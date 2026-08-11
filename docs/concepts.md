@@ -113,6 +113,8 @@ The container is launched interactively in the agent pane — you can see its ou
 
 Paths are mirrored from the host so that absolute paths inside the container resolve correctly. The container runs as the host user (matched uid/gid), so bind-mounted files are readable and writable without permission issues.
 
+jj does not read git's identity, so when a gitconfig with both a name and an email is available, `am` also passes `JJ_USER` and `JJ_EMAIL` into the container, derived from that same file. Without them a `jj` commit made inside a session would be recorded with an empty committer, which jj itself refuses to push. Setting either variable explicitly — through `container.env`, a devcontainer, or your host environment — overrides the derived value.
+
 Container isolation can be disabled per-session with `--no-container`, or turned off by default in config with `container.enabled = false`.
 
 Containers run with `--rm -it`: they are automatically removed when the tmux pane is closed or when the container's main process exits.

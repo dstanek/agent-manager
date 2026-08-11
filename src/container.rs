@@ -490,6 +490,48 @@ fn get_host_uid_gid() -> Option<(u32, u32)> {
     None
 }
 
+/// Read a single value out of a specific gitconfig file. Delegates the parsing to
+/// `git` itself so includes and conditional includes resolve the way they would for
+/// the user, rather than being re-implemented here.
+fn read_gitconfig_value(path: &Path, key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .arg("config")
+        .arg("--file")
+        .arg(path)
+        .arg(key)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Derive `JJ_USER`/`JJ_EMAIL` from the gitconfig that gets mounted into the container.
+///
+/// jj does not read git's identity, so without this a jj commit made inside a session
+/// lands with an empty committer and jj itself refuses to push it. Deriving both from
+/// the same file keeps git and jj agreeing on who you are, including when the user has
+/// pointed `container.gitconfig` at a gitconfig of their own.
+///
+/// Returns nothing unless *both* values are present — a half-populated identity would
+/// produce the same unpushable commit while looking like it had been configured.
+fn jj_identity_env(gitconfig: &Path) -> Vec<(String, String)> {
+    if !gitconfig.exists() {
+        return Vec::new();
+    }
+    match (
+        read_gitconfig_value(gitconfig, "user.name"),
+        read_gitconfig_value(gitconfig, "user.email"),
+    ) {
+        (Some(name), Some(email)) => vec![
+            ("JJ_USER".to_string(), name),
+            ("JJ_EMAIL".to_string(), email),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_run_command(
     runtime: &ContainerRuntime,
@@ -623,6 +665,14 @@ pub fn build_run_command(
             let mode_str = if mount.read_only { "ro" } else { "rw" };
             cmd.push(format!("{source}:{}:{mode_str}", mount.target));
         }
+    }
+
+    // jj identity, derived from the gitconfig mounted above. Emitted before the
+    // other env sources so an explicit JJ_USER/JJ_EMAIL from config, a devcontainer,
+    // or host pass-through still wins.
+    for (key, val) in jj_identity_env(&mounts.gitconfig_host) {
+        cmd.push("-e".to_string());
+        cmd.push(format!("{key}={val}"));
     }
 
     // Extra env vars (e.g. agent-specific tokens)
@@ -1448,6 +1498,120 @@ mod tests {
             ],
         );
         assert!(cmd[2].contains("exec claude --dangerously-skip-permissions 'it'\\''s'"));
+    }
+
+    // ── jj identity ───────────────────────────────────────────────────────────
+
+    fn write_gitconfig(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn jj_identity_env_derives_both_values_from_gitconfig() {
+        let tmp = TempDir::new().unwrap();
+        let gitconfig = tmp.path().join(".gitconfig");
+        write_gitconfig(
+            &gitconfig,
+            "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
+        );
+        assert_eq!(
+            jj_identity_env(&gitconfig),
+            vec![
+                ("JJ_USER".to_string(), "Ada Lovelace".to_string()),
+                ("JJ_EMAIL".to_string(), "ada@example.com".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn jj_identity_env_empty_when_gitconfig_missing() {
+        let tmp = TempDir::new().unwrap();
+        assert!(jj_identity_env(&tmp.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn jj_identity_env_empty_when_identity_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        // A name with no email is worse than nothing: jj would still refuse to push,
+        // but the commit would look configured.
+        let gitconfig = tmp.path().join(".gitconfig");
+        write_gitconfig(&gitconfig, "[user]\n\tname = Ada Lovelace\n");
+        assert!(jj_identity_env(&gitconfig).is_empty());
+
+        write_gitconfig(&gitconfig, "[core]\n\tautocrlf = false\n");
+        assert!(jj_identity_env(&gitconfig).is_empty());
+    }
+
+    #[test]
+    fn build_run_command_injects_jj_identity() {
+        let tmp = TempDir::new().unwrap();
+        write_gitconfig(
+            &tmp.path().join(".gitconfig"),
+            "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
+        );
+        let mounts = make_mounts(tmp.path());
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+        assert!(cmd.contains(&"JJ_USER=Ada Lovelace".to_string()));
+        assert!(cmd.contains(&"JJ_EMAIL=ada@example.com".to_string()));
+    }
+
+    #[test]
+    fn build_run_command_jj_identity_yields_to_explicit_env() {
+        let tmp = TempDir::new().unwrap();
+        write_gitconfig(
+            &tmp.path().join(".gitconfig"),
+            "[user]\n\tname = Ada Lovelace\n\temail = ada@example.com\n",
+        );
+        let mounts = make_mounts(tmp.path());
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[("JJ_EMAIL".to_string(), "override@example.com".to_string())],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+        let derived = cmd
+            .iter()
+            .position(|a| a == "JJ_EMAIL=ada@example.com")
+            .expect("derived identity missing");
+        let explicit = cmd
+            .iter()
+            .position(|a| a == "JJ_EMAIL=override@example.com")
+            .expect("explicit override missing");
+        assert!(
+            derived < explicit,
+            "derived identity must come first so the later -e wins"
+        );
+    }
+
+    #[test]
+    fn build_run_command_omits_jj_identity_without_gitconfig() {
+        let tmp = TempDir::new().unwrap();
+        let mounts = make_mounts(tmp.path());
+        let cmd = build_run_command(
+            &podman_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &DevcontainerRuntime::default(),
+        );
+        assert!(!cmd.iter().any(|a| a.starts_with("JJ_USER=")));
+        assert!(!cmd.iter().any(|a| a.starts_with("JJ_EMAIL=")));
     }
 
     #[test]
