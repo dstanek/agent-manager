@@ -1,15 +1,22 @@
 # Feature 7: Codex Integration
 
-Auth preset for OpenAI Codex — env-var only, no filesystem mount.
+Auth preset for OpenAI Codex — an API key from the environment, an interactive sign-in
+mounted from `~/.codex`, or both.
 
 ## Background
 
 `am` supports named agent presets that configure credential access for known agents. Most
-presets mount a credential directory into the container. Codex is different: it authenticates
-entirely via the `OPENAI_API_KEY` environment variable, so no filesystem mount is needed.
+presets mount a credential directory into the container.
+
+> **Superseded.** This spec originally read: *"Codex is different: it authenticates entirely
+> via the `OPENAI_API_KEY` environment variable, so no filesystem mount is needed."* That was
+> true of the Codex CLI at the time. It now also supports interactive sign-in, persisted to
+> `~/.codex/auth.json`, and users who signed in that way had no credentials inside the
+> container — codex worked on the host and failed under `am`. The preset mounts `~/.codex`
+> and treats either credential as sufficient.
 
 The existing preset mechanism in `container.rs` already handles filesystem mounts. This
-feature extends it to support env-var-only presets.
+feature also supports env-var-only presets, for users who authenticate with a key alone.
 
 ## Spec
 
@@ -17,7 +24,7 @@ feature extends it to support env-var-only presets.
 
 | Preset key | Host path | Container path | Notes |
 |---|---|---|---|
-| `codex` | _(none — env var only)_ | — | Uses `OPENAI_API_KEY` pass-through |
+| `codex` | `~/.codex` (when present) | `<home>/.codex` (rw) | Plus `OPENAI_API_KEY` pass-through when set |
 
 ### Behaviour
 

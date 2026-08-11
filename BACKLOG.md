@@ -9,9 +9,11 @@ Outstanding work for `am`. Items are grouped by theme and roughly ordered by pri
 ### Feature 7: Codex Integration
 > Spec: [`specs/codex-integration.md`](specs/codex-integration.md)
 
-Env-var-only auth preset for OpenAI Codex — no filesystem mount needed.
+Auth preset for OpenAI Codex — API key, interactive sign-in, or both.
 
-**Fully implemented.** `KnownAgent::Codex` is accepted, `validate_agent_credentials` checks `OPENAI_API_KEY` is set (fails early with a clear message if not), `resolve_agent_auth_mount` returns an empty vec (no filesystem mount needed), and `agent_extra_env` injects `OPENAI_API_KEY` into the container.
+**Fully implemented.** `KnownAgent::Codex` is accepted, `resolve_agent_auth_mounts` mounts `~/.codex` read-write when it exists, `agent_extra_env` injects `OPENAI_API_KEY` when it is set, and `validate_agent_credentials` fails early only when *neither* credential is present.
+
+Originally shipped env-var-only, on the premise that codex authenticated solely through `OPENAI_API_KEY`. The CLI also supports interactive sign-in persisted to `~/.codex/auth.json`; users on that path had no credentials in the container and were forced to export a key they did not otherwise need.
 
 - [x] Design: no mount; auth via `OPENAI_API_KEY` env var pass-through; `validate_agent("codex")` must pass
 - [x] Implementation: `codex` branch in `resolve_agent_auth_mount()` returns empty vec

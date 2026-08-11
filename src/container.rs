@@ -344,7 +344,32 @@ fn resolve_agent_auth_mounts(
                 mode: MountMode::ReadOnly,
             }]
         }
-        KnownAgent::Codex => vec![], // env-var only, no filesystem mount
+        KnownAgent::Codex => {
+            // Unresolvable HOME is not fatal here, unlike the other agents: codex may be
+            // authenticated by an API key alone, and failing the whole preflight because
+            // there is nowhere to look for a sign-in would break that case.
+            let Ok(home) = home_dir() else {
+                return Ok(vec![]);
+            };
+            let config_host = home.join(".codex");
+            // Only mount what exists: an API-key user may never have run codex on this
+            // host, and mounting a missing directory would have the runtime create it
+            // as root-owned.
+            if config_host.exists() {
+                vec![AgentAuthMount {
+                    // The whole directory, read-write. Codex signs in interactively and
+                    // rotates the token in auth.json, which it replaces rather than
+                    // rewrites — a single-file mount would leave the container writing
+                    // to a detached inode the host never sees. Read-only would work
+                    // until the first token refresh and then fail.
+                    host_path: config_host,
+                    container_path: PathBuf::from(format!("{home_in_container}/.codex")),
+                    mode: MountMode::ReadWrite,
+                }]
+            } else {
+                vec![]
+            }
+        }
     })
 }
 
@@ -376,16 +401,14 @@ fn get_gh_token() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn required_env_var(agent: KnownAgent, key: &str, example: &str) -> Result<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent '{agent}' requires {key} to be set in the environment\n\
-                 Export it before running: export {key}={example}"
-            )
-        })
+/// Codex is authenticated by an API key *or* an interactive sign-in, so neither missing
+/// one is an error on its own — only both together. Naming both in one message keeps the
+/// user from fixing the half they were not using.
+fn codex_credentials_error(agent: KnownAgent) -> anyhow::Error {
+    anyhow::anyhow!(
+        "agent '{agent}' has no credentials: OPENAI_API_KEY is not set and ~/.codex does not exist\n\
+         Run 'codex' once to sign in, or export OPENAI_API_KEY=sk-..."
+    )
 }
 
 fn ensure_required_paths(agent: KnownAgent, required: &[PathBuf]) -> Result<()> {
@@ -447,13 +470,24 @@ fn resolve_agent_auth(agent: KnownAgent, home_in_container: &str) -> Result<Agen
                 env: vec![],
             })
         }
-        KnownAgent::Codex => Ok(AgentAuth {
-            mounts: vec![],
-            env: vec![(
-                "OPENAI_API_KEY".to_string(),
-                required_env_var(agent, "OPENAI_API_KEY", "sk-...")?,
-            )],
-        }),
+        KnownAgent::Codex => {
+            // Two independent ways to be authenticated, and either is sufficient: an
+            // API key in the environment, or an interactive sign-in codex persisted to
+            // ~/.codex. Requiring the key locked out every signed-in user.
+            let mounts = resolve_agent_auth_mounts(agent, home_in_container)?;
+            let key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            if mounts.is_empty() && key.is_none() {
+                return Err(codex_credentials_error(agent));
+            }
+            Ok(AgentAuth {
+                mounts,
+                env: key
+                    .map(|value| vec![("OPENAI_API_KEY".to_string(), value)])
+                    .unwrap_or_default(),
+            })
+        }
     }
 }
 
@@ -484,8 +518,21 @@ pub fn validate_agent_credentials(agent: KnownAgent) -> Result<()> {
         }
         KnownAgent::Gemini => ensure_required_paths(agent, &[home_dir()?.join(".gemini")]),
         KnownAgent::Codex => {
-            required_env_var(agent, "OPENAI_API_KEY", "sk-...")?;
-            Ok(())
+            // Either form of credential is enough. Codex accepts an API key from the
+            // environment *or* an interactive sign-in it persists to ~/.codex/auth.json,
+            // and requiring the env var locked out everyone who uses the second — the
+            // agent worked on the host and failed the moment am wrapped it.
+            let has_signin = home_dir()
+                .map(|home| home.join(".codex").join("auth.json").exists())
+                .unwrap_or(false);
+            let has_key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+            if has_signin || has_key {
+                Ok(())
+            } else {
+                Err(codex_credentials_error(agent))
+            }
         }
     }
 }
@@ -1949,6 +1996,10 @@ mod tests {
     #[test]
     fn preflight_agent_auth_codex_ok_when_key_set() {
         let _g = lock_env();
+        // A temp HOME with no ~/.codex: the API-key-only user, and hermetic against
+        // whatever HOME a neighbouring test left behind.
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
         std::env::set_var("OPENAI_API_KEY", "sk-test");
 
         let auth = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap();
@@ -1961,24 +2012,70 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
     }
 
+    // These pin the no-credentials path, so HOME must point somewhere without a
+    // ~/.codex — otherwise the result depends on whether the developer running the
+    // suite happens to have signed into codex.
     #[test]
     fn preflight_agent_auth_codex_fails_when_key_missing() {
         let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
         std::env::remove_var("OPENAI_API_KEY");
 
         let err = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap_err();
         assert!(err.to_string().contains("OPENAI_API_KEY"));
+
+        std::env::remove_var("HOME");
     }
 
     #[test]
     fn preflight_agent_auth_codex_fails_when_key_empty() {
         let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
         std::env::set_var("OPENAI_API_KEY", "");
 
         let err = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap_err();
         assert!(err.to_string().contains("OPENAI_API_KEY"));
 
         std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn preflight_agent_auth_codex_accepts_an_interactive_signin() {
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(tmp.path().join(".codex").join("auth.json"), "{}").unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("OPENAI_API_KEY");
+
+        // No API key anywhere, and this must still be enough: it is how codex works
+        // for anyone who signed in rather than exporting a key.
+        let auth = preflight_agent_auth(KnownAgent::Codex, "/home/am").unwrap();
+        assert!(auth.env.is_empty());
+        assert_eq!(auth.mounts.len(), 1);
+
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn codex_mounts_the_config_dir_read_write_when_present() {
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let mounts = resolve_agent_auth_mounts(KnownAgent::Codex, "/home/am").unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].host_path, tmp.path().join(".codex"));
+        assert_eq!(mounts[0].container_path, PathBuf::from("/home/am/.codex"));
+        // Read-write: codex rotates the token in auth.json, and a read-only mount
+        // would work until the first refresh and then break.
+        assert_eq!(mounts[0].mode, MountMode::ReadWrite);
+
+        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -2067,11 +2164,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_returns_no_mount() {
+    fn codex_returns_no_mount_when_never_signed_in() {
         let _g = lock_env();
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
 
+        // An API-key user may have no ~/.codex at all. Mounting a missing directory
+        // would have the runtime create it, owned by root.
         assert!(resolve_agent_auth_mounts(KnownAgent::Codex, "/home/am")
             .unwrap()
             .is_empty());
