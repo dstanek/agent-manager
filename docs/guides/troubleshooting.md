@@ -371,7 +371,7 @@ am start feature-name-that-is-longer-than-40-chars  # too long
 
 **Command:** `am init`
 
-Running `am init` multiple times in the same directory is safe. Existing configuration files (`.am/config.toml`, `.am/sessions.json`) are not overwritten, and `.gitignore` is only updated if needed.
+Running `am init` multiple times in the same directory is safe. An existing `.am/config.toml` is not overwritten, and `.gitignore` is only updated if needed. `am init` does not touch session state, which lives outside the repository entirely.
 
 ### No sessions active
 
@@ -435,7 +435,7 @@ am destroy feat --force
     - ✓ Stops and removes the container
     - ✓ Kills the tmux window
     - ✓ Removes git worktree and deletes the `am/<slug>` branch
-    - ✓ Removes session from `.am/sessions.json`
+    - ✓ Removes the session from the global session store
     - ✗ These changes cannot be undone
     - ✗ Worktree and branch are permanently deleted
 

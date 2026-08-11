@@ -72,7 +72,7 @@ Don't do this — use `am destroy <slug>` instead.
 
 If you delete it manually:
 - The branch `am/<slug>` still exists in git (orphaned)
-- The session is still recorded in `.am/sessions.json`
+- The session is still recorded in the global session store
 - `am` may get confused
 
 **Fix:** Use `am destroy <slug>` to properly clean up.
@@ -87,13 +87,13 @@ Yes! It's a normal git branch. You can:
 
 `am` doesn't lock or protect the branch — it's yours to modify.
 
-### Can multiple users work in the same `.am/` directory?
+### Can multiple users share `.am/`?
 
-No. `.am/sessions.json` tracks active sessions, and multiple users would conflict. Each user should:
-- Have their own clone of the repo, or
-- Use separate `.am/` directories (e.g., `.am-alice/`, `.am-bob/`)
+Partly, and the useful half is the intended workflow.
 
-This is a limitation of the current design.
+`.am/config.toml` is meant to be committed and shared. Session state is no longer kept in the repository — each user has their own store at `$XDG_STATE_HOME/am/sessions.json` — so a shared config file no longer drags a shared session registry along with it. Committing `.am/config.toml` gives your whole team the same `agent`, `container`, and `devcontainer` defaults.
+
+What is still not supported is two people working out of the *same checkout* at the same time: `.am/worktrees/` is a single directory on disk, and two sessions with the same slug would collide there. Each user should have their own clone.
 
 ---
 

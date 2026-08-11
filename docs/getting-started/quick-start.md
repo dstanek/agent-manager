@@ -54,9 +54,10 @@ am init
 This creates a `.am/` directory at the repository root containing:
 
 - `.am/config.toml` — project configuration with all options commented out
-- `.am/sessions.json` — session state file (starts empty)
 
-`am init` also appends `.am/` to your `.gitignore` file so the session state does not get committed. If `.gitignore` does not exist yet, it will be created.
+`am init` also appends `.am/worktrees/` to your `.gitignore` so agent checkouts do not get committed. If `.gitignore` does not exist yet, it will be created. Note that `.am/config.toml` itself is *not* ignored — it is designed to be committed and shared with your team.
+
+Session state is not stored in the repository at all. It lives in a per-user file at `$XDG_STATE_HOME/am/sessions.json` (falling back to `~/.local/state/am/sessions.json`), created on demand the first time you start a session.
 
 ---
 
@@ -169,7 +170,7 @@ The destroy command:
 1. Stops and removes the container
 2. Kills the tmux window
 3. Removes the git worktree and deletes the `am/feat` branch
-4. Removes the session record from `.am/sessions.json`
+4. Removes the session record from the global session store
 
 ---
 

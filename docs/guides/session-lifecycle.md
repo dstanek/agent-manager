@@ -17,8 +17,9 @@ Every `am` session is made up of up to three pieces:
    is not passed.
 
 All three are independent. You can run `am` without tmux, without containers, or without
-either — every combination is valid. The session record in `.am/sessions.json` reflects
-exactly what was created.
+either — every combination is valid. The session record in the global session store
+(`$XDG_STATE_HOME/am/sessions.json`) reflects exactly what was created, along with the
+repository the session belongs to.
 
 ---
 

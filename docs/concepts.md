@@ -12,7 +12,7 @@ A **session** is the central unit of work in `am`. When you run `am start`, a se
 - A **tmux window** with a split-pane layout
 - An optional **container** wrapping the agent process
 
-Sessions are tracked in `.am/sessions.json` and displayed by `am list`. When you're done, `am destroy` tears down all the pieces in one command.
+Sessions are tracked in a per-user state file at `$XDG_STATE_HOME/am/sessions.json` (falling back to `~/.local/state/am/sessions.json`) and displayed by `am list`. Because the registry is global rather than per-repository, `am list --all` can show sessions from every repo you have started one in. When you're done, `am destroy` tears down all the pieces in one command.
 
 The key idea is that a session is self-contained. Two sessions can run simultaneously in the same repository without stepping on each other, because each one has its own branch, its own terminal, and (optionally) its own container.
 
@@ -53,14 +53,19 @@ In both cases, the checkout lives at `.am/worktrees/<slug>` and is removed when 
 
 ```
 .am/
-├── config.toml       ← project-level am configuration
-├── sessions.json     ← active session state (managed automatically)
+├── config.toml       ← project-level am configuration (committable)
 └── worktrees/
     ├── feat/         ← worktree for the "feat" session
     └── fix-login/    ← worktree for the "fix-login" session
 ```
 
-`.am/` is added to `.gitignore` automatically by `am init`. It is local to your machine — session state, worktrees, and project config are not committed to the repository.
+`am init` adds `.am/worktrees/` to `.gitignore` — not the whole `.am/` directory. Worktrees are local to your machine, but `.am/config.toml` is meant to be committed so a team shares the same `agent`, `container`, and `devcontainer` defaults.
+
+Session state is deliberately *not* here. It lives in the per-user global store described above, which is what lets `am list` work from any directory and keeps two developers in the same repository from fighting over one registry file.
+
+!!! note "Upgrading from an older version"
+
+    Earlier versions kept session state in `.am/sessions.json` and a generated identity file in `.am/gitconfig`. Both have moved under `$XDG_STATE_HOME/am/`. The next `am list` migrates any old per-repo records into the global store and removes the stale file for you. If your `.gitignore` still has a broad `.am/` entry, `am init` prints a note suggesting you narrow it to `.am/worktrees/`.
 
 ---
 

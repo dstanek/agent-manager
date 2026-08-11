@@ -18,8 +18,10 @@ am init
 
 - Creates the `.am/` directory at the repository root
 - Writes a default `.am/config.toml` with all settings commented out
-- Creates an empty `.am/sessions.json` to hold session state
-- Appends `.am/` to `.gitignore` (creates `.gitignore` if it does not exist)
+- Appends `.am/worktrees/` to `.gitignore` (creates `.gitignore` if it does not exist)
+- Prints an advisory if `.gitignore` still contains a broad `.am/` entry, since `.am/config.toml` is meant to be committed
+
+`am init` does not create a session state file. Sessions are recorded in a per-user store at `$XDG_STATE_HOME/am/sessions.json` (falling back to `~/.local/state/am/sessions.json`), created on demand by `am start`.
 
 Running `am init` in a directory that is not a git or jj repository is an error. Running it a second time in the same repository is safe — existing files are not overwritten.
 
@@ -113,7 +115,7 @@ am start <slug> [OPTIONS]
 4. If inside tmux: opens a new window named `am-<slug>` with a split pane; sets up the agent pane and the shell pane
 5. If container is enabled: launches the container with the appropriate mounts and environment variables
 6. Sends the agent command to the agent pane
-7. Records the session in `.am/sessions.json`
+7. Records the session in the global session store, tagged with the repository it belongs to
 
 Steps 3–6 are covered by a rollback: if any of them fails, the worktree and its branch are
 removed rather than left behind for you to clean up by hand.
@@ -124,26 +126,41 @@ If `am start` is run outside of tmux, it creates the worktree and then launches 
 
 ## `am list`
 
-List all active sessions for the current project.
+List active sessions — by default those belonging to the current project.
 
 **Usage**
 
 ```sh
 am list
+am list --all
 ```
 
-Reads from `.am/sessions.json` and prints a table of all recorded sessions. If there are no sessions, prints a friendly message instead.
+**Options**
+
+| Flag | Description |
+|---|---|
+| `--all` | Show sessions from every repository, not just the current one. |
+
+Reads the global session store and prints a table of matching sessions. If there are none, prints a friendly message instead.
+
+Plain `am list` must be run inside a git or jj repository, since it filters by the current repo; if you are outside one, `am` says so and points you at `am list --all`. `am list --all` works from any directory.
+
+The first time `am list` runs in a repository that still has an old `.am/sessions.json`, its records are migrated into the global store and the old file is removed. This happens transparently — no action is needed on your part.
 
 **Output columns**
 
 | Column | Description |
 |---|---|
+| `REPO` | Repository the session belongs to, with `$HOME` abbreviated to `~`. Only shown with `--all`. |
 | `SLUG` | The session name |
 | `CONTAINER` | Container runtime in use (`podman`, `docker`), or `—` if no container |
 | `AUTO` | `yes` if the session was started with `--auto`, otherwise `—` |
 | `WORKTREE` | Absolute path to the session's git worktree or jj workspace |
 | `WINDOW` | The tmux window name (`am-<slug>`) |
+| `STATUS` | `stale` if the session's repository no longer exists on disk, otherwise blank. Only shown with `--all`. |
 | `CREATED` | Timestamp when the session was created (`YYYY-MM-DD HH:MM`) |
+
+With `--all`, sessions are grouped by repository and sorted oldest-first within each, and any `stale` rows are sorted to the bottom. A stale row means the repository was moved or deleted without `am destroy` being run first; the record can be cleaned up by destroying the session or removing it from the store by hand.
 
 **Example output**
 
@@ -217,7 +234,7 @@ am destroy <slug> [OPTIONS]
 2. Removes the container (`podman rm am-<slug>` or equivalent)
 3. Kills the tmux window `am-<slug>` (skipped if the window no longer exists)
 4. Removes the git worktree at `.am/worktrees/<slug>` and deletes the `am/<slug>` branch
-5. Removes the session record from `.am/sessions.json`
+5. Removes the session record from the global session store
 
 Without `--force`, `am` prints a summary of what will be destroyed and asks for confirmation. This is the only destructive command in `am` and cannot be undone — the worktree and branch are permanently deleted.
 
