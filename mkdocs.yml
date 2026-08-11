@@ -48,10 +48,12 @@ nav:
   - Guides:
     - Claude Code: guides/claude-code.md
     - GitHub Copilot: guides/github-copilot.md
+    - Session Lifecycle: guides/session-lifecycle.md
     - Custom Images: guides/custom-images.md
     - Dev Containers: guides/devcontainers.md
     - Troubleshooting: guides/troubleshooting.md
     - CI/CD Integration: guides/ci-cd-integration.md
+    - FAQ: guides/faq.md
   - Reference:
     - Quick Reference: reference/quick-reference.md
     - Commands: reference/commands.md
