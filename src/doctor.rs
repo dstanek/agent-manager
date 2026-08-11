@@ -140,8 +140,15 @@ impl Report {
             ));
             if let Some(ref hint) = check.hint {
                 // Indented under the check it belongs to, so a wall of hints cannot be
-                // mistaken for a list of separate problems.
-                out.push_str(&format!("      → {hint}\n"));
+                // mistaken for a list of separate problems. Dimmed for the same reason:
+                // the finding is what you scan for, the hint is what you read once you
+                // have found it.
+                out.push_str(&paint(
+                    &format!("      → {hint}"),
+                    Color::Dim,
+                    color,
+                ));
+                out.push('\n');
             }
         }
 
@@ -820,6 +827,19 @@ mod tests {
     }
 
     #[test]
+    fn hints_are_dimmed_rather_than_colored_by_severity() {
+        let report = Report {
+            checks: vec![Check::fail("S", "broken", "detail", "do this")],
+        };
+        let out = report.render(true);
+
+        // The finding is red, the hint attached to it is dim — a second red line would
+        // read as a second problem.
+        assert!(out.contains("\x1b[31m✗\x1b[0m"));
+        assert!(out.contains("\x1b[2m      → do this\x1b[0m"));
+    }
+
+    #[test]
     fn render_without_color_has_no_escape_sequences() {
         let report = Report {
             checks: vec![
@@ -834,6 +854,26 @@ mod tests {
         assert!(!out.contains('\x1b'), "unexpected escape in: {out:?}");
     }
 
+    /// Remove every ANSI SGR sequence. Written generically rather than as a list of the
+    /// codes in use, so adding a style cannot quietly stop the alignment test checking
+    /// anything.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn color_does_not_disturb_column_alignment() {
         let report = Report {
@@ -842,12 +882,9 @@ mod tests {
                 Check::fail("S", "short", "detail", "hint"),
             ],
         };
-        // The glyph is one visible column wide either way, so the detail column has to
-        // land in the same place with and without color.
-        let plain = report.render(false);
-        let colored = report.render(true).replace('\x1b', "");
-        let strip = |s: String| s.replace("[32m", "").replace("[31m", "").replace("[0m", "");
-        assert_eq!(strip(colored), plain);
+        // Every painted run is one visible column wide either way, so stripping the
+        // escapes has to reproduce the plain render byte for byte.
+        assert_eq!(strip_ansi(&report.render(true)), report.render(false));
     }
 
     #[test]

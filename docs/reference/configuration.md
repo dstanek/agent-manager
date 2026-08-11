@@ -103,7 +103,9 @@ Environment variables override both the global and project configs and are usefu
 
 ### Color
 
-`am` colors status glyphs and the `error:`, `warning:` and `Note:` prefixes when it is writing to a terminal: green for fine, yellow for worth reading, red for something that will stop you. Color is only ever an accent on text that already says the same thing, so nothing is lost without it.
+`am` colors output when it is writing to a terminal: green for fine, yellow for worth reading, red for something that will stop you, and dim for structure rather than content. That covers `am doctor`'s status glyphs and verdict, the `error:`, `warning:` and `Note:` prefixes, the `stale` marker in `am list --all`, and the table headers. Color is only ever an accent on text that already says the same thing, so nothing is lost without it.
+
+Output that is meant to become a file is never colored — `am generate-config` prints a plain template whether or not it is redirected.
 
 | Variable | Effect |
 |---|---|
