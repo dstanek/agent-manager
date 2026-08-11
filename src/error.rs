@@ -51,6 +51,9 @@ pub enum AmError {
     #[error("config error: {0}")]
     ConfigError(String),
 
+    #[error("cannot determine state directory: neither XDG_STATE_HOME nor HOME is set")]
+    GlobalStateDirNotFound,
+
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 }

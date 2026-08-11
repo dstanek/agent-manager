@@ -100,7 +100,7 @@ pub struct ContainerMounts {
     pub worktree_host: PathBuf,
     pub vcs_host: PathBuf,                   // .git dir (git) or .jj dir (jj)
     pub colocated_git_host: Option<PathBuf>, // .git for colocated jj+git repos
-    pub gitconfig_host: PathBuf,             // .am/gitconfig (or override)
+    pub gitconfig_host: PathBuf,             // $XDG_STATE_HOME/am/gitconfig (or override)
     pub ssh_host: PathBuf,                   // ~/.ssh
     pub agent_auth: Vec<AgentAuthMount>,
     /// Home directory inside the container. Derived from the configured container user
@@ -255,6 +255,7 @@ pub fn resolve_mounts(
     };
     let gitconfig_host = gitconfig
         .map(|p| p.to_path_buf())
+        .or_else(|| crate::config::global_state_dir().map(|d| d.join("gitconfig")))
         .unwrap_or_else(|| repo_root.join(".am").join("gitconfig"));
     let ssh_host = ssh
         .map(|p| p.to_path_buf())
@@ -914,7 +915,11 @@ mod tests {
 
         assert_eq!(mounts.worktree_host, repo_root.join(".am/worktrees/feat"));
         assert_eq!(mounts.vcs_host, repo_root.join(".git"));
-        assert_eq!(mounts.gitconfig_host, repo_root.join(".am/gitconfig"));
+        // When no explicit gitconfig is given, falls back to global state dir.
+        assert_eq!(
+            mounts.gitconfig_host,
+            tmp.path().join(".local/state/am/gitconfig")
+        );
         assert_eq!(mounts.ssh_host, tmp.path().join(".ssh"));
         assert!(mounts.agent_auth.is_empty());
 
