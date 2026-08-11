@@ -139,7 +139,6 @@ pub struct ContainerConfig {
     pub mode: ContainerMode,
     pub runtime: RuntimePreference,
     pub image: Option<String>,
-    pub agent: Option<String>,
     pub network: NetworkMode,
     pub env: Vec<String>,
     pub gitconfig: Option<PathBuf>, // None = ~/.gitconfig
@@ -154,7 +153,6 @@ impl Default for ContainerConfig {
             mode: ContainerMode::default(),
             runtime: RuntimePreference::Auto,
             image: None,
-            agent: None,
             network: NetworkMode::Full,
             env: Vec::new(),
             gitconfig: None,
@@ -302,7 +300,6 @@ struct FileContainer {
     mode: Option<ContainerMode>,
     runtime: Option<RuntimePreference>,
     image: Option<String>,
-    agent: Option<String>,
     network: Option<NetworkMode>,
     env: Option<Vec<String>>,
     gitconfig: Option<PathBuf>,
@@ -381,7 +378,6 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     apply_opt(&mut base.container.mode, file.container.mode);
     apply_opt(&mut base.container.runtime, file.container.runtime);
     apply_opt_string(&mut base.container.image, file.container.image);
-    apply_opt_string(&mut base.container.agent, file.container.agent);
     apply_opt(&mut base.container.network, file.container.network);
     apply_opt(&mut base.container.env, file.container.env);
     apply_opt_some(&mut base.container.gitconfig, file.container.gitconfig);
@@ -508,7 +504,7 @@ pub fn global_config_template() -> &'static str {
 #   AM_AGENT
 #   AM_TMUX_AGENT_PANE, AM_TMUX_SPLIT, AM_TMUX_SPLIT_PERCENT
 #   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
-#   AM_CONTAINER_AGENT, AM_CONTAINER_NETWORK, AM_CONTAINER_USER
+#   AM_CONTAINER_NETWORK, AM_CONTAINER_USER
 #   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS
 #   AM_DEVCONTAINER_BIN (path to the `devcontainer` CLI)
 
@@ -634,11 +630,6 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
     if let Ok(val) = std::env::var("AM_CONTAINER_IMAGE") {
         if !val.is_empty() {
             config.container.image = Some(val);
-        }
-    }
-    if let Ok(val) = std::env::var("AM_CONTAINER_AGENT") {
-        if !val.is_empty() {
-            config.container.agent = Some(val);
         }
     }
     if let Ok(val) = std::env::var("AM_CONTAINER_NETWORK") {
@@ -778,6 +769,64 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    // ── Agent precedence ──────────────────────────────────────────────────────
+    //
+    // The generated config states one rule: CLI flags > env vars > project > global.
+    // These pin the two file-and-env halves of it. `container.agent` used to break
+    // both, because it resolved per key: a global container.agent beat a project
+    // defaults.agent, and a project container.agent beat AM_AGENT. Any future
+    // second way to name the agent must not reintroduce that.
+
+    #[test]
+    fn project_agent_beats_global_agent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+
+        let global = write_toml(tmp.path(), "global.toml", "[defaults]\nagent = \"copilot\"\n");
+        let project = write_toml(tmp.path(), "project.toml", "[defaults]\nagent = \"claude\"\n");
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+        assert_eq!(config.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn env_agent_beats_both_config_files() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::set_var("AM_AGENT", "gemini");
+        let tmp = TempDir::new().unwrap();
+
+        let global = write_toml(tmp.path(), "global.toml", "[defaults]\nagent = \"copilot\"\n");
+        let project = write_toml(tmp.path(), "project.toml", "[defaults]\nagent = \"claude\"\n");
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+        assert_eq!(config.agent.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn container_agent_is_no_longer_a_way_to_set_the_agent() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        // Neither the retired file key nor its env var may resurrect the inversion.
+        std::env::set_var("AM_CONTAINER_AGENT", "copilot");
+        let tmp = TempDir::new().unwrap();
+
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[container]\nagent = \"copilot\"\n",
+        );
+
+        // Unknown keys are ignored rather than rejected — no section in this file
+        // sets `deny_unknown_fields` — so a stale config still loads. What matters
+        // is that it no longer selects an agent behind `defaults.agent`'s back.
+        let config = load_with_global(None, Some(&project)).unwrap();
+        assert_eq!(config.agent, None);
     }
 
     #[test]
