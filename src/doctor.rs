@@ -190,12 +190,36 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
 /// later check would describe a configuration the user does not have, and the one command
 /// meant to explain the problem would be the one hiding it. `am start` fails outright on
 /// the same file, so a clean report would have been a lie.
+/// Describe which config files were actually read.
+///
+/// "loaded" was ambiguous in the one case where it mattered: a user editing a config that
+/// `am` never opens reads it as confirmation. Naming the files turns that into an obvious
+/// mismatch — the path on screen is not the path they edited. Files that do not exist are
+/// listed as absent rather than omitted, since "no project config" is itself the answer to
+/// why a setting had no effect.
+fn sources(global: Option<&Path>, project: Option<&Path>) -> String {
+    let mut parts = Vec::new();
+    match global.filter(|p| p.exists()) {
+        Some(p) => parts.push(format!("global {}", p.display())),
+        None => parts.push("no global config".to_string()),
+    }
+    match project {
+        Some(p) if p.exists() => parts.push(format!("project {}", p.display())),
+        Some(p) => parts.push(format!("no project config at {}", p.display())),
+        None => {}
+    }
+    parts.join(", ")
+}
+
 fn check_config(report: &mut Report, repo_root: Option<&Path>) -> Config {
     let project = repo_root.map(|r| r.join(".am").join("config.toml"));
-    match config::load_with_global(config::global_config_path().as_deref(), project.as_deref()) {
+    let global = config::global_config_path();
+    match config::load_with_global(global.as_deref(), project.as_deref()) {
         Ok(cfg) => {
             if cfg.unknown_keys.is_empty() {
-                report.checks.push(Check::ok(PROJECT, "config", "loaded"));
+                report
+                    .checks
+                    .push(Check::ok(PROJECT, "config", sources(global.as_deref(), project.as_deref())));
             } else {
                 // Named individually: "3 unknown keys" tells the user they have a
                 // problem without telling them where, which is the part that is hard
@@ -739,6 +763,37 @@ mod tests {
         assert!(
             check.hint.is_some(),
             "a failing config check must say what to do about it"
+        );
+    }
+
+    #[test]
+    fn config_check_names_the_files_it_read() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        let project = tmp.path().join(".am").join("config.toml");
+        std::fs::write(&project, "[defaults]\nagent = \"claude\"\n").unwrap();
+
+        let mut report = Report::default();
+        check_config(&mut report, Some(tmp.path()));
+
+        let detail = find(&report, "config").detail;
+        assert!(
+            detail.contains(&project.display().to_string()),
+            "the loaded project config must be named, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn config_check_says_so_when_there_is_no_project_config() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut report = Report::default();
+        check_config(&mut report, Some(tmp.path()));
+
+        let detail = find(&report, "config").detail;
+        assert!(
+            detail.contains("no project config at"),
+            "an absent project config is itself the answer, got: {detail}"
         );
     }
 
