@@ -1,0 +1,37 @@
+# Project-level am configuration — .am/config.toml
+# Uncomment only the values you want to override from your global or compiled-in defaults.
+# Precedence (highest wins): CLI flags > environment variables > project config > global config
+# Run `am generate-config` to see the full global config template with all options documented.
+
+[defaults]
+agent = "claude"         # agent to launch, e.g. "claude" | "copilot" — also selects the container image
+
+# Override the container image for a specific agent (built-in defaults shown):
+# [agents.claude]
+# image = "ghcr.io/dstanek/am-claude-minimal:latest"
+
+[agents.copilot]
+image = "ghcr.io/dstanek/am-copilot:latest"
+
+[tmux]
+# agent_pane = "left"    # which pane gets the agent: "left" | "right"
+# split = "horizontal"   # split direction: "horizontal" | "vertical"
+# split_percent = 50     # percentage of the window given to the agent pane
+
+[container]
+# enabled = true
+# mode = "auto"          # "auto" (devcontainer when one is found) | "devcontainer" | "image"
+# runtime = "auto"       # "auto" | "podman" | "docker"
+# network = "full"       # "full" | "none"
+# env = []               # extra environment variables to pass into the container
+# gitconfig = ""         # path to gitconfig to mount (default: ~/.gitconfig)
+# ssh = ""               # path to SSH dir to mount (default: ~/.ssh)
+# image = ""             # override image for all agents (advanced; prefer [agents.<name>].image)
+# user = "am"            # username inside the container (used for credential mount paths)
+
+# Applies only when container.mode resolves to "devcontainer".
+[devcontainer]
+# path = ""                  # explicit devcontainer.json, relative to the worktree
+# agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
+# allow_host_commands = false # let initializeCommand run on the HOST — off by default
+# skip_lifecycle = false     # skip postCreateCommand and friends
