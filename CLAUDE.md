@@ -10,7 +10,7 @@
 cargo build              # Debug build
 cargo build --release    # Release build
 cargo test               # Run all tests (run after every change)
-cargo clippy -- -D warnings  # Lint (run after every change)
+cargo clippy --all-targets -- -D warnings  # Lint, including tests (run after every change)
 cargo run -- <command>   # Run (e.g., cargo run -- start my-feature)
 make build-claude        # Build Claude Code Docker image
 make build-copilot       # Build Copilot Docker image
@@ -47,7 +47,7 @@ make build-copilot       # Build Copilot Docker image
 - Test git fixtures commit with `--no-verify`: a developer's global `init.templatedir` can install a `commit-msg` hook into every `git init`
 - Tests mutating env vars use a mutex to serialize execution
 
-**After every code change:** run `cargo test` and `cargo clippy -- -D warnings`. Fix any failures before proceeding.
+**After every code change:** run `cargo test` and `cargo clippy --all-targets -- -D warnings`. Fix any failures before proceeding. `--all-targets` matters — without it clippy skips test code, which is what CI lints.
 
 ## Path Handling Strategy
 

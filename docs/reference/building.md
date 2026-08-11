@@ -78,10 +78,11 @@ subcommands are present).
 
 Two workflows exercise the build:
 
-- **`.github/workflows/ci.yml`** — on every push and pull request to `main`,
-  runs `cargo clippy -- -D warnings`, `cargo build`, and `cargo test` on
+- **`.github/workflows/ci.yml`** — on pull requests to `main` that touch `src/`,
+  `tests/`, `Cargo.toml`, `Cargo.lock`, or the workflow itself, runs
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `cargo test` on
   `ubuntu-latest` (which build-checks Linux), plus a `cross-build` job that runs
-  `cargo build --release --target <triple>` (build-only, no packaging) for
+  `cargo build --target <triple>` (build-only, no packaging) for
   `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`. This catches
   macOS/Windows-specific compile breakage on the PR that introduces it rather
   than only at release time; the remaining targets are exercised at tag time.
