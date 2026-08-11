@@ -666,11 +666,16 @@ fn cmd_list_repo() -> anyhow::Result<()> {
         .unwrap_or(8)
         .max(8);
 
-    println!(
+    // Painted after formatting, never per cell: the column widths are computed from the
+    // plain strings, and ANSI escapes would be counted as visible characters.
+    let color = color::enabled(color::Stream::Stdout);
+    let header = format!(
         "{:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  CREATED",
         "SLUG", "CONTAINER", "AUTO", "WORKTREE", "WINDOW",
     );
-    println!("{}", "-".repeat(slug_w + 9 + 4 + path_w + 10 + 19 + 10));
+    println!("{}", color::paint(&header, color::Color::Dim, color));
+    let rule = "-".repeat(slug_w + 9 + 4 + path_w + 10 + 19 + 10);
+    println!("{}", color::paint(&rule, color::Color::Dim, color));
 
     for s in &sessions {
         let container = s
@@ -742,11 +747,14 @@ fn cmd_list_all() -> anyhow::Result<()> {
         .unwrap_or(8)
         .max(8);
 
-    println!(
+    let color = color::enabled(color::Stream::Stdout);
+    let header = format!(
         "{:<repo_w$}  {:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  {:<7}  CREATED",
         "REPO", "SLUG", "CONTAINER", "AUTO", "WORKTREE", "WINDOW", "STATUS",
     );
-    println!("{}", "-".repeat(repo_w + slug_w + 9 + 4 + path_w + 10 + 7 + 19 + 14));
+    println!("{}", color::paint(&header, color::Color::Dim, color));
+    let rule = "-".repeat(repo_w + slug_w + 9 + 4 + path_w + 10 + 7 + 19 + 14);
+    println!("{}", color::paint(&rule, color::Color::Dim, color));
 
     for s in &sessions {
         let container = s
@@ -756,10 +764,20 @@ fn cmd_list_all() -> anyhow::Result<()> {
             .unwrap_or("—");
         let auto = if s.auto { "yes" } else { "—" };
         let created = s.created_at.format("%Y-%m-%d %H:%M").to_string();
-        let status = if s.repo_root.exists() { "" } else { "stale" };
+        let stale = !s.repo_root.exists();
+        // Padded first, then painted, so the escapes land outside the column width.
+        // Only a real `stale` is painted — an empty cell has nothing to emphasise.
+        let status = format!("{:<7}", if stale { "stale" } else { "" });
+        let status = if stale {
+            // Same word, same color as `am doctor` gives a warning: one vocabulary
+            // across commands.
+            color::paint(&status, color::Color::Yellow, color)
+        } else {
+            status
+        };
         let repo = abbrev_home(&s.repo_root);
         println!(
-            "{:<repo_w$}  {:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  {:<7}  {}",
+            "{:<repo_w$}  {:<slug_w$}  {:<9}  {:<4}  {:<path_w$}  {:<10}  {}  {}",
             repo,
             s.slug,
             container,
@@ -868,7 +886,12 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
             && worktree::git_worktree_has_changes(&s.vcs.worktree_path)
         {
             eprintln!(
-                "\x1b[31mWarning: the worktree has uncommitted changes that will be lost.\x1b[0m"
+                "{} the worktree has uncommitted changes that will be lost.",
+                color::paint(
+                    "warning:",
+                    color::Color::Red,
+                    color::enabled(color::Stream::Stderr)
+                )
             );
         }
         print!("{}", msgs.destroy_confirm(slug));

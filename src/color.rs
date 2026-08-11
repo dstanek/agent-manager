@@ -42,6 +42,9 @@ pub enum Color {
     Green,
     Yellow,
     Red,
+    /// Not a severity — de-emphasis, for text that is structure rather than content:
+    /// table headers, and hints that belong to a finding already stated above them.
+    Dim,
 }
 
 impl Color {
@@ -50,6 +53,7 @@ impl Color {
             Color::Green => "\x1b[32m",
             Color::Yellow => "\x1b[33m",
             Color::Red => "\x1b[31m",
+            Color::Dim => "\x1b[2m",
         }
     }
 }
