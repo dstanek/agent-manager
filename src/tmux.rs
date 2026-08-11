@@ -80,13 +80,14 @@ pub fn create_window(window_name: &str, working_dir: &Path) -> Result<String> {
 }
 
 /// Split an existing window.
-/// Horizontal: `tmux split-window -h -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
-/// Vertical:   `tmux split-window -v -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
+/// Horizontal: `tmux split-window -h [-b] -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
+/// Vertical:   `tmux split-window -v [-b] -p <new_pane_percent> -c <working_dir> -t <window_name> [shell_cmd]`
 ///
 /// `new_pane_percent` is the percentage of the window given to the **new** pane (1–99).
-/// The caller is responsible for mapping the logical agent/shell pane assignment to the
-/// correct percentage (e.g. if the agent is in the new pane, pass `split_percent` directly;
-/// if the agent is in the original pane, pass `100 - split_percent`).
+///
+/// `before` adds `-b`, placing the new pane left of (horizontal) or above (vertical) the
+/// existing one, which also makes it pane index 0. This is what lets a caller put the new
+/// pane on either side without giving up the ability to run a command in it.
 ///
 /// `shell_cmd` — when `Some`, tmux runs this command (via `$SHELL -c`) in the new pane
 /// instead of an interactive shell.
@@ -95,6 +96,7 @@ pub fn split_window(
     working_dir: &Path,
     direction: &SplitDirection,
     new_pane_percent: u8,
+    before: bool,
     shell_cmd: Option<&str>,
 ) -> Result<()> {
     let bin = tmux_bin()?;
@@ -104,16 +106,11 @@ pub fn split_window(
     };
     let percent = new_pane_percent.to_string();
     let wd = working_dir.to_string_lossy();
-    let mut args = vec![
-        "split-window",
-        flag,
-        "-p",
-        &percent,
-        "-c",
-        &wd,
-        "-t",
-        window_name,
-    ];
+    let mut args = vec!["split-window", flag];
+    if before {
+        args.push("-b");
+    }
+    args.extend_from_slice(&["-p", &percent, "-c", &wd, "-t", window_name]);
     if let Some(cmd) = shell_cmd {
         args.push(cmd);
     }
@@ -269,6 +266,7 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Horizontal,
             50,
+            false,
             None,
         )
         .unwrap();
@@ -286,6 +284,7 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Vertical,
             50,
+            false,
             None,
         )
         .unwrap();
@@ -302,12 +301,49 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Horizontal,
             30,
+            false,
             None,
         )
         .unwrap();
         let out = mock.captured();
         assert!(out.contains("-p"), "expected -p flag, got: {out}");
         assert!(out.contains("30"), "expected percent value 30, got: {out}");
+    }
+
+    #[test]
+    fn split_window_before_passes_b_flag() {
+        let mock = MockTmux::new();
+        split_window(
+            "am-feat",
+            Path::new("/tmp/worktree"),
+            &SplitDirection::Horizontal,
+            50,
+            true,
+            Some("podman run --rm -it myimage"),
+        )
+        .unwrap();
+        let out = mock.captured();
+        assert!(out.contains("-b"), "expected -b flag, got: {out}");
+        assert!(
+            out.contains("podman run --rm -it myimage"),
+            "expected shell command alongside -b, got: {out}"
+        );
+    }
+
+    #[test]
+    fn split_window_omits_b_flag_when_not_before() {
+        let mock = MockTmux::new();
+        split_window(
+            "am-feat",
+            Path::new("/tmp/worktree"),
+            &SplitDirection::Horizontal,
+            50,
+            false,
+            None,
+        )
+        .unwrap();
+        let out = mock.captured();
+        assert!(!out.contains("-b"), "expected no -b flag, got: {out}");
     }
 
     #[test]
@@ -318,6 +354,7 @@ mod tests {
             Path::new("/tmp/worktree"),
             &SplitDirection::Horizontal,
             50,
+            false,
             Some("podman run --rm -it myimage"),
         )
         .unwrap();

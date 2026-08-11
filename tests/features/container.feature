@@ -11,7 +11,11 @@ Feature: container integration — session isolation with a container runtime
     Then the command succeeds
     And the output contains "container: am-my-feature"
     And the session file contains "container"
-    And the mock tmux log contains "send-keys"
+    # The container command is handed to split-window rather than typed into a shell with
+    # send-keys, so an over-width line is never redrawn into the agent pane twice.
+    And the mock tmux log contains "split-window"
+    And the mock tmux log contains "am-my-feature"
+    And the mock tmux log does not contain "send-keys"
 
   Scenario: start with --no-container skips container setup
     When I run "am start my-feature --no-container"

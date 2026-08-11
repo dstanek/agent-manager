@@ -231,14 +231,8 @@ fn cmd_start(
     if let Some(container) = &mut session_container {
         container.container_name = Some(container_name.clone());
     }
-    // Pane assignment: split-window creates a new pane at index 1.
-    // PaneSide::Right: agent in new pane (1), shell in original (0).
-    // PaneSide::Left:  agent in original pane (0), shell in new pane (1).
-    // The -p percent controls the size of the new pane.
-    let (agent_pane_idx, shell_pane_idx, new_pane_percent) = match cfg.tmux.agent_pane {
-        config::PaneSide::Right => (1usize, 0usize, cfg.tmux.split_percent),
-        config::PaneSide::Left => (0usize, 1usize, 100 - cfg.tmux.split_percent),
-    };
+    // The -p percent always describes the new pane, which is always the agent's.
+    let (agent_pane_idx, shell_pane_idx, split_before) = pane_layout(&cfg.tmux.agent_pane);
 
     let tmux_window_id = if tmux::is_in_tmux() {
         // Create a dedicated window for the session instead of commandeering the
@@ -254,24 +248,23 @@ fn cmd_start(
                 .collect::<Vec<_>>()
                 .join(" ")
         });
-        let split_shell_cmd =
-            split_window_shell_cmd(container_shell_cmd.as_deref(), agent_pane_idx);
         tmux::split_window(
             &window_id,
             &worktree_path,
             &cfg.tmux.split,
-            new_pane_percent,
-            split_shell_cmd,
+            cfg.tmux.split_percent,
+            split_before,
+            container_shell_cmd.as_deref(),
         )
         .with_context(|| {
             format!("tmux split failed — run 'am destroy --force {slug}' to clean up")
         })?;
-        if let Some(ref cmd) = container_shell_cmd {
-            if split_shell_cmd.is_none() {
-                tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), cmd)?;
+        // A container command was exec'd by the split above. A host-side agent is short
+        // enough to type, and typing it leaves a shell behind when the agent exits.
+        if container_shell_cmd.is_none() {
+            if let Some(ref agent) = effective_agent {
+                tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), agent)?;
             }
-        } else if let Some(ref agent) = effective_agent {
-            tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), agent)?;
         }
         // Both panes already open in the worktree (via `new-window -c`), so no cd
         // is needed. Keep focus on the shell pane.
@@ -809,15 +802,13 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
-        let (agent_pane_idx, shell_pane_idx, new_pane_percent) = match cfg.tmux.agent_pane {
-            config::PaneSide::Right => (1usize, 0usize, cfg.tmux.split_percent),
-            config::PaneSide::Left => (0usize, 1usize, 100 - cfg.tmux.split_percent),
-        };
+        let (agent_pane_idx, shell_pane_idx, split_before) = pane_layout(&cfg.tmux.agent_pane);
         tmux::split_window(
             &window_id,
             &s.vcs.worktree_path,
             &cfg.tmux.split,
-            new_pane_percent,
+            cfg.tmux.split_percent,
+            split_before,
             None,
         )?;
         tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
@@ -1107,17 +1098,20 @@ fn cd_cmd(path: &std::path::Path) -> String {
     format!("cd '{escaped}'")
 }
 
-
-/// `tmux split-window [shell-command]` runs the command in the newly created pane.
-/// Only attach the container command there when the agent pane is that new pane.
-fn split_window_shell_cmd(
-    container_shell_cmd: Option<&str>,
-    agent_pane_idx: usize,
-) -> Option<&str> {
-    if agent_pane_idx == 1 {
-        container_shell_cmd
-    } else {
-        None
+/// Map the configured agent side onto `(agent_pane_idx, shell_pane_idx, split_before)`.
+///
+/// The agent is *always* the pane `split-window` creates, so tmux can exec the container
+/// command in it directly. The alternative — leaving the agent in the window's original
+/// pane and typing the command in with send-keys — makes an interactive shell redraw a
+/// several-hundred-character line, which renders it twice and drops the whole `podman run`
+/// invocation into the user's shell history.
+///
+/// `-b` inserts the new pane before the existing one, which puts it left (horizontal split)
+/// or above (vertical) *and* makes it pane index 0.
+fn pane_layout(agent_pane: &config::PaneSide) -> (usize, usize, bool) {
+    match agent_pane {
+        config::PaneSide::Right => (1, 0, false),
+        config::PaneSide::Left => (0, 1, true),
     }
 }
 
@@ -1155,20 +1149,19 @@ fn find_repo_root() -> anyhow::Result<(PathBuf, config::Vcs)> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_window_shell_cmd;
+    use super::pane_layout;
     use crate::command::shell_quote;
+    use crate::config::PaneSide;
 
     #[test]
-    fn split_window_shell_cmd_used_when_agent_is_new_pane() {
-        assert_eq!(
-            split_window_shell_cmd(Some("podman run image"), 1),
-            Some("podman run image")
-        );
+    fn pane_layout_puts_agent_in_the_new_pane_on_the_right() {
+        assert_eq!(pane_layout(&PaneSide::Right), (1, 0, false));
     }
 
     #[test]
-    fn split_window_shell_cmd_not_used_when_agent_is_original_pane() {
-        assert_eq!(split_window_shell_cmd(Some("podman run image"), 0), None);
+    fn pane_layout_puts_agent_in_the_new_pane_on_the_left() {
+        // -b, so the new pane is inserted first and becomes index 0.
+        assert_eq!(pane_layout(&PaneSide::Left), (0, 1, true));
     }
 
     #[test]
