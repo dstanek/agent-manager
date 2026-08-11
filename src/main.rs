@@ -1,4 +1,5 @@
 mod cli;
+mod color;
 mod command;
 mod config;
 mod container;
@@ -30,7 +31,7 @@ fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = run(cli) {
-        eprintln!("error: {e}");
+        eprintln!("{} {e}", error_prefix());
         std::process::exit(1);
     }
 }
@@ -91,8 +92,9 @@ fn cmd_init() -> anyhow::Result<()> {
         .any(|l| l.trim() == ".am/" || l.trim() == ".am");
     if has_old_am_entry {
         println!(
-            "Note: .am/ is in .gitignore; .am/config.toml is now committable — \
-             you may want to narrow this to .am/worktrees/"
+            "{} .am/ is in .gitignore; .am/config.toml is now committable — \
+             you may want to narrow this to .am/worktrees/",
+            note_prefix()
         );
     }
 
@@ -132,7 +134,7 @@ fn cmd_start(
     // Migration: transparently move old per-repo sessions to the global store.
     // Ignore migration errors — they are warnings, not blockers.
     if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("warning: session migration failed: {e}");
+        eprintln!("{} session migration failed: {e}", warning_prefix());
     }
 
     let sessions = session::load_sessions_for_repo(&repo_root)?;
@@ -271,7 +273,7 @@ fn cmd_start(
         tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
         Some(window_id)
     } else if container_cmd.is_none() {
-        println!("Note: not inside tmux — no window opened. Run 'am attach {slug}' from inside tmux to open one.");
+        println!("{} not inside tmux — no window opened. Run 'am attach {slug}' from inside tmux to open one.", note_prefix());
         None
     } else {
         None
@@ -641,7 +643,7 @@ fn cmd_list_repo() -> anyhow::Result<()> {
 
     // Migration: transparently move old per-repo sessions to the global store.
     if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("warning: session migration failed: {e}");
+        eprintln!("{} session migration failed: {e}", warning_prefix());
     }
 
     let sessions = session::load_sessions_for_repo(&repo_root)?;
@@ -776,7 +778,7 @@ fn cmd_list_all() -> anyhow::Result<()> {
 fn cmd_attach(slug: &str) -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
     if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("warning: session migration failed: {e}");
+        eprintln!("{} session migration failed: {e}", warning_prefix());
     }
     let sessions = session::load_sessions_for_repo(&repo_root)?;
 
@@ -831,7 +833,7 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
 fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
     if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("warning: session migration failed: {e}");
+        eprintln!("{} session migration failed: {e}", warning_prefix());
     }
     let sessions = session::load_sessions_for_repo(&repo_root)?;
 
@@ -853,7 +855,7 @@ fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
 fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Result<()> {
     let (repo_root, vcs) = find_repo_root()?;
     if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("warning: session migration failed: {e}");
+        eprintln!("{} session migration failed: {e}", warning_prefix());
     }
     let sessions = session::load_sessions_for_repo(&repo_root)?;
 
@@ -920,7 +922,7 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
     };
     if let Err(e) = remove_result {
         if force {
-            eprintln!("warning: could not fully remove worktree: {e}");
+            eprintln!("{} could not fully remove worktree: {e}", warning_prefix());
         } else {
             return Err(e.context(
                 "worktree removal failed; session record preserved. \
@@ -948,7 +950,7 @@ fn cmd_doctor(agent_flag: Option<&str>) -> anyhow::Result<()> {
         repo.as_ref().map(|(root, vcs)| (root.as_path(), vcs.clone())),
         agent_flag,
     );
-    print!("{}", report.render());
+    print!("{}", report.render(color::enabled(color::Stream::Stdout)));
     if report.failures() > 0 {
         std::process::exit(1);
     }
@@ -972,7 +974,7 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
             Ok((root, _)) => {
                 // We're inside a repo. Check if slug matches this repo.
                 if let Err(e) = session::migrate_sessions(&root) {
-                    eprintln!("warning: session migration failed: {e}");
+                    eprintln!("{} session migration failed: {e}", warning_prefix());
                 }
                 let all = session::load_all_sessions()?;
                 let for_this_repo: Vec<_> = all
@@ -1059,10 +1061,10 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
         if let Ok(rt) = container::detect_runtime(pref) {
             let container_name = sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
             if let Err(e) = container::stop_container(&rt, container_name) {
-                eprintln!("warning: container cleanup failed: {e}");
+                eprintln!("{} container cleanup failed: {e}", warning_prefix());
             }
             if let Err(e) = container::remove_container(&rt, container_name) {
-                eprintln!("warning: container cleanup failed: {e}");
+                eprintln!("{} container cleanup failed: {e}", warning_prefix());
             }
         }
     }
@@ -1070,7 +1072,7 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
     // Best-effort tmux cleanup.
     let window_target = s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window);
     if let Err(e) = tmux::kill_window(window_target) {
-        eprintln!("warning: tmux cleanup failed: {e}");
+        eprintln!("{} tmux cleanup failed: {e}", warning_prefix());
     }
 
     // Remove the record from the global store.
@@ -1127,9 +1129,37 @@ fn load_config(repo_root: &Path) -> anyhow::Result<config::Config> {
         Some(&project_config_path),
     )?;
     for unknown in &cfg.unknown_keys {
-        eprintln!("warning: unknown config key {unknown}");
+        eprintln!("{} unknown config key {unknown}", warning_prefix());
     }
     Ok(cfg)
+}
+
+/// The `error:` prefix, red on a terminal. Color goes on the label alone, never the
+/// message: the words have to survive being piped into a log.
+fn error_prefix() -> String {
+    color::paint(
+        "error:",
+        color::Color::Red,
+        color::enabled(color::Stream::Stderr),
+    )
+}
+
+/// The `warning:` prefix, yellow on a terminal.
+fn warning_prefix() -> String {
+    color::paint(
+        "warning:",
+        color::Color::Yellow,
+        color::enabled(color::Stream::Stderr),
+    )
+}
+
+/// The `Note:` prefix, yellow on a terminal. Goes to stdout, unlike the other two.
+fn note_prefix() -> String {
+    color::paint(
+        "Note:",
+        color::Color::Yellow,
+        color::enabled(color::Stream::Stdout),
+    )
 }
 
 fn read_git_config(key: &str) -> Option<String> {
