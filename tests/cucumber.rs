@@ -490,6 +490,17 @@ async fn given_file_without_trailing_newline(
     fs::write(&path, &content).unwrap();
 }
 
+#[given(expr = "a project config containing {string}")]
+async fn given_project_config(world: &mut AmWorld, body: String) {
+    let dir = world.project_path().join(".am");
+    fs::create_dir_all(&dir).unwrap();
+    // Gherkin hands the string over with its escapes intact: newlines arrive as a
+    // literal backslash-n, and the quotes TOML needs as backslash-quote. Both have to
+    // be unescaped or the file is written with backslashes in it and fails to parse.
+    let content = body.replace("\\n", "\n").replace("\\\"", "\"");
+    fs::write(dir.join("config.toml"), content).unwrap();
+}
+
 #[given(expr = "I have set env {string} to {string}")]
 async fn given_env_var(world: &mut AmWorld, key: String, value: String) {
     world.extra_env.push((key, value));

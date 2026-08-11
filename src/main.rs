@@ -145,12 +145,7 @@ fn cmd_start(
     let container_name = container_name(&repo_root, slug);
 
     // Load config
-    let project_config_path = repo_root.join(".am").join("config.toml");
-    let cfg = config::load_with_global(
-        config::global_config_path().as_deref(),
-        Some(&project_config_path),
-    )?;
-    warn_unknown_keys(&cfg);
+    let cfg = load_config(&repo_root)?;
 
     // Effective agent: --agent flag > config.agent
     let effective_agent = agent_flag.map(str::to_string).or_else(|| cfg.agent.clone());
@@ -798,11 +793,7 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
 
     // Try to switch to an existing window; if it's not there, create it.
     if tmux::select_window(window_target).is_err() {
-        let project_config_path = repo_root.join(".am").join("config.toml");
-        let cfg = config::load_with_global(
-            config::global_config_path().as_deref(),
-            Some(&project_config_path),
-        )?;
+        let cfg = load_config(&repo_root)?;
         let window_id = tmux::create_window(window_name, &s.vcs.worktree_path)
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
@@ -1119,15 +1110,26 @@ fn split_window_shell_cmd(
     }
 }
 
-/// Warn about config keys `am` does not recognise, one per line.
+/// Load config for a repository, warning about keys `am` does not recognise.
+///
+/// The only way commands should load config. Warning was previously bolted onto the one
+/// call site that remembered to ask for it, which left `am attach` reading the same files
+/// in silence — and a rule that holds for some commands and not others is worse than no
+/// rule, because the silence reads as approval.
 ///
 /// A typo is otherwise invisible: the key parses, is discarded, and the setting the user
-/// thought they made simply never happens. `am doctor` reports the same list as a check;
-/// this is for the commands where nobody is running doctor.
-fn warn_unknown_keys(cfg: &config::Config) {
+/// believes they made never happens. `am doctor` reports the same keys as a check, with
+/// the offending file named; this is for the commands where nobody is running doctor.
+fn load_config(repo_root: &Path) -> anyhow::Result<config::Config> {
+    let project_config_path = repo_root.join(".am").join("config.toml");
+    let cfg = config::load_with_global(
+        config::global_config_path().as_deref(),
+        Some(&project_config_path),
+    )?;
     for unknown in &cfg.unknown_keys {
         eprintln!("warning: unknown config key {unknown}");
     }
+    Ok(cfg)
 }
 
 fn read_git_config(key: &str) -> Option<String> {
