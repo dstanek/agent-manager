@@ -168,6 +168,9 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
     let cfg = check_config(&mut report, repo_root);
 
     if let Some(root) = repo_root {
+        if let Ok(cwd) = std::env::current_dir() {
+            check_shadowed_config(&mut report, &cwd, root);
+        }
         check_project_setup(&mut report, root, &cfg);
     }
     check_tmux(&mut report);
@@ -265,6 +268,36 @@ fn check_config(report: &mut Report, repo_root: Option<&Path>) -> Config {
 
 fn effective_agent(agent_flag: Option<&str>, cfg: &Config) -> Option<String> {
     agent_flag.map(str::to_string).or_else(|| cfg.agent.clone())
+}
+
+/// Warn about a project config sitting between the current directory and the repo root.
+///
+/// `.am/config.toml` is meant to be committed, so a copy appears in every session
+/// worktree — but `find_repo_root` deliberately walks past worktrees and jj workspaces
+/// to the main repository, and only that copy is ever read. Editing the file in front of
+/// you therefore does nothing at all, with no indication of why. Naming both paths is the
+/// whole fix: the file that is ignored, and the one to edit instead.
+fn check_shadowed_config(report: &mut Report, cwd: &Path, repo_root: &Path) {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d == repo_root {
+            return;
+        }
+        let shadowed = d.join(".am").join("config.toml");
+        if shadowed.exists() {
+            report.checks.push(Check::warn(
+                PROJECT,
+                "shadowed config",
+                format!("{} is never read", shadowed.display()),
+                format!(
+                    "am uses the repository root's config — edit {} instead",
+                    repo_root.join(".am").join("config.toml").display()
+                ),
+            ));
+            return;
+        }
+        dir = d.parent();
+    }
 }
 
 fn check_repository<'a>(report: &mut Report, repo: Option<(&'a Path, Vcs)>) -> Option<&'a Path> {
@@ -764,6 +797,56 @@ mod tests {
             check.hint.is_some(),
             "a failing config check must say what to do about it"
         );
+    }
+
+    #[test]
+    fn shadowed_config_in_a_worktree_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path();
+        let worktree = repo_root.join(".am").join("worktrees").join("feat");
+        std::fs::create_dir_all(worktree.join(".am")).unwrap();
+        let shadowed = worktree.join(".am").join("config.toml");
+        std::fs::write(&shadowed, "[defaults]\nagent = \"claude\"\n").unwrap();
+
+        let mut report = Report::default();
+        check_shadowed_config(&mut report, &worktree, repo_root);
+
+        let check = find(&report, "shadowed config");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains(&shadowed.display().to_string()));
+        // The hint has to name the file that *is* read, or the user is left guessing.
+        assert!(check
+            .hint
+            .unwrap()
+            .contains(&repo_root.join(".am").join("config.toml").display().to_string()));
+    }
+
+    #[test]
+    fn no_shadowed_config_warning_at_the_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        std::fs::write(
+            tmp.path().join(".am").join("config.toml"),
+            "[defaults]\nagent = \"claude\"\n",
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        check_shadowed_config(&mut report, tmp.path(), tmp.path());
+
+        assert!(!has(&report, "shadowed config"));
+    }
+
+    #[test]
+    fn no_shadowed_config_warning_for_an_ordinary_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("src").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut report = Report::default();
+        check_shadowed_config(&mut report, &sub, tmp.path());
+
+        assert!(!has(&report, "shadowed config"));
     }
 
     #[test]
