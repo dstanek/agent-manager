@@ -652,6 +652,19 @@ async fn then_tmux_log_contains(world: &mut AmWorld, text: String) {
     );
 }
 
+#[then(expr = "the mock tmux log does not contain {string}")]
+async fn then_tmux_log_does_not_contain(world: &mut AmWorld, text: String) {
+    let log = world
+        .mock_tmux_log
+        .as_ref()
+        .expect("mock tmux was not set up for this scenario");
+    let content = fs::read_to_string(log).unwrap_or_default();
+    assert!(
+        !content.contains(&text),
+        "expected tmux log to NOT contain {text:?}\ngot:\n{content}",
+    );
+}
+
 #[then(expr = "the mock podman log contains {string}")]
 async fn then_podman_log_contains(world: &mut AmWorld, text: String) {
     let log = world
