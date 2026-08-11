@@ -86,6 +86,8 @@ For other trailer types (autonomous, review), see `docs/reference/commit-trailer
 
 ## Key Reference Files
 
-- `SPEC.md` — full technical specification
-- `PLAN.md` — implementation status
-- `config.md` — configuration reference
+- `specs/` — per-feature specs; each large feature gets one. Start here for design intent
+- `BACKLOG.md` — feature status and what is left to do
+- `docs/reference/configuration.md` — configuration reference
+- `docs/reference/commands.md` — current behaviour of every command
+- `PLAN.md` — the one-time bootstrap plan, kept as history. Not maintained; do not trust it for current behaviour

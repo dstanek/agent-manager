@@ -11,6 +11,19 @@ Each feature follows this loop — repeat until the user signs off:
 
 Mark sub-tasks `[x]` as completed. Mark the feature header `[x]` only after the user approves the UX review.
 
+## Status: historical
+
+This is the one-time plan that bootstrapped the project, kept as a record of how
+`am` was built. It is not a live status document and is not updated as the code
+changes — several entries describe behaviour that has since been replaced, most
+visibly the session registry, which moved out of the repository to a per-user
+store at `$XDG_STATE_HOME/am/sessions.json`.
+
+Work since the bootstrap is specced per feature in [`specs/`](specs/), tracked in
+[`BACKLOG.md`](BACKLOG.md), and documented in [`docs/`](docs/). For how any command
+behaves today, read [`docs/reference/commands.md`](docs/reference/commands.md) —
+not this file.
+
 ---
 
 ## Feature 0: Foundation
