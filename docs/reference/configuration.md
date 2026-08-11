@@ -75,7 +75,6 @@ Environment variables override both the global and project configs and are usefu
 | `AM_CONTAINER_ENABLED` | `container.enabled` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_CONTAINER_ENABLED=false` |
 | `AM_CONTAINER_MODE` | `container.mode` | `image`, `devcontainer`, `auto` | `AM_CONTAINER_MODE=devcontainer` |
 | `AM_CONTAINER_RUNTIME` | `container.runtime` | `auto`, `podman`, `docker` | `AM_CONTAINER_RUNTIME=docker` |
-| `AM_CONTAINER_AGENT` | `container.agent` | known agent name | `AM_CONTAINER_AGENT=claude` |
 | `AM_CONTAINER_IMAGE` | `container.image` | any non-empty string | `AM_CONTAINER_IMAGE=my-image:latest` |
 | `AM_CONTAINER_NETWORK` | `container.network` | `full`, `none` | `AM_CONTAINER_NETWORK=none` |
 | `AM_CONTAINER_USER` | `container.user` | safe username (`[a-z_][a-z0-9_-]*`, error if invalid) | `AM_CONTAINER_USER=am` |
@@ -178,7 +177,6 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | `enabled` | boolean | `true` | Whether to run sessions inside a container | `true`, `false` |
 | `mode` | string | `"auto"` | Where the environment comes from: the repo's own `.devcontainer/devcontainer.json` when one is found, an `am`-resolved image otherwise | `"auto"`, `"devcontainer"`, `"image"` |
 | `runtime` | string | `"auto"` | Container runtime to use; `"auto"` tries Podman first, then Docker | `"auto"`, `"podman"`, `"docker"` |
-| `agent` | string | `""` | Agent to run inside the container; overrides `defaults.agent` when container mode is active | Any known agent name, e.g. `"claude"` |
 | `image` | string | `""` | Override image for all agents; takes priority over `[agents.<name>].image`; leave unset to use the per-agent default | Any valid image reference |
 | `network` | string | `"full"` | Network access mode for the container | `"full"` (unrestricted internet access), `"none"` (no network) |
 | `env` | list of strings | `[]` | Extra environment variables passed into the container from the host shell | e.g. `["ANTHROPIC_API_KEY", "FOO=bar"]` |

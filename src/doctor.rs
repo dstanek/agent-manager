@@ -191,10 +191,7 @@ fn load_config(repo_root: Option<&Path>) -> Config {
 }
 
 fn effective_agent(agent_flag: Option<&str>, cfg: &Config) -> Option<String> {
-    agent_flag
-        .map(str::to_string)
-        .or_else(|| cfg.container.agent.clone())
-        .or_else(|| cfg.agent.clone())
+    agent_flag.map(str::to_string).or_else(|| cfg.agent.clone())
 }
 
 fn check_repository<'a>(report: &mut Report, repo: Option<(&'a Path, Vcs)>) -> Option<&'a Path> {

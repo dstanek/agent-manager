@@ -151,11 +151,8 @@ fn cmd_start(
         Some(&project_config_path),
     )?;
 
-    // Effective agent: --agent flag > config.container.agent > config.agent
-    let effective_agent = agent_flag
-        .map(str::to_string)
-        .or_else(|| cfg.container.agent.clone())
-        .or_else(|| cfg.agent.clone());
+    // Effective agent: --agent flag > config.agent
+    let effective_agent = agent_flag.map(str::to_string).or_else(|| cfg.agent.clone());
 
     // ── Early validation (fail before any side effects) ───────────────────────
 
