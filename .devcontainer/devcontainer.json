@@ -56,6 +56,13 @@
     "source=/run/user/1000/podman/podman.sock,target=/var/run/docker-host.sock,type=bind"
   ],
 
+  // Run tini as PID 1 so orphaned processes get reaped. Without it PID 1 is the
+  // agent itself, which only waits on children it spawned — anything re-parented
+  // to it stays a zombie holding a PID slot. git's auto-gc detaches into the
+  // background on purpose, so a session doing ordinary git work leaks PIDs until
+  // fork() starts failing with EAGAIN.
+  "init": true,
+
   // Installed here rather than in the Dockerfile because the Node feature is
   // layered on after it. The package is a single dependency-free script, so the
   // reinstall this incurs on each `am start` costs a second or so.
