@@ -11,12 +11,20 @@ mod tmux;
 mod worktree;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use clap::Parser;
 use cli::{Cli, Commands, SessionCommands};
 use command::shell_quote;
+
+/// Build a stable, globally unique container name from a repo and session slug.
+fn container_name(repo_root: &Path, slug: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(repo_root.as_os_str().as_encoded_bytes());
+    let prefix: String = hash.iter().take(3).map(|b| format!("{b:02x}")).collect();
+    format!("am-{slug}-{prefix}")
+}
 
 fn main() {
     let cli = Cli::parse();
@@ -129,9 +137,12 @@ fn cmd_start(
 
     let sessions = session::load_sessions_for_repo(&repo_root)?;
 
-    if session::find_session(&sessions, slug).is_some() {
+    if sessions.iter().any(|s| s.slug == slug) {
         return Err(error::AmError::SlugAlreadyExists(slug.to_string()).into());
     }
+
+    let window_name = format!("am-{slug}");
+    let container_name = container_name(&repo_root, slug);
 
     // Load config
     let project_config_path = repo_root.join(".am").join("config.toml");
@@ -184,7 +195,7 @@ fn cmd_start(
             container::validate_agent_credentials(agent)?;
         }
         // Pre-emptively remove any leftover container from a previous run
-        container::remove_if_exists(&runtime, &format!("am-{slug}"));
+        container::remove_if_exists(&runtime, &container_name);
         Some(runtime)
     } else {
         None
@@ -198,7 +209,7 @@ fn cmd_start(
     let worktree_path = guard.path().to_path_buf();
 
     // ── Post-worktree preflight: the devcontainer config, if any ──────────────
-    let (container_cmd, session_container) = match runtime {
+    let (container_cmd, mut session_container) = match runtime {
         Some(ref runtime) => {
             let plan = plan_container(ContainerPlanInput {
                 slug,
@@ -211,13 +222,15 @@ fn cmd_start(
                 agent_name: effective_agent.as_deref(),
                 auto,
                 rebuild,
+                container_name: &container_name,
             })?;
             (Some(plan.cmd), Some(plan.session))
         }
         None => (None, None),
     };
-    let window_name = format!("am-{slug}");
-
+    if let Some(container) = &mut session_container {
+        container.container_name = Some(container_name.clone());
+    }
     // Pane assignment: split-window creates a new pane at index 1.
     // PaneSide::Right: agent in new pane (1), shell in original (0).
     // PaneSide::Left:  agent in original pane (0), shell in new pane (1).
@@ -227,11 +240,11 @@ fn cmd_start(
         config::PaneSide::Left => (0usize, 1usize, 100 - cfg.tmux.split_percent),
     };
 
-    if tmux::is_in_tmux() {
+    let tmux_window_id = if tmux::is_in_tmux() {
         // Create a dedicated window for the session instead of commandeering the
         // caller's current window. `new-window` opens both panes in the worktree
         // and switches focus to the new window automatically.
-        tmux::create_window(&window_name, &worktree_path)
+        let window_id = tmux::create_window(&window_name, &worktree_path)
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
@@ -244,7 +257,7 @@ fn cmd_start(
         let split_shell_cmd =
             split_window_shell_cmd(container_shell_cmd.as_deref(), agent_pane_idx);
         tmux::split_window(
-            &window_name,
+            &window_id,
             &worktree_path,
             &cfg.tmux.split,
             new_pane_percent,
@@ -255,17 +268,21 @@ fn cmd_start(
         })?;
         if let Some(ref cmd) = container_shell_cmd {
             if split_shell_cmd.is_none() {
-                tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), cmd)?;
+                tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), cmd)?;
             }
         } else if let Some(ref agent) = effective_agent {
-            tmux::send_keys(&tmux::get_pane_id(&window_name, agent_pane_idx), agent)?;
+            tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), agent)?;
         }
         // Both panes already open in the worktree (via `new-window -c`), so no cd
         // is needed. Keep focus on the shell pane.
-        tmux::select_pane(&tmux::get_pane_id(&window_name, shell_pane_idx))?;
+        tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
+        Some(window_id)
     } else if container_cmd.is_none() {
         println!("Note: not inside tmux — no window opened. Run 'am attach {slug}' from inside tmux to open one.");
-    }
+        None
+    } else {
+        None
+    };
 
     let new_session = session::Session {
         slug: slug.to_string(),
@@ -277,9 +294,10 @@ fn cmd_start(
             worktree_path: worktree_path.clone(),
         },
         tmux: session::TmuxMetadata {
-            tmux_window: window_name,
-            agent_pane: tmux::get_pane_id(&format!("am-{slug}"), agent_pane_idx),
-            shell_pane: tmux::get_pane_id(&format!("am-{slug}"), shell_pane_idx),
+            tmux_window: window_name.clone(),
+            tmux_window_id: tmux_window_id.clone(),
+            agent_pane: tmux::get_pane_id(tmux_window_id.as_deref().unwrap_or(&window_name), agent_pane_idx),
+            shell_pane: tmux::get_pane_id(tmux_window_id.as_deref().unwrap_or(&window_name), shell_pane_idx),
             // Sessions now own a dedicated window; there is no prior window state
             // to restore on destroy. These remain for compatibility with records
             // written by older versions of `am`.
@@ -298,7 +316,7 @@ fn cmd_start(
             guard.commit();
             println!("Started session '{slug}'");
             println!("  worktree:  {}", worktree_path.display());
-            println!("  container: am-{slug}");
+            println!("  container: {container_name}");
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -333,7 +351,7 @@ fn cmd_start(
     println!("  worktree:  {}", worktree_path.display());
     println!("  branch:    am/{slug}");
     if let Some((mode, image)) = mode {
-        println!("  container: am-{slug}");
+        println!("  container: {container_name}");
         if mode == session::ContainerMode::Devcontainer {
             println!("  image:     {image} (from devcontainer.json)");
         }
@@ -356,6 +374,7 @@ struct ContainerPlanInput<'a> {
     agent_name: Option<&'a str>,
     auto: bool,
     rebuild: bool,
+    container_name: &'a str,
 }
 
 struct ContainerPlan {
@@ -377,6 +396,7 @@ fn plan_container(input: ContainerPlanInput) -> anyhow::Result<ContainerPlan> {
         agent_name,
         auto,
         rebuild,
+        container_name,
     } = input;
 
     // Discovery is relative to the worktree: the config is a checked-in, branch-specific
@@ -402,8 +422,10 @@ fn plan_container(input: ContainerPlanInput) -> anyhow::Result<ContainerPlan> {
     match config_path {
         Some(path) => plan_devcontainer(
             slug, repo_root, worktree, vcs, cfg, runtime, agent, agent_name, auto, rebuild, &path,
+            container_name,
         ),
-        None => plan_image(slug, repo_root, vcs, cfg, runtime, agent, agent_name, auto),
+        None => plan_image(slug, repo_root, vcs, cfg, runtime, agent, agent_name, auto,
+            container_name),
     }
 }
 
@@ -418,6 +440,7 @@ fn plan_image(
     agent: Option<container::KnownAgent>,
     agent_name: Option<&str>,
     auto: bool,
+    container_name: &str,
 ) -> anyhow::Result<ContainerPlan> {
     let image = config::resolve_image(agent_name, cfg)
         .ok_or(error::AmError::ContainerImageNotConfigured)?;
@@ -443,7 +466,7 @@ fn plan_image(
         &cfg.container.env,
         &agent_auth.env,
         &cfg.container.network,
-        &format!("am-{slug}"),
+        container_name,
         &container::DevcontainerRuntime::default(),
     );
     cmd.extend(agent_command(agent, auto));
@@ -471,6 +494,7 @@ fn plan_devcontainer(
     auto: bool,
     rebuild: bool,
     config_path: &std::path::Path,
+    container_name: &str,
 ) -> anyhow::Result<ContainerPlan> {
     let json = devcontainer::parse_config(config_path)?;
     devcontainer::check_supported(&json)?;
@@ -539,7 +563,7 @@ fn plan_devcontainer(
         &cfg.container.env,
         &agent_auth.env,
         &cfg.container.network,
-        &format!("am-{slug}"),
+        container_name,
         &trusted,
     );
     // Feature entrypoints and lifecycle hooks must run before the agent, and am overrides
@@ -558,6 +582,7 @@ fn plan_devcontainer(
         session: session::SessionContainer {
             runtime: runtime.kind.to_string(),
             image,
+            container_name: None,
             container_id: None,
             mode: session::ContainerMode::Devcontainer,
             config_path: Some(config_path.to_path_buf()),
@@ -762,39 +787,45 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
     }
     let sessions = session::load_sessions_for_repo(&repo_root)?;
 
-    let s = session::find_session(&sessions, slug)
-        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?;
+    let mut s = session::find_session(&sessions, slug)
+        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?
+        .clone();
 
     if !tmux::is_in_tmux() {
         return Err(error::AmError::NotInTmux.into());
     }
 
-    let window_name = format!("am-{slug}");
+    let window_name = &s.tmux.tmux_window;
+    let window_target = s.tmux.tmux_window_id.as_deref().unwrap_or(window_name);
 
     // Try to switch to an existing window; if it's not there, create it.
-    if tmux::select_window(&window_name).is_err() {
+    if tmux::select_window(window_target).is_err() {
         let project_config_path = repo_root.join(".am").join("config.toml");
         let cfg = config::load_with_global(
             config::global_config_path().as_deref(),
             Some(&project_config_path),
         )?;
-        tmux::create_window(&window_name, &s.vcs.worktree_path)
+        let window_id = tmux::create_window(window_name, &s.vcs.worktree_path)
             .map_err(|e| anyhow::anyhow!(
                 "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
             ))?;
-        let (shell_pane_idx, new_pane_percent) = match cfg.tmux.agent_pane {
-            config::PaneSide::Right => (0usize, cfg.tmux.split_percent),
-            config::PaneSide::Left => (1usize, 100 - cfg.tmux.split_percent),
+        let (agent_pane_idx, shell_pane_idx, new_pane_percent) = match cfg.tmux.agent_pane {
+            config::PaneSide::Right => (1usize, 0usize, cfg.tmux.split_percent),
+            config::PaneSide::Left => (0usize, 1usize, 100 - cfg.tmux.split_percent),
         };
         tmux::split_window(
-            &window_name,
+            &window_id,
             &s.vcs.worktree_path,
             &cfg.tmux.split,
             new_pane_percent,
             None,
         )?;
-        tmux::select_pane(&tmux::get_pane_id(&window_name, shell_pane_idx))?;
-        tmux::select_window(&window_name)?;
+        tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
+        tmux::select_window(&window_id)?;
+        s.tmux.tmux_window_id = Some(window_id.clone());
+        s.tmux.agent_pane = tmux::get_pane_id(&window_id, agent_pane_idx);
+        s.tmux.shell_pane = tmux::get_pane_id(&window_id, shell_pane_idx);
+        session::update_session_global(s.clone())?;
         println!("Opened new window for session '{slug}'.");
         if s.container.is_some() {
             println!("  Note: the container was stopped when the window closed.");
@@ -823,7 +854,7 @@ fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
     }
 
     tmux::send_keys(&s.tmux.agent_pane, agent)?;
-    tmux::select_window(&s.tmux.tmux_window)?;
+    tmux::select_window(s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window))?;
     println!("Launched '{agent}' in session '{slug}'.");
     Ok(())
 }
@@ -866,8 +897,9 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
             _ => config::RuntimePreference::Podman,
         };
         if let Ok(rt) = container::detect_runtime(pref) {
-            let _ = container::stop_container(&rt, &format!("am-{slug}"));
-            let _ = container::remove_container(&rt, &format!("am-{slug}"));
+            let container_name = sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
+            let _ = container::stop_container(&rt, container_name);
+            let _ = container::remove_container(&rt, container_name);
         }
     }
 
@@ -880,11 +912,13 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
             }
             let _ = tmux::kill_pane(&s.tmux.agent_pane);
             if let Some(ref orig) = s.tmux.original_window_name {
-                let _ = tmux::rename_window(Some(&s.tmux.tmux_window), orig);
+                let target = s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window);
+                let _ = tmux::rename_window(Some(target), orig);
             }
         } else {
             // Old-style session: the window was dedicated, kill it entirely.
-            let _ = tmux::kill_window(&s.tmux.tmux_window);
+            let target = s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window);
+            let _ = tmux::kill_window(target);
         }
     }
 
@@ -956,30 +990,28 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
                     .iter()
                     .filter(|s| s.repo_root == root && s.slug == slug)
                     .collect();
-                if !for_this_repo.is_empty() {
-                    // Slug matches current repo — use it.
+                // Look across all repos for this slug.
+                let matching: Vec<_> = all
+                    .iter()
+                    .filter(|s| s.slug == slug)
+                    .collect();
+                if matching.is_empty() {
+                    return Err(error::AmError::SlugNotFound(slug.to_string()).into());
+                } else if matching.len() == 1 {
+                    matching[0].repo_root.clone()
+                } else if !for_this_repo.is_empty() && matching.len() == for_this_repo.len() {
+                    // All matches are in the current repo — no ambiguity.
                     root
                 } else {
-                    // Slug not in current repo; look across all repos.
-                    let matching: Vec<_> = all
+                    let repos: Vec<_> = matching
                         .iter()
-                        .filter(|s| s.slug == slug)
+                        .map(|s| format!("  {}", s.repo_root.display()))
                         .collect();
-                    if matching.is_empty() {
-                        return Err(error::AmError::SlugNotFound(slug.to_string()).into());
-                    } else if matching.len() == 1 {
-                        matching[0].repo_root.clone()
-                    } else {
-                        let repos: Vec<_> = matching
-                            .iter()
-                            .map(|s| format!("  {}", s.repo_root.display()))
-                            .collect();
-                        return Err(anyhow::anyhow!(
-                            "slug '{}' exists in multiple repos:\n{}\nUse --repo <path> to specify which one.",
-                            slug,
-                            repos.join("\n")
-                        ));
-                    }
+                    return Err(anyhow::anyhow!(
+                        "slug '{}' exists in multiple repos:\n{}\nUse --repo <path> to specify which one.",
+                        slug,
+                        repos.join("\n")
+                    ));
                 }
             }
             Err(_) => {
@@ -1036,17 +1068,19 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
             _ => config::RuntimePreference::Podman,
         };
         if let Ok(rt) = container::detect_runtime(pref) {
-            if let Err(e) = container::stop_container(&rt, &format!("am-{slug}")) {
+            let container_name = sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
+            if let Err(e) = container::stop_container(&rt, container_name) {
                 eprintln!("warning: container cleanup failed: {e}");
             }
-            if let Err(e) = container::remove_container(&rt, &format!("am-{slug}")) {
+            if let Err(e) = container::remove_container(&rt, container_name) {
                 eprintln!("warning: container cleanup failed: {e}");
             }
         }
     }
 
     // Best-effort tmux cleanup.
-    if let Err(e) = tmux::kill_window(&s.tmux.tmux_window) {
+    let window_target = s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window);
+    if let Err(e) = tmux::kill_window(window_target) {
         eprintln!("warning: tmux cleanup failed: {e}");
     }
 
@@ -1245,5 +1279,38 @@ mod tests {
             agent_command(Some(KnownAgent::Claude), true),
             vec!["claude", "--dangerously-skip-permissions"]
         );
+    }
+
+    // ── container_name ───────────────────────────────────────────────────────
+
+    use super::container_name;
+    use std::path::Path;
+
+    #[test]
+    fn container_name_includes_a_hash() {
+        let name = container_name(Path::new("/repo-a"), "feat");
+        assert!(name.starts_with("am-feat-"), "expected hash suffix, got: {name}");
+        assert!(name.len() > "am-feat-".len(), "hash suffix should not be empty");
+    }
+
+    #[test]
+    fn container_name_is_deterministic() {
+        let a = container_name(Path::new("/repo-b"), "feat");
+        let b = container_name(Path::new("/repo-b"), "feat");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn container_name_differs_across_repos() {
+        let b = container_name(Path::new("/repo-b"), "feat");
+        let c = container_name(Path::new("/repo-c"), "feat");
+        assert_ne!(b, c);
+    }
+
+    #[test]
+    fn container_name_differs_across_slugs() {
+        let a = container_name(Path::new("/repo-a"), "feat");
+        let b = container_name(Path::new("/repo-a"), "bugfix");
+        assert_ne!(a, b);
     }
 }

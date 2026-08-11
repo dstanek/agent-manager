@@ -45,25 +45,38 @@ fn run_tmux(bin: &Path, args: &[&str]) -> Result<()> {
     command::run_command(&bin.to_string_lossy(), args, AmError::TmuxError)
 }
 
+fn run_tmux_output(bin: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    command::run_built_command_output(cmd, AmError::TmuxError)
+}
+
 /// Returns `true` if the `$TMUX` environment variable is set (i.e. we are
 /// running inside a tmux session).
 pub fn is_in_tmux() -> bool {
     std::env::var("TMUX").is_ok()
 }
 
-/// `tmux new-window -n <window_name> -c <working_dir>`
-pub fn create_window(window_name: &str, working_dir: &Path) -> Result<()> {
+/// Create a window with a human-facing title and return its stable tmux ID.
+pub fn create_window(window_name: &str, working_dir: &Path) -> Result<String> {
     let bin = tmux_bin()?;
-    run_tmux(
+    let id = run_tmux_output(
         &bin,
         &[
             "new-window",
+            "-P",
+            "-F",
+            "#{window_id}",
             "-n",
             window_name,
             "-c",
             &working_dir.to_string_lossy(),
         ],
-    )
+    )?;
+    if id.is_empty() {
+        return Err(AmError::TmuxError("tmux did not return a window ID".to_string()).into());
+    }
+    Ok(id)
 }
 
 /// Split an existing window.
@@ -148,9 +161,9 @@ pub fn rename_window(target: Option<&str>, new_name: &str) -> Result<()> {
     }
 }
 
-/// Returns the pane target string `"<window_name>.<index>"`.
-pub fn get_pane_id(window_name: &str, index: usize) -> String {
-    format!("{window_name}.{index}")
+/// Returns the pane target string `"<window_target>.<index>"`.
+pub fn get_pane_id(window_target: &str, index: usize) -> String {
+    format!("{window_target}.{index}")
 }
 
 #[cfg(test)]
@@ -166,7 +179,7 @@ mod tests {
     /// Write a mock tmux script that appends its args to `$MOCK_TMUX_LOG`.
     fn make_mock_tmux(dir: &Path) -> std::path::PathBuf {
         let script = dir.join("mock_tmux");
-        std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$MOCK_TMUX_LOG\"\n").unwrap();
+        std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$MOCK_TMUX_LOG\"\nif [ \"$1\" = \"new-window\" ]; then echo '@1'; fi\n").unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
@@ -237,7 +250,7 @@ mod tests {
     #[test]
     fn create_window_sends_correct_command() {
         let mock = MockTmux::new();
-        create_window("am-feat", Path::new("/tmp/worktree")).unwrap();
+        assert_eq!(create_window("am-feat", Path::new("/tmp/worktree")).unwrap(), "@1");
         let out = mock.captured();
         assert!(
             out.contains("new-window"),
