@@ -101,6 +101,17 @@ Environment variables override both the global and project configs and are usefu
 !!! note "Mount path customization"
     `AM_CONTAINER_GITCONFIG` and `AM_CONTAINER_SSH` override where `am` looks for your git and SSH configuration on the host. `AM_CONTAINER_USER` changes the username used when constructing mount targets inside the container (e.g. `/home/<user>/.ssh`, `/home/<user>/.gitconfig`) and must be a safe POSIX username. `CLAUDE_CONFIG_DIR` overrides the Claude configuration directory. These are rarely needed unless you have a non-standard directory structure.
 
+### Color
+
+`am` colors status glyphs and the `error:`, `warning:` and `Note:` prefixes when it is writing to a terminal: green for fine, yellow for worth reading, red for something that will stop you. Color is only ever an accent on text that already says the same thing, so nothing is lost without it.
+
+| Variable | Effect |
+|---|---|
+| `NO_COLOR` | Set to any non-empty value to disable color. Wins over everything else. |
+| `CLICOLOR_FORCE` | Set to any non-empty value other than `0` to force color on, even when output is piped — useful for `less -R` or a CI log viewer that renders ANSI. |
+
+Each stream is decided independently, so `am doctor > report.txt` still colors the warnings that go to stderr. Piped output is plain by default.
+
 ### Binary path overrides
 
 These variables redirect `am` to a specific binary instead of searching `PATH`. Useful when a tool is installed in a non-standard location or when you want to pin to a specific version.

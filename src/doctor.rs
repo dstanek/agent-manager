@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use crate::color::{paint, Color};
 use crate::config::{Config, ContainerMode, Vcs};
 use crate::{config, container, devcontainer, tmux};
 
@@ -32,6 +33,14 @@ impl Status {
             Status::Ok => "✓",
             Status::Warn => "!",
             Status::Fail => "✗",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Status::Ok => Color::Green,
+            Status::Warn => Color::Yellow,
+            Status::Fail => Color::Red,
         }
     }
 }
@@ -106,7 +115,12 @@ impl Report {
     }
 
     /// Render for a terminal, grouped by section in the order the checks were added.
-    pub fn render(&self) -> String {
+    ///
+    /// `color` is passed in rather than probed here so rendering stays pure and both forms
+    /// are testable. Only the status glyph is colored: the alignment columns depend on
+    /// the visible width of what precedes them, and ANSI codes have none — coloring the
+    /// name or detail would push every escape sequence into the padding arithmetic.
+    pub fn render(&self, color: bool) -> String {
         let mut out = String::new();
         let mut current_section: Option<&str> = None;
         for check in &self.checks {
@@ -120,7 +134,7 @@ impl Report {
             }
             out.push_str(&format!(
                 "  {} {:<22} {}\n",
-                check.status.glyph(),
+                paint(check.status.glyph(), check.status.color(), color),
                 check.name,
                 check.detail
             ));
@@ -131,17 +145,28 @@ impl Report {
             }
         }
 
+        // The verdict carries the same severity as the worst check, so it takes the same
+        // color — a red summary line is what you see when the report scrolls past.
         let (failures, warnings) = (self.failures(), self.warnings());
         out.push('\n');
         if failures > 0 {
             let noun = if failures == 1 { "problem" } else { "problems" };
-            out.push_str(&format!(
-                "{failures} {noun} will prevent 'am start' from working.\n"
+            out.push_str(&paint(
+                &format!("{failures} {noun} will prevent 'am start' from working."),
+                Color::Red,
+                color,
             ));
+            out.push('\n');
         } else if warnings > 0 {
-            out.push_str("Ready. Some notes above are worth reading.\n");
+            out.push_str(&paint(
+                "Ready. Some notes above are worth reading.",
+                Color::Yellow,
+                color,
+            ));
+            out.push('\n');
         } else {
-            out.push_str("Ready.\n");
+            out.push_str(&paint("Ready.", Color::Green, color));
+            out.push('\n');
         }
         out
     }
@@ -776,6 +801,73 @@ mod tests {
         report.checks.iter().any(|c| c.name == name)
     }
 
+    // ── Color ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_colors_each_status_differently() {
+        let report = Report {
+            checks: vec![
+                Check::ok("S", "fine", "detail"),
+                Check::warn("S", "note", "detail", "hint"),
+                Check::fail("S", "broken", "detail", "hint"),
+            ],
+        };
+        let out = report.render(true);
+
+        assert!(out.contains("\x1b[32m✓\x1b[0m"), "ok should be green");
+        assert!(out.contains("\x1b[33m!\x1b[0m"), "warn should be yellow");
+        assert!(out.contains("\x1b[31m✗\x1b[0m"), "fail should be red");
+    }
+
+    #[test]
+    fn render_without_color_has_no_escape_sequences() {
+        let report = Report {
+            checks: vec![
+                Check::ok("S", "fine", "detail"),
+                Check::fail("S", "broken", "detail", "hint"),
+            ],
+        };
+        let out = report.render(false);
+
+        // Piped output and NO_COLOR users get this form; a stray escape here would end
+        // up in log files and in the cucumber assertions.
+        assert!(!out.contains('\x1b'), "unexpected escape in: {out:?}");
+    }
+
+    #[test]
+    fn color_does_not_disturb_column_alignment() {
+        let report = Report {
+            checks: vec![
+                Check::ok("S", "short", "detail"),
+                Check::fail("S", "short", "detail", "hint"),
+            ],
+        };
+        // The glyph is one visible column wide either way, so the detail column has to
+        // land in the same place with and without color.
+        let plain = report.render(false);
+        let colored = report.render(true).replace('\x1b', "");
+        let strip = |s: String| s.replace("[32m", "").replace("[31m", "").replace("[0m", "");
+        assert_eq!(strip(colored), plain);
+    }
+
+    #[test]
+    fn the_verdict_line_takes_the_worst_severity() {
+        let ready = Report {
+            checks: vec![Check::ok("S", "a", "d")],
+        };
+        assert!(ready.render(true).contains("\x1b[32mReady."));
+
+        let noted = Report {
+            checks: vec![Check::warn("S", "a", "d", "h")],
+        };
+        assert!(noted.render(true).contains("\x1b[33mReady. Some notes"));
+
+        let broken = Report {
+            checks: vec![Check::fail("S", "a", "d", "h")],
+        };
+        assert!(broken.render(true).contains("\x1b[31m1 problem"));
+    }
+
     // ── Config loading ────────────────────────────────────────────────────────
 
     #[test]
@@ -944,7 +1036,7 @@ mod tests {
                 Check::ok("Second", "c", "detail-c"),
             ],
         };
-        let out = report.render();
+        let out = report.render(false);
         assert_eq!(out.matches("First").count(), 1, "section repeated: {out}");
         assert!(out.find("First").unwrap() < out.find("Second").unwrap());
     }
@@ -957,7 +1049,7 @@ mod tests {
                 Check::fail("S", "broken", "nope", "run 'am init'"),
             ],
         };
-        let out = report.render();
+        let out = report.render(false);
         assert!(out.contains("→ run 'am init'"));
         assert_eq!(out.matches('→').count(), 1);
     }
@@ -967,17 +1059,17 @@ mod tests {
         let ready = Report {
             checks: vec![Check::ok("S", "a", "fine")],
         };
-        assert!(ready.render().ends_with("Ready.\n"));
+        assert!(ready.render(false).ends_with("Ready.\n"));
 
         let noted = Report {
             checks: vec![Check::warn("S", "a", "hmm", "note")],
         };
-        assert!(noted.render().contains("worth reading"));
+        assert!(noted.render(false).contains("worth reading"));
 
         let broken = Report {
             checks: vec![Check::fail("S", "a", "no", "fix")],
         };
-        assert!(broken.render().contains("prevent 'am start'"));
+        assert!(broken.render(false).contains("prevent 'am start'"));
     }
 
     // ── Repository ────────────────────────────────────────────────────────────
