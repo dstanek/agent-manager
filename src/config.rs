@@ -1184,6 +1184,9 @@ env = ["--rm"]
 
     #[test]
     fn split_percent_out_of_range_in_toml_fails() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::remove_var("AM_TMUX_SPLIT_PERCENT");
         let tmp = TempDir::new().unwrap();
         let project = write_toml(
             tmp.path(),
@@ -1202,6 +1205,9 @@ split_percent = 100
 
     #[test]
     fn split_percent_zero_in_toml_fails() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
+        std::env::remove_var("AM_TMUX_SPLIT_PERCENT");
         let tmp = TempDir::new().unwrap();
         let project = write_toml(
             tmp.path(),
