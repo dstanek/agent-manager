@@ -57,6 +57,20 @@ Selecting the agent also selects the container image — `am` ships with built-i
 
 ---
 
+## Unrecognised keys
+
+A key `am` does not know is a warning, not an error. The file still loads and every key `am` does recognise still applies:
+
+```
+warning: unknown config key defaults.agnet in /home/you/src/project/.am/config.toml
+```
+
+`am doctor` reports the same keys as a check, grouped by the file each came from.
+
+The keys are not rejected outright because `.am/config.toml` is meant to be committed and shared. A hard error would mean a config written against a newer `am` breaks for a teammate running an older one — so an unrecognised key is reported and ignored instead. The cost of that choice is that a typo does nothing silently until you read the warning, which is exactly what the warning is for.
+
+---
+
 ## Environment variables
 
 Environment variables override both the global and project configs and are useful for CI pipelines, Docker-in-Docker setups, or temporary one-off overrides without editing any files.

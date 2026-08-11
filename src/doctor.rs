@@ -194,9 +194,35 @@ fn check_config(report: &mut Report, repo_root: Option<&Path>) -> Config {
     let project = repo_root.map(|r| r.join(".am").join("config.toml"));
     match config::load_with_global(config::global_config_path().as_deref(), project.as_deref()) {
         Ok(cfg) => {
-            report
-                .checks
-                .push(Check::ok(PROJECT, "config", "loaded"));
+            if cfg.unknown_keys.is_empty() {
+                report.checks.push(Check::ok(PROJECT, "config", "loaded"));
+            } else {
+                // Named individually: "3 unknown keys" tells the user they have a
+                // problem without telling them where, which is the part that is hard
+                // to work out from a file they believe is correct. Grouped by file so
+                // the path is not repeated once per key — with two config files in
+                // play, which file a key came from is the whole question.
+                let mut groups: Vec<(&Path, Vec<&str>)> = Vec::new();
+                for unknown in &cfg.unknown_keys {
+                    match groups.last_mut() {
+                        Some((file, keys)) if *file == unknown.file => {
+                            keys.push(&unknown.key)
+                        }
+                        _ => groups.push((&unknown.file, vec![&unknown.key])),
+                    }
+                }
+                let list = groups
+                    .iter()
+                    .map(|(file, keys)| format!("{} in {}", keys.join(", "), file.display()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                report.checks.push(Check::warn(
+                    PROJECT,
+                    "config",
+                    format!("loaded, with unrecognised keys: {list}"),
+                    "remove them or correct the spelling — they have no effect",
+                ));
+            }
             cfg
         }
         Err(e) => {
@@ -713,6 +739,28 @@ mod tests {
         assert!(
             check.hint.is_some(),
             "a failing config check must say what to do about it"
+        );
+    }
+
+    #[test]
+    fn config_check_warns_about_unrecognised_keys() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        std::fs::write(
+            tmp.path().join(".am").join("config.toml"),
+            "[defaults]\nagnet = \"claude\"\n",
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        check_config(&mut report, Some(tmp.path()));
+
+        let check = find(&report, "config");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.detail.contains("defaults.agnet"),
+            "the offending key must be named, got: {}",
+            check.detail
         );
     }
 

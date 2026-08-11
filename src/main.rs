@@ -150,6 +150,7 @@ fn cmd_start(
         config::global_config_path().as_deref(),
         Some(&project_config_path),
     )?;
+    warn_unknown_keys(&cfg);
 
     // Effective agent: --agent flag > config.agent
     let effective_agent = agent_flag.map(str::to_string).or_else(|| cfg.agent.clone());
@@ -1115,6 +1116,17 @@ fn split_window_shell_cmd(
         container_shell_cmd
     } else {
         None
+    }
+}
+
+/// Warn about config keys `am` does not recognise, one per line.
+///
+/// A typo is otherwise invisible: the key parses, is discarded, and the setting the user
+/// thought they made simply never happens. `am doctor` reports the same list as a check;
+/// this is for the commands where nobody is running doctor.
+fn warn_unknown_keys(cfg: &config::Config) {
+    for unknown in &cfg.unknown_keys {
+        eprintln!("warning: unknown config key {unknown}");
     }
 }
 

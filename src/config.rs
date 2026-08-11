@@ -204,6 +204,10 @@ pub struct Config {
     pub tmux: TmuxConfig,
     pub container: ContainerConfig,
     pub devcontainer: DevcontainerConfig,
+    /// Keys found in the config files that `am` does not recognise. Not a config value
+    /// itself, so it never round-trips through a config file.
+    #[serde(skip)]
+    pub unknown_keys: Vec<UnknownKey>,
 }
 
 /// Compiled-in per-agent defaults.
@@ -244,6 +248,7 @@ impl Default for Config {
             tmux: TmuxConfig::default(),
             container: ContainerConfig::default(),
             devcontainer: DevcontainerConfig::default(),
+            unknown_keys: Vec::new(),
         }
     }
 }
@@ -279,12 +284,16 @@ pub fn resolve_image<'a>(agent: Option<&str>, cfg: &'a Config) -> Option<&'a str
 #[derive(Debug, Deserialize, Default)]
 struct FileDefaults {
     agent: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct FileAgentSettings {
     image: Option<String>,
     devcontainer_feature: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -292,6 +301,8 @@ struct FileTmux {
     agent_pane: Option<PaneSide>,
     split: Option<SplitDirection>,
     split_percent: Option<u8>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -305,6 +316,8 @@ struct FileContainer {
     gitconfig: Option<PathBuf>,
     ssh: Option<PathBuf>,
     user: Option<String>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -316,6 +329,8 @@ struct FileDevcontainer {
     skip_lifecycle: Option<bool>,
     home: Option<PathBuf>,
     extra_features: Option<HashMap<String, String>>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -330,6 +345,60 @@ struct FileConfig {
     container: FileContainer,
     #[serde(default)]
     devcontainer: FileDevcontainer,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
+}
+
+/// A key `am` does not recognise, and the file it came from.
+///
+/// Collected rather than rejected. `deny_unknown_fields` would turn a typo into a hard
+/// error, but it would also break a config written for a newer `am` when an older one
+/// reads it — and `.am/config.toml` is meant to be committed and shared, so that is a
+/// team hitting version skew, not a hypothetical. Warning keeps the diagnosis without
+/// the breakage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownKey {
+    pub file: PathBuf,
+    pub key: String,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} in {}", self.key, self.file.display())
+    }
+}
+
+/// Every unrecognised key in a parsed file, as dotted paths.
+///
+/// Sorted so the output is stable — `HashMap` iteration order would otherwise reshuffle
+/// the warning on every run and make it look like the set had changed.
+fn collect_unknown(file: &FileConfig, path: &Path) -> Vec<UnknownKey> {
+    let mut keys: Vec<String> = Vec::new();
+    keys.extend(file.unknown.keys().cloned());
+    keys.extend(file.defaults.unknown.keys().map(|k| format!("defaults.{k}")));
+    keys.extend(file.tmux.unknown.keys().map(|k| format!("tmux.{k}")));
+    keys.extend(file.container.unknown.keys().map(|k| format!("container.{k}")));
+    keys.extend(
+        file.devcontainer
+            .unknown
+            .keys()
+            .map(|k| format!("devcontainer.{k}")),
+    );
+    for (name, settings) in &file.agents {
+        keys.extend(
+            settings
+                .unknown
+                .keys()
+                .map(|k| format!("agents.{name}.{k}")),
+        );
+    }
+    keys.sort();
+    keys.into_iter()
+        .map(|key| UnknownKey {
+            file: path.to_path_buf(),
+            key,
+        })
+        .collect()
 }
 
 /// Overwrite `target` with `value` when present. `target` is a plain `T` (not `Option<T>`).
@@ -738,6 +807,7 @@ pub fn load_with_global(
     if let Some(global_path) = global_path {
         if global_path.exists() {
             let file = parse_config_file(global_path)?;
+            config.unknown_keys.extend(collect_unknown(&file, global_path));
             apply_file_config(&mut config, file);
         }
     }
@@ -746,6 +816,7 @@ pub fn load_with_global(
     if let Some(path) = project_config_path {
         if path.exists() {
             let file = parse_config_file(path)?;
+            config.unknown_keys.extend(collect_unknown(&file, path));
             apply_file_config(&mut config, file);
         }
     }
@@ -769,6 +840,107 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    // ── Unknown keys ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_keys_are_collected_not_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            r#"
+typo_at_top = 1
+
+[defaults]
+agent = "claude"
+agnet = "copilot"
+
+[tmux]
+splt_percent = 30
+
+[container]
+agent = "copilot"
+
+[devcontainer]
+skip_lifecyle = true
+
+[agents.claude]
+imag = "nope:latest"
+"#,
+        );
+
+        let config = load_with_global(None, Some(&project)).unwrap();
+
+        // The recognised key still applies — an unknown neighbour does not poison it.
+        assert_eq!(config.agent.as_deref(), Some("claude"));
+
+        let keys: Vec<&str> = config
+            .unknown_keys
+            .iter()
+            .map(|u| u.key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "agents.claude.imag",
+                "container.agent",
+                "defaults.agnet",
+                "devcontainer.skip_lifecyle",
+                "tmux.splt_percent",
+                "typo_at_top",
+            ]
+        );
+        assert!(config.unknown_keys.iter().all(|u| u.file == project));
+    }
+
+    #[test]
+    fn a_clean_config_reports_no_unknown_keys() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[defaults]\nagent = \"claude\"\n\n[container]\nenabled = true\n",
+        );
+
+        let config = load_with_global(None, Some(&project)).unwrap();
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+    }
+
+    #[test]
+    fn unknown_keys_name_the_file_they_came_from() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+
+        let global = write_toml(tmp.path(), "global.toml", "[tmux]\nwrong_one = 1\n");
+        let project = write_toml(tmp.path(), "project.toml", "[tmux]\nother_one = 2\n");
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+
+        // Two files, same section: without the path a user cannot tell which to edit.
+        let found: Vec<(String, String)> = config
+            .unknown_keys
+            .iter()
+            .map(|u| (u.key.clone(), u.file.display().to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("tmux.wrong_one".to_string(), global.display().to_string()),
+                ("tmux.other_one".to_string(), project.display().to_string()),
+            ]
+        );
     }
 
     // ── Agent precedence ──────────────────────────────────────────────────────
