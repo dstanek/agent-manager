@@ -74,6 +74,42 @@ platform.
 
 ## Bug Fixes
 
+### Documented MSRV is stale and unenforced
+
+[`docs/reference/building.md:39`](docs/reference/building.md) states "Rust 1.70 or later", but
+the crate graph has drifted well past that:
+
+- **Building the binary requires 1.85** — `toml_parser` 1.1.3, `indexmap` 2.14.0,
+  `clap_lex` 1.1.0, `cpufeatures` 0.3.0, and `hybrid-array` 0.4.14 all declare it.
+- **Running the test suite requires 1.88** — `cucumber` 0.23, `gherkin` 0.16, and their
+  `globset`/`ignore` dependencies.
+
+So the real floor is 1.85 to build and 1.88 to contribute — both well above the documented
+1.70.
+
+The drift moves in *both* directions, which is what makes it worth enforcing rather than
+just correcting once. Measured a day earlier, the binary floor was 1.88, pinned there by
+`home` 0.5.12 arriving transitively through `which` 6.0.3. The routine `which` v8 bump
+dropped `home` from the graph entirely (v8 depends only on `libc`), lowering the floor to
+1.85 — a change no one asked for, reviewed, or recorded.
+
+Nothing catches any of this because nothing enforces it: `Cargo.toml` has no `rust-version`
+field, and every job in `ci.yml` uses `dtolnay/rust-toolchain@stable`, so CI has never once
+compiled against the floor the docs promise. A user on 1.70 following those docs gets a
+compile failure deep in a transitive dependency, with nothing pointing at the real cause.
+
+- [ ] Set `rust-version` in `Cargo.toml` to the real floor so `cargo` reports a clear error
+      instead of a dependency-resolution failure
+- [ ] Correct `docs/reference/building.md` to match, and say whether the documented floor is
+      the build floor or the contribute floor — they differ
+- [ ] Add a CI job pinned to the declared MSRV, so the two cannot drift again
+- [ ] Decide the policy: track stable and document it honestly, or hold a floor and pin the
+      dependencies that push past it. Note the binding constraints have all been *transitive*
+      so far — no direct dependency choice would have surfaced them
+
+Found while pricing prompt-crate options for [`specs/guided-setup.md`](specs/guided-setup.md);
+independent of that feature.
+
 ### Context-aware user messages
 > Spec: [`specs/context-aware-messages.md`](specs/context-aware-messages.md)
 
