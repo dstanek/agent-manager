@@ -217,6 +217,10 @@ fn default_agent_images() -> HashMap<String, AgentSettings> {
         (
             "claude",
             Some("ghcr.io/dstanek/am-claude-minimal:latest"),
+            // An external OCI artifact shipped as a default, so it needs an
+            // annotation: Renovate's devcontainer manager only reads
+            // devcontainer.json and cannot see a reference in Rust source.
+            // renovate: datasource=docker depName=ghcr.io/anthropics/devcontainer-features/claude-code
             Some("ghcr.io/anthropics/devcontainer-features/claude-code:1"),
         ),
         (

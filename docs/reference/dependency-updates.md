@@ -29,6 +29,7 @@ so a config change takes effect immediately instead of a week later.
 | `pip_requirements` | `requirements-docs.txt` | `rangeStrategy: bump`, so the `>=` floors actually move |
 | `custom.regex` | Any `Dockerfile*` | Versions in `ARG`/`ENV` lines carrying a `# renovate:` annotation |
 | `custom.regex` | `.devcontainer/devcontainer.json` | Versions passed as feature *options*, carrying a `// renovate:` annotation |
+| `custom.regex` | `src/*.rs` | OCI references compiled in as defaults, carrying a `// renovate:` annotation |
 
 Lock file maintenance is enabled, so `Cargo.lock` gets a periodic refresh of
 transitive crates instead of only moving when a direct dependency happens to be
@@ -63,13 +64,14 @@ run: |
   JJ_VERSION=0.44.0
 ```
 
-Three versions are annotated this way today:
+Four versions are annotated this way today:
 
 - `JJ_VERSION` in `.devcontainer/Dockerfile` — the jj release the project is
   developed against
 - `JJ_VERSION` in `.github/workflows/ci.yml` — the same release, used by the
   cucumber suite's "a jj repository" step
 - `GO_VERSION` in `examples/Dockerfile.golang`
+- `RENOVATE_VERSION` in `.github/workflows/renovate.yml` — see below
 
 The two jj pins are the reason one manager covers both file types. They name the
 same `depName`, so Renovate bumps them in a single PR. Split across two managers
@@ -93,6 +95,26 @@ annotation — with `//` comments, since `devcontainer.json` is JSONC:
 `"24"` rather than pinning `"24.19.0"` — the feature keeps resolving the latest
 patch itself. That shape is preserved by the versioning scheme, not by a
 `rangeStrategy` setting; setting one here has no effect.
+
+## Two annotations worth knowing about
+
+**`src/config.rs`** ships `ghcr.io/anthropics/devcontainer-features/claude-code:1`
+as a compiled-in default for the `claude` agent. That is an external OCI artifact
+every user receives, and no built-in manager can see it — the `devcontainer`
+manager reads `devcontainer.json` files, not Rust source. Without the annotation
+it would sit at `:1` forever with nothing to surface a `:2`. The neighbouring
+`ghcr.io/dstanek/am-*-minimal:latest` defaults are this project's own images at
+`:latest`, so there is nothing to pin there.
+
+**`RENOVATE_VERSION`** in the workflow is read by both the validate job (via
+`npx --package renovate@$RENOVATE_VERSION`) and the scheduled run (via the
+action's `renovate-version` input). They have to agree on the major: otherwise a
+config using a newer schema validates green and then fails at runtime, which is
+precisely the delayed failure the validate job exists to catch. It is pinned to
+the **major only** — Renovate ships several releases a week, so a full version
+pin would open a PR for each one while changing nothing that matters. `npm`
+versioning reads a bare major as a range, so Renovate rewrites it to `45`, never
+to `44.23.3`.
 
 ## What is deliberately not managed
 
