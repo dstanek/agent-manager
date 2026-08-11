@@ -43,7 +43,7 @@ make build-copilot       # Build Copilot Docker image
 
 - `tempfile` crate for isolated test directories
 - Mock tmux via `AM_TMUX_BIN`; mock container runtimes via `AM_PODMAN_BIN`/`AM_DOCKER_BIN`; mock the Dev Containers CLI via `AM_DEVCONTAINER_BIN`
-- Tests that write a mock script and then exec it must hold a mutex — a concurrent fork elsewhere inherits the open write descriptor and the exec fails with `ETXTBSY`
+- Tests run single-threaded: `.cargo/config.toml` sets `RUST_TEST_THREADS = "1"`. A test that writes a mock script and then execs it fails with `ETXTBSY` if any other thread forks while the file is still open for writing, because the child inherits the write descriptor. Per-module mutexes cannot prevent this — the contended resource is the process-wide fd table — so the whole binary is serialized instead. Do not remove this without moving the exec-mock tests to their own test target.
 - Test git fixtures commit with `--no-verify`: a developer's global `init.templatedir` can install a `commit-msg` hook into every `git init`
 - Tests mutating env vars use a mutex to serialize execution
 
