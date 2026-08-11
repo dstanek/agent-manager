@@ -114,11 +114,25 @@ am destroy feat --force
 am start feat --agent gemini
 ```
 
-### Codex API key not found in the container
+### Codex authentication fails in the container
 
 **Agent:** Codex
 
-If Codex reports an authentication error:
+Codex accepts either an API key or an interactive sign-in, and `am` supports both. You need only one.
+
+**If you signed in interactively** (`codex` on your host, no API key), the credentials live in `~/.codex/auth.json`. `am` mounts the whole `~/.codex` directory read-write into the session, so sign-in carries over and token refreshes are written back. Check that the directory exists on the host:
+
+```sh
+ls ~/.codex/auth.json
+```
+
+If it is missing, run `codex` once on the host and complete the sign-in.
+
+!!! warning "Shared state across sessions"
+
+    Because the whole directory is mounted, your host codex and every concurrent `am` session share the same history and SQLite databases under `~/.codex`. Running several codex sessions at once may interleave their history.
+
+**If you use an API key:**
 
 1. Ensure `OPENAI_API_KEY` is set in your host shell:
 
