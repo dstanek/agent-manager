@@ -8,7 +8,7 @@
 # The build context is the repo root (see "context" in devcontainer.json) so
 # requirements-docs.txt stays the single source of truth for the docs toolchain.
 
-FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
+FROM mcr.microsoft.com/devcontainers/rust:2-bookworm
 
 # Keep in step with the jj version the project is developed against.
 # renovate: datasource=github-releases depName=jj-vcs/jj
