@@ -77,7 +77,7 @@ subcommands are present).
 Two workflows exercise the build:
 
 - **`.github/workflows/ci.yml`** — on pull requests to `main` that touch `src/`,
-  `tests/`, `Cargo.toml`, `Cargo.lock`, or the workflow itself, runs
+  `tests/`, `Cargo.toml`, `Cargo.lock`, `.cargo/`, or the workflow itself, runs
   `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `cargo test` on
   `ubuntu-latest` (which build-checks Linux), plus a `cross-build` job that runs
   `cargo build --target <triple>` (build-only, no packaging) for
