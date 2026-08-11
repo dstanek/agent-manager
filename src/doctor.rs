@@ -165,7 +165,7 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
     let mut report = Report::default();
 
     let repo_root = check_repository(&mut report, repo);
-    let cfg = load_config(repo_root);
+    let cfg = check_config(&mut report, repo_root);
 
     if let Some(root) = repo_root {
         check_project_setup(&mut report, root, &cfg);
@@ -184,10 +184,33 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
 }
 
 /// Load config the same way `cmd_start` does, falling back to global-only outside a repo.
-fn load_config(repo_root: Option<&Path>) -> Config {
+///
+/// A config that fails to load is reported rather than swallowed. `doctor` used to fall
+/// back to compiled-in defaults silently, which is the worst possible answer here: every
+/// later check would describe a configuration the user does not have, and the one command
+/// meant to explain the problem would be the one hiding it. `am start` fails outright on
+/// the same file, so a clean report would have been a lie.
+fn check_config(report: &mut Report, repo_root: Option<&Path>) -> Config {
     let project = repo_root.map(|r| r.join(".am").join("config.toml"));
-    config::load_with_global(config::global_config_path().as_deref(), project.as_deref())
-        .unwrap_or_default()
+    match config::load_with_global(config::global_config_path().as_deref(), project.as_deref()) {
+        Ok(cfg) => {
+            report
+                .checks
+                .push(Check::ok(PROJECT, "config", "loaded"));
+            cfg
+        }
+        Err(e) => {
+            report.checks.push(Check::fail(
+                PROJECT,
+                "config",
+                // The chain names the offending file and key; without it the user gets
+                // "invalid config" and no way to find which of two files is at fault.
+                format!("{e:#}"),
+                "fix the reported file, or move it aside to fall back to defaults",
+            ));
+            Config::default()
+        }
+    }
 }
 
 fn effective_agent(agent_flag: Option<&str>, cfg: &Config) -> Option<String> {
@@ -668,6 +691,46 @@ mod tests {
 
     fn has(report: &Report, name: &str) -> bool {
         report.checks.iter().any(|c| c.name == name)
+    }
+
+    // ── Config loading ────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_check_reports_a_broken_project_config() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        std::fs::write(
+            tmp.path().join(".am").join("config.toml"),
+            "[tmux]\nsplit_percent = 500\n",
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        check_config(&mut report, Some(tmp.path()));
+
+        let check = find(&report, "config");
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.hint.is_some(),
+            "a failing config check must say what to do about it"
+        );
+    }
+
+    #[test]
+    fn config_check_passes_on_a_valid_project_config() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".am")).unwrap();
+        std::fs::write(
+            tmp.path().join(".am").join("config.toml"),
+            "[defaults]\nagent = \"claude\"\n",
+        )
+        .unwrap();
+
+        let mut report = Report::default();
+        let cfg = check_config(&mut report, Some(tmp.path()));
+
+        assert_eq!(find(&report, "config").status, Status::Ok);
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
     }
 
     // ── Report shape ──────────────────────────────────────────────────────────
