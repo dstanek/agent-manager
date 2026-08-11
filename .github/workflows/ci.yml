@@ -8,6 +8,8 @@ on:
       - 'tests/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # Carries RUST_TEST_THREADS, which the suite depends on to avoid ETXTBSY.
+      - '.cargo/**'
       - '.github/workflows/ci.yml'
 
 jobs:
