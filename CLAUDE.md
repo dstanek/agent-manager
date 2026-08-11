@@ -25,7 +25,7 @@ make build-copilot       # Build Copilot Docker image
 - `error.rs` — `AmError` enum via `thiserror`; all functions return `anyhow::Result<T>`
 - `doctor.rs` — `am doctor` readiness checks; reuses `cmd_start`'s own preflight functions so a passing report and a working `am start` cannot drift apart
 - `devcontainer.rs` — Dev Container support: JSONC config parsing, `devcontainer.metadata` label parsing and merge, variable substitution, config hashing, `devcontainer build` delegation, trust gate
-- `session.rs` — session CRUD; state in `.am/sessions.json`
+- `session.rs` — session CRUD; state in a global per-user store at `$XDG_STATE_HOME/am/sessions.json`, with transparent migration from the old per-repo `.am/sessions.json`
 - `worktree.rs` — git (`git worktree add`) and jj (`jj workspace add`) operations plus `WorktreeGuard` rollback; VCS detection (`find_repo_root`) is in `main.rs`
 - `tmux.rs` — tmux window/pane management
 - `container.rs` — Podman/Docker lifecycle; mount resolution; agent auth presets

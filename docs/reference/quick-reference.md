@@ -11,7 +11,8 @@ One-page guide to common `am` commands, workflows, and configurations.
 | `am init` | Initialize am in current repo |
 | `am doctor` | Report what is/isn't ready for `am start` |
 | `am start <slug>` | Create a new agent session |
-| `am list` | Show all active sessions |
+| `am list` | Show active sessions in the current repo |
+| `am list --all` | Show active sessions across every repo |
 | `am attach <slug>` | Switch to existing session |
 | `am run <slug> <agent>` | Launch agent in session's agent pane |
 | `am destroy <slug>` | Stop and remove session |
@@ -160,14 +161,17 @@ Valid slugs: **1–40 characters**, lowercase letters (a–z), digits (0–9), h
 ```
 your-repo/
 ├── .am/
-│   ├── config.toml          ← Project config (edit this)
-│   ├── sessions.json        ← Active sessions (auto-managed)
-│   └── worktrees/
+│   ├── config.toml          ← Project config (edit this; commit it)
+│   └── worktrees/           ← gitignored
 │       ├── feat/            ← Worktree for 'feat' session
 │       ├── tests/           ← Worktree for 'tests' session
 │       └── docs/            ← Worktree for 'docs' session
 ├── .git/
 └── ... (your files)
+
+$XDG_STATE_HOME/am/          ← per-user, outside any repo
+├── sessions.json            ← Active sessions, all repos (auto-managed)
+└── gitconfig                ← Identity mounted into containers (auto-generated)
 ```
 
 ---
@@ -220,9 +224,10 @@ For a complete list, see [Configuration Reference](configuration.md#environment-
 
 | Path | Purpose |
 |------|---------|
-| `.am/config.toml` | Project-level configuration |
-| `.am/sessions.json` | Track active sessions |
+| `.am/config.toml` | Project-level configuration (committable) |
 | `.am/worktrees/<slug>/` | Agent's working directory |
+| `$XDG_STATE_HOME/am/sessions.json` | Track active sessions across all repos (`~/.local/state/am/` by default) |
+| `$XDG_STATE_HOME/am/gitconfig` | Generated identity mounted into containers |
 | `~/.config/am/config.toml` | Global config (all projects) |
 | `~/.claude/` | Claude Code credentials |
 | `~/.config/gh/` | GitHub CLI auth (for Copilot) |

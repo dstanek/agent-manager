@@ -39,8 +39,10 @@ Open the file and uncomment any values you want to change from the compiled-in d
 
 The project config overrides global defaults for a specific repository. It is created automatically by `am init`. All lines are commented out by default so that global defaults flow through unchanged — uncomment only the keys you actually want to override.
 
+This file is safe to commit, and committing it is the intended workflow: it is how a team shares one set of `agent`, `container`, and `devcontainer` defaults. `am init` ignores only `.am/worktrees/`, not `.am/` as a whole.
+
 ```sh
-# Initialize a project (creates .am/config.toml and .am/sessions.json)
+# Initialize a project (creates .am/config.toml)
 am init
 ```
 
@@ -180,7 +182,7 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 | `image` | string | `""` | Override image for all agents; takes priority over `[agents.<name>].image`; leave unset to use the per-agent default | Any valid image reference |
 | `network` | string | `"full"` | Network access mode for the container | `"full"` (unrestricted internet access), `"none"` (no network) |
 | `env` | list of strings | `[]` | Extra environment variables passed into the container from the host shell | e.g. `["ANTHROPIC_API_KEY", "FOO=bar"]` |
-| `gitconfig` | path | `""` | Host path to a gitconfig file to mount into the container; defaults to `.am/gitconfig` in the repo root | Any valid file path |
+| `gitconfig` | path | `""` | Host path to a gitconfig file to mount into the container; defaults to `$XDG_STATE_HOME/am/gitconfig`, which `am start` regenerates from your host `user.name` and `user.email` | Any valid file path |
 | `ssh` | path | `""` | Host path to an SSH directory to mount into the container; defaults to `~/.ssh` | Any valid directory path |
 | `user` | string | `"am"` | Username used when building credential mount paths inside the container, such as `/home/<user>/.ssh` and `/home/<user>/.gitconfig`. In devcontainer mode the image's `remoteUser` takes precedence, and `root` resolves to `/root` rather than `/home/root` | safe username (`[a-z_][a-z0-9_-]*`) |
 
