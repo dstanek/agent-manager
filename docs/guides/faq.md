@@ -75,7 +75,7 @@ If you delete it manually:
 - The session is still recorded in the global session store
 - `am` may get confused
 
-**Fix:** Use `am destroy <slug>` to properly clean up.
+**Fix:** Use `am destroy <slug>` to properly clean up. If the repository itself is gone — so there is nothing left for `am destroy` to work on — use `am session rm <slug> --repo <path>` to drop the leftover record instead.
 
 ### Can I manually edit the `.am/<slug>` branch?
 

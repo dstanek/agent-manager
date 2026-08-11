@@ -160,7 +160,7 @@ The first time `am list` runs in a repository that still has an old `.am/session
 | `STATUS` | `stale` if the session's repository no longer exists on disk, otherwise blank. Only shown with `--all`. |
 | `CREATED` | Timestamp when the session was created (`YYYY-MM-DD HH:MM`) |
 
-With `--all`, sessions are grouped by repository and sorted oldest-first within each, and any `stale` rows are sorted to the bottom. A stale row means the repository was moved or deleted without `am destroy` being run first; the record can be cleaned up by destroying the session or removing it from the store by hand.
+With `--all`, sessions are grouped by repository and sorted oldest-first within each, and any `stale` rows are sorted to the bottom. A stale row means the repository was moved or deleted without `am destroy` being run first. Clear it with [`am session rm <slug> --repo <path>`](#am-session-rm-slug) — `am destroy` is no help here, because it needs the repository it is being asked to clean up.
 
 **Example output**
 
@@ -237,6 +237,50 @@ am destroy <slug> [OPTIONS]
 5. Removes the session record from the global session store
 
 Without `--force`, `am` prints a summary of what will be destroyed and asks for confirmation. This is the only destructive command in `am` and cannot be undone — the worktree and branch are permanently deleted.
+
+---
+
+## `am session rm <slug>`
+
+Remove a session record from the global store. Use this when `am destroy` cannot do the job — most often for a `stale` row in `am list --all`, where the repository has been moved or deleted and there is no longer a worktree to tear down.
+
+**Usage**
+
+```sh
+am session rm <slug>
+am session rm <slug> --repo ~/src/old-project
+am session rm <slug> --force
+```
+
+**Options**
+
+| Flag | Description |
+|---|---|
+| `--repo <path>` | Repository the session belongs to. Required when you are not inside a repository, or when the same slug exists in more than one. The path need not still exist — that is the point for stale records. |
+| `--force`, `-f` | Skip the confirmation prompt. |
+
+**What it does**
+
+1. Stops and removes the container, if the record names one — best effort, a failure is a warning rather than an error
+2. Kills the tmux window — also best effort
+3. Removes the session record from the global store
+
+**What it does not do**
+
+It leaves the worktree and branch alone. That is the difference from `am destroy`, which removes them and is the right command whenever the repository is still present. `am session rm` cleans up the bookkeeping, not your code.
+
+**Resolving the slug**
+
+Run inside a repository, `am` looks for the slug there first. If the slug exists in exactly one repository anywhere in the store, that one is used. If it exists in several, `am` lists the candidates and asks you to disambiguate with `--repo`:
+
+```
+slug 'feat' exists in multiple repos:
+  /home/you/src/project-a
+  /home/you/src/project-b
+Use --repo <path> to specify which one.
+```
+
+Run outside any repository, the same rules apply minus the current-repo preference. An unknown slug is an error naming the slug.
 
 ---
 
