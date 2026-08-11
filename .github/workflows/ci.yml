@@ -23,8 +23,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --all-targets so test code is linted too. Without it clippy sees only the
+      # binary, and lints in #[cfg(test)] modules drift in unnoticed.
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
