@@ -697,6 +697,6 @@ async fn main() {
     // block tokio threads, so parallel execution causes deadlocks.
     AmWorld::cucumber()
         .max_concurrent_scenarios(1)
-        .run("tests/features")
+        .run_and_exit("tests/features")
         .await;
 }
