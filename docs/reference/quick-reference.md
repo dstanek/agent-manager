@@ -277,7 +277,6 @@ agent = "claude"
 
 ```toml
 [defaults]
-vcs = "git"
 agent = "claude"
 
 [agents.claude]

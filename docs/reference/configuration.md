@@ -61,13 +61,12 @@ Selecting the agent also selects the container image — `am` ships with built-i
 
 Environment variables override both the global and project configs and are useful for CI pipelines, Docker-in-Docker setups, or temporary one-off overrides without editing any files.
 
-**Validation:** Enum fields (`AM_VCS`, `AM_TMUX_SPLIT`, etc.) silently ignore unrecognised values so that adding new enum variants remains backwards-compatible. Numeric and identifier fields (`AM_TMUX_SPLIT_PERCENT`, `AM_CONTAINER_USER`) return a hard error if the value is out of range or malformed — the same behaviour as loading an invalid value from a config file.
+**Validation:** Enum fields (`AM_TMUX_SPLIT`, `AM_CONTAINER_MODE`, etc.) silently ignore unrecognised values so that adding new enum variants remains backwards-compatible. Numeric and identifier fields (`AM_TMUX_SPLIT_PERCENT`, `AM_CONTAINER_USER`) return a hard error if the value is out of range or malformed — the same behaviour as loading an invalid value from a config file.
 
 ### Config overrides
 
 | Variable | Config key | Values | Example |
 |---|---|---|---|
-| `AM_VCS` | `defaults.vcs` | `git`, `jj` | `AM_VCS=jj` |
 | `AM_AGENT` | `defaults.agent` | any non-empty string | `AM_AGENT=claude` |
 | `AM_TMUX_AGENT_PANE` | `tmux.agent_pane` | `left`, `right` | `AM_TMUX_AGENT_PANE=right` |
 | `AM_TMUX_SPLIT` | `tmux.split` | `horizontal`, `vertical` | `AM_TMUX_SPLIT=vertical` |
@@ -124,8 +123,11 @@ Top-level defaults that apply across all sessions unless overridden.
 
 | Key | Type | Default | Description | Valid Values |
 |---|---|---|---|---|
-| `vcs` | string | `"git"` | Version control system used to create worktrees or workspaces | `"git"`, `"jj"` |
 | `agent` | string | `""` | Default agent launched in the agent pane; also selects the container image via `[agents.<name>]`; empty means no agent is auto-launched | Any known agent name, e.g. `"claude"`, `"copilot"` |
+
+!!! note "Version control is detected, not configured"
+
+    There is no `vcs` setting. `am` looks for `.jj/` first and falls back to `.git/`, erroring if it finds neither, so a repository's own layout decides whether you get a jj workspace or a git worktree.
 
 ### `[agents.<name>]`
 
