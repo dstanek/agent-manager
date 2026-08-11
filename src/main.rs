@@ -99,6 +99,9 @@ fn cmd_init() -> anyhow::Result<()> {
             .create(true)
             .append(true)
             .open(&gitignore_path)?;
+        if !gitignore_content.is_empty() && !gitignore_content.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
         file.write_all(b".am/worktrees/\n")?;
         println!("Added .am/worktrees/ to .gitignore");
     }
