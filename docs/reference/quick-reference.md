@@ -16,6 +16,7 @@ One-page guide to common `am` commands, workflows, and configurations.
 | `am attach <slug>` | Switch to existing session |
 | `am run <slug> <agent>` | Launch agent in session's agent pane |
 | `am destroy <slug>` | Stop and remove session |
+| `am session rm <slug>` | Remove a session record, leaving worktree and branch alone |
 | `am generate-config` | Show resolved configuration |
 
 ---
@@ -258,6 +259,7 @@ See [Troubleshooting Guide](../guides/troubleshooting.md) for detailed solutions
 | Help for specific command | `am start --help` |
 | Validate config | `am generate-config` |
 | Check active sessions | `am list` |
+| Clear a `stale` session row | `am session rm <slug> --repo <path>` |
 | Read full docs | Visit [documentation home](../index.md) |
 
 ---
