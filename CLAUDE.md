@@ -16,29 +16,6 @@ make build-claude        # Build Claude Code Docker image
 make build-copilot       # Build Copilot Docker image
 ```
 
-## Architecture
-
-**Modules:**
-- `cli.rs` — clap CLI; slug validation (1–40 chars, lowercase/digits/hyphens/underscores)
-- `command.rs` — subprocess helpers (`run_command`, `run_built_command`, and output variants); shared stderr/status error formatting
-- `config.rs` — layered config: CLI flags → env vars → `.am/config.toml` → `~/.config/am/config.toml` → defaults
-- `error.rs` — `AmError` enum via `thiserror`; all functions return `anyhow::Result<T>`
-- `doctor.rs` — `am doctor` readiness checks; reuses `cmd_start`'s own preflight functions so a passing report and a working `am start` cannot drift apart
-- `devcontainer.rs` — Dev Container support: JSONC config parsing, `devcontainer.metadata` label parsing and merge, variable substitution, config hashing, `devcontainer build` delegation, trust gate
-- `session.rs` — session CRUD; state in a global per-user store at `$XDG_STATE_HOME/am/sessions.json`, with transparent migration from the old per-repo `.am/sessions.json`
-- `worktree.rs` — git (`git worktree add`) and jj (`jj workspace add`) operations plus `WorktreeGuard` rollback; VCS detection (`find_repo_root`) is in `main.rs`
-- `tmux.rs` — tmux window/pane management
-- `container.rs` — Podman/Docker lifecycle; mount resolution; agent auth presets
-- `main.rs` — command handlers (`cmd_init`, `cmd_start`, `cmd_list`, `cmd_attach`, `cmd_run`, `cmd_destroy`, `cmd_doctor`, `cmd_generate_config`)
-
-**VCS detection:** checks `.jj/` first, falls back to `.git`, errors if neither found.
-
-**Container mounts:** both git and jj repos mirror the host path structure inside the container (worktree and VCS dirs are mounted at the same absolute paths). No `GIT_DIR`/`GIT_WORK_TREE` env vars are injected. The host's `$SSH_AUTH_SOCK` follows the same mirroring rule when `container.ssh_agent` is on (default), because mounting `~/.ssh` alone cannot authenticate a passphrase-protected or agent-only key; it is the one mount never relabelled under SELinux, since the socket belongs to a host process. See `container.rs`.
-
-**Agent auth presets** (`claude`, `copilot`, `gemini`, `codex`) provide credentials at runtime via mounts and/or environment variables. `codex` accepts either an `OPENAI_API_KEY` or an interactive sign-in mounted from `~/.codex`, and only fails preflight when neither exists — an agent with two authentication paths must not be validated as if it had one. Unknown agent names are rejected early with a clear error listing valid agents. Mount targets are derived from `ContainerMounts::container_home`, not from the username — a devcontainer's `remoteUser` may be `root`, whose home is `/root`.
-
-**Dev Container mode** (`container.mode = "image" | "devcontainer" | "auto"`, default `"auto"` — devcontainer when a `.devcontainer/devcontainer.json` is found, an `am`-resolved image otherwise): `am` delegates `devcontainer build` to the reference CLI and keeps the run path. The built image's `devcontainer.metadata` label carries feature contributions *and* the whole `devcontainer.json`; only `runArgs`, `workspaceFolder`, `workspaceMount`, `initializeCommand`, `dockerComposeFile`, and `name` are read from the file itself. Images are named `am-dc-<config-hash>` so an unchanged config skips the build. Real CLI output for tests is in `tests/fixtures/devcontainer/`.
-
 ## Testing
 
 - `tempfile` crate for isolated test directories
@@ -51,25 +28,11 @@ make build-copilot       # Build Copilot Docker image
 
 ## Path Handling Strategy
 
-Preserve type safety as long as possible by keeping Path/PathBuf/OsStr until converting to String is absolutely necessary:
+Prefer `Path`/`PathBuf`/`OsStr` over `String` — convert to `String` only at boundaries (command args, container mounts).
 
-**Hierarchy (in order of preference):**
-1. `Path`/`PathBuf`/`OsStr` — Keep internal code type-safe (no early conversion)
-2. `&Path` / `&OsStr` — Use in function parameters (not `&str`)
-3. `.as_path()` / `.as_os_str()` — Borrow without copying
-4. `.display()` — For format strings in logging/printing (never panics, handles UTF-8)
-5. `.to_string_lossy()` — When `Cow<str>` or owned `String` is needed (command args, mounting)
-6. `.to_str()?` — Only for critical UTF-8 requirements with proper error handling
-7. `String` — Last resort (owned copy)
-
-**Practical rules:**
-- ✅ `fn foo(path: &Path)` — NOT `fn foo(path: &str)`
-- ✅ Use `.display()` for error messages and logging
-- ✅ Convert to String only at boundaries (Command args, container mounts)
-- ✅ Inline conversions: `cmd.arg(path.to_string_lossy())` rather than intermediate variables
-- ❌ Don't convert early: avoid `let path_str = path.to_string_lossy(); ... use later`
-
-This approach improves type safety, clarity (conversions are visible at call sites), and performance (fewer allocations).
+- `fn foo(path: &Path)` — not `fn foo(path: &str)`
+- `.display()` for error messages and logging
+- `.to_string_lossy()` inline at call sites, not into intermediate variables
 
 ## Version Control
 
