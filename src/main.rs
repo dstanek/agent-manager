@@ -7,11 +7,12 @@ mod devcontainer;
 mod doctor;
 mod error;
 mod messages;
+mod onboarding;
 mod session;
 mod tmux;
 mod worktree;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -42,6 +43,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(),
+        Commands::Setup { yes, agent } => cmd_setup(yes, agent.as_deref()),
         Commands::Start {
             slug,
             agent,
@@ -67,13 +69,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
 fn cmd_init() -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
+    init_project(&repo_root, None)?;
+    println!("am initialized. Run 'am start <slug>' to create your first session.");
+    Ok(())
+}
 
+/// Create `.am/` and the `.gitignore` entry, reporting what it did.
+///
+/// Shared with `am setup`, whose first action is exactly this. Extracted so the two front
+/// doors cannot drift apart — the same reason `am doctor` reuses `cmd_start`'s preflight.
+/// The closing "am initialized" line stays with `cmd_init`: `am setup` has several more
+/// steps to run before it can say anything of the kind.
+///
+/// `known_agent` is `am setup`'s only deviation from `am init`: when it already knows which
+/// agent to write (a flag, or `--yes`'s default) and the project file does not exist yet, the
+/// skeleton is rendered with `defaults.agent` already active instead of commented — see
+/// [`onboarding::render_project_config_skeleton_with_agent`]. `am init` always passes `None`,
+/// so its output is unchanged.
+fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) -> anyhow::Result<()> {
     let am_dir = repo_root.join(".am");
     std::fs::create_dir_all(&am_dir)?;
 
     let config_path = am_dir.join("config.toml");
     if !config_path.exists() {
-        config::write_defaults(&config_path)?;
+        match known_agent {
+            Some(agent) => std::fs::write(
+                &config_path,
+                onboarding::render_project_config_skeleton_with_agent(agent),
+            )?,
+            None => config::write_defaults(&config_path)?,
+        }
         println!("Created .am/config.toml");
     } else {
         println!(".am/config.toml already exists, skipping");
@@ -116,8 +141,196 @@ fn cmd_init() -> anyhow::Result<()> {
         println!("Added .am/worktrees/ to .gitignore");
     }
 
-    println!("am initialized. Run 'am start <slug>' to create your first session.");
     Ok(())
+}
+
+// ── am setup ──────────────────────────────────────────────────────────────────
+
+/// Guided setup: `am init`'s work, the two questions detection cannot answer, then
+/// `am doctor`'s own verification.
+///
+/// Nothing here re-implements a check or a session launch — the point of the command is to
+/// walk a user through the existing ones, so `doctor::run` and `cmd_start` are called
+/// directly and a passing `am setup` cannot disagree with a working `am start`.
+fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
+    // Both of these must fail before anything is written: an unknown agent name is a typo
+    // to correct, and a prompt no one can answer is a hang to avoid.
+    let flag_agent = agent_flag.map(container::KnownAgent::parse).transpose()?;
+    if !yes && !std::io::stdin().is_terminal() {
+        return Err(anyhow::anyhow!(
+            "am setup requires an interactive terminal — pass --yes for non-interactive \
+             setup, or use 'am init' + 'am generate-config'"
+        ));
+    }
+
+    let (repo_root, vcs) = find_repo_root()?;
+
+    // Gathered before anything is created, so the "exists" flags describe what the user
+    // arrived with rather than what this run just made.
+    let detected = onboarding::DetectedState::gather(Some((repo_root.as_path(), vcs.clone())))?;
+
+    // One line of context before anything is asked: which repo this is about, and whether
+    // the user is starting fresh or revisiting.
+    println!(
+        "Setting up am for the {} repository at {}{}",
+        match detected.vcs {
+            Some(config::Vcs::Jj) => "jj",
+            _ => "git",
+        },
+        repo_root.display(),
+        if detected.project_config_exists {
+            " (existing configuration)"
+        } else {
+            ""
+        }
+    );
+
+    let mut io = onboarding::TermIo;
+
+    // The agent question, resolved early whenever it needs no prompt — a flag, or `--yes`'s
+    // default — so a brand-new project file (created next) can be written with the active
+    // line already in place. Neither path performs any IO (a flag short-circuits `ask_agent`
+    // before it prints anything, and `default_agent_answer` never takes an `Io` at all), so
+    // this changes nothing about what gets printed or when. A genuinely interactive answer is
+    // still asked below, after the file exists, in its original place in the flow.
+    let resolved_agent_answer: Option<Option<container::KnownAgent>> = if flag_agent.is_some() {
+        Some(onboarding::ask_agent(&mut io, &detected, flag_agent)?)
+    } else if yes {
+        Some(onboarding::default_agent_answer(&detected))
+    } else {
+        None
+    };
+
+    // Steps 2-3: make sure both files exist. Skeletons only — every value stays commented
+    // out, so creating them changes nothing about how a session resolves — except when the
+    // agent was just resolved above and the project file is new, where the active line is
+    // rendered in directly rather than inserted next to its own commented example.
+    init_project(&repo_root, resolved_agent_answer.flatten())?;
+    match detected.global_config_path.as_deref() {
+        Some(path) if !detected.global_config_exists => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, onboarding::render_global_config_skeleton())?;
+            println!("Created {}", path.display());
+        }
+        Some(_) => {}
+        None => eprintln!(
+            "{} neither XDG_CONFIG_HOME nor HOME is set — no global config will be written",
+            warning_prefix()
+        ),
+    }
+
+    // Steps 4-5. `--yes` is "press Enter through everything": it accepts every shown
+    // default, which is why it writes nothing at all on an already-configured repo.
+    // `--agent` is an answer rather than a default, so it is evaluated either way. Only ask
+    // now if the agent question is still unresolved — i.e. it genuinely needs a prompt.
+    let agent_answer = match resolved_agent_answer {
+        Some(answer) => answer,
+        None => onboarding::ask_agent(&mut io, &detected, flag_agent)?,
+    };
+    let container_answer = if yes {
+        None
+    } else {
+        onboarding::ask_container_enabled(&mut io, &detected)?
+    };
+
+    if let Some(agent) = agent_answer {
+        let written = onboarding::update_project_agent(&detected.project_config_path, agent)?;
+        // A brand-new file already carries the active line from creation above, in which
+        // case `update_project_agent` correctly finds it already correct and writes
+        // nothing — so the confirmation has to come from here instead in that case.
+        let already_written_at_creation =
+            resolved_agent_answer.is_some() && !detected.project_config_exists;
+        if written || already_written_at_creation {
+            println!(
+                "Set defaults.agent = \"{agent}\" in {}",
+                detected.project_config_path.display()
+            );
+        }
+    }
+    if let Some(enabled) = container_answer {
+        if let Some(path) = detected.global_config_path.as_deref() {
+            if onboarding::update_global_container_enabled(path, enabled)? {
+                println!("Set container.enabled = {enabled} in {}", path.display());
+            }
+        }
+    }
+
+    // Step 6: what the repo itself brings, stated rather than asked about — "auto" is
+    // already the right answer for a repo that describes its own environment.
+    if let Some(path) = &detected.devcontainer {
+        println!(
+            "Found {} — sessions will use it automatically (container.mode = \"auto\")",
+            path.display()
+        );
+        if devcontainer::parse_config(path).is_ok_and(|json| json.initialize_command.is_some()) {
+            // Never offered as a prompt: silently letting a wizard enable host command
+            // execution from a repo-controlled file is not an acceptable default.
+            println!(
+                "{} it declares initializeCommand, which runs on your host — am refuses it \
+                 unless devcontainer.allow_host_commands is set. Run 'am doctor' for the detail.",
+                note_prefix()
+            );
+        }
+    }
+
+    // Step 7: the verification is `am doctor`, run for real and rendered identically.
+    println!("\nChecking your setup...\n");
+    let report = doctor::run(Some((repo_root.as_path(), vcs.clone())), agent_flag);
+    print!("{}", report.render(color::enabled(color::Stream::Stdout)));
+    if report.failures() > 0 {
+        println!("Fix the items above, then re-run 'am setup'.");
+        std::process::exit(1);
+    }
+
+    // Step 8: never under --yes — a bootstrap step should not create a worktree, a branch
+    // and possibly a container image unasked.
+    let resolved_agent = flag_agent
+        .or(agent_answer)
+        .or(detected.effective_agent.value);
+    if !yes && std::io::stdin().is_terminal() {
+        if let Some(slug) =
+            onboarding::ask_first_session(&mut io, detected.devcontainer.is_some())?
+        {
+            return cmd_start(&slug, agent_flag, false, false, false);
+        }
+    }
+    print_next_steps(resolved_agent, detected.tmux_present);
+    Ok(())
+}
+
+fn print_next_steps(agent: Option<container::KnownAgent>, tmux_present: bool) {
+    let agent_flag = agent
+        .map(|a| format!(" --agent {a}"))
+        .unwrap_or_default();
+    let rows = [
+        (
+            format!("am start feat{agent_flag}"),
+            "start your first session",
+        ),
+        ("am doctor".to_string(), "re-check readiness any time"),
+        (
+            "am attach feat".to_string(),
+            // Attaching needs a tmux window to attach to; without tmux, sessions run the
+            // container directly and there is nothing to jump back into.
+            if tmux_present {
+                "jump back into a running session"
+            } else {
+                "jump back into a running session (needs tmux)"
+            },
+        ),
+    ];
+    let width = rows.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+    let dim = color::enabled(color::Stream::Stdout);
+
+    println!("\nNext steps:");
+    for (cmd, note) in &rows {
+        println!(
+            "  {cmd:<width$}   {}",
+            color::paint(&format!("# {note}"), color::Color::Dim, dim)
+        );
+    }
 }
 
 // ── am start ──────────────────────────────────────────────────────────────────
@@ -1215,9 +1428,45 @@ fn find_repo_root() -> anyhow::Result<(PathBuf, config::Vcs)> {
 
 #[cfg(test)]
 mod tests {
-    use super::pane_layout;
+    use super::{init_project, pane_layout};
     use crate::command::shell_quote;
     use crate::config::PaneSide;
+
+    // ── init_project ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_known_agent_is_rendered_active_in_a_fresh_project_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        init_project(tmp.path(), Some(KnownAgent::Codex)).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".am").join("config.toml")).unwrap();
+        assert!(content.contains("agent = \"codex\""), "{content}");
+        assert!(!content.contains("# agent ="), "{content}");
+    }
+
+    #[test]
+    fn without_a_known_agent_the_project_file_stays_fully_commented() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        init_project(tmp.path(), None).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".am").join("config.toml")).unwrap();
+        assert!(content.contains("# agent = \"claude\""), "{content}");
+    }
+
+    #[test]
+    fn a_known_agent_does_not_touch_an_existing_project_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let am_dir = tmp.path().join(".am");
+        std::fs::create_dir_all(&am_dir).unwrap();
+        std::fs::write(am_dir.join("config.toml"), "[defaults]\nagent = \"gemini\"\n").unwrap();
+
+        init_project(tmp.path(), Some(KnownAgent::Codex)).unwrap();
+
+        let content = std::fs::read_to_string(am_dir.join("config.toml")).unwrap();
+        assert_eq!(content, "[defaults]\nagent = \"gemini\"\n");
+    }
 
     #[test]
     fn pane_layout_puts_agent_in_the_new_pane_on_the_right() {

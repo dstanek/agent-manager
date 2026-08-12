@@ -82,6 +82,83 @@ Environment
 
 ---
 
+## `am setup`
+
+Guided, interactive setup — the on-ramp for a first-time user or a new repository. Runs `am init`'s setup, asks only the questions detected state can't answer, then verifies the result by running the same checks `am doctor` runs.
+
+**Usage**
+
+```sh
+am setup
+am setup --yes
+am setup --agent claude
+am setup --yes --agent claude
+```
+
+**Options**
+
+| Option | Description |
+|---|---|
+| `--yes`, `-y` | Skip every prompt; each question resolves to its effective current value (project config → global config → compiled default). Never offers to start a session. Exits with the same code `am doctor` would (`0` clean, `1` on failure), so `am setup --yes && am start feat --agent claude` works as a CI bootstrap step. |
+| `--agent <AGENT>`, `-a` | Set the agent directly instead of asking — evaluated the same way with or without `--yes`. If it differs from the current value, it is written; if it matches, nothing is written. Must be one of `claude`, `copilot`, `gemini`, `codex`; an unknown name is rejected immediately, before any file is touched. |
+
+**What it does**
+
+1. Requires an interactive terminal unless `--yes` is passed. With no TTY and no `--yes`, it fails immediately with "am setup requires an interactive terminal" — no file is touched.
+2. Runs the same directory and `.gitignore` setup as `am init` (creates `.am/config.toml` if missing, adds `.am/worktrees/` to `.gitignore`), and creates `~/.config/am/config.toml` if it doesn't exist yet — both fully commented skeletons, same as `am init`'s output.
+3. Asks which agent to use, unless `--agent` was given. The prompt's default is the effective current value — project config, then global config, then (if nothing is configured anywhere) the first agent with credentials already detected on this host, falling back to `claude` — labeled with its source, e.g. `currently: claude (from your global config)`. Pressing Enter accepts the default; if that default is already what's configured, nothing is written.
+4. Asks whether to proceed with containers disabled, but only when neither Podman nor Docker is on `PATH` *and* there is a global config file to write the answer to. Which runtime to use is never asked — `container.runtime = "auto"` already resolves that on its own.
+5. Prints a one-line note when `.devcontainer/devcontainer.json` is found (sessions will use it automatically), and a warning if it declares `initializeCommand` — never a prompt, since defaulting host command execution on would be an unsafe wizard default.
+6. Runs `am doctor`'s checks against whatever was just written and prints the identical report. Exit code matches `am doctor`'s: `0` if clean, `1` on any failure.
+7. If the report is clean and the session is interactive (not `--yes`, stdin is a TTY), offers to start a first session — accepting prompts for a slug and calls the same code path as `am start`. Declining, or running under `--yes`/non-interactively, prints a "Next steps" block instead and exits `0`.
+
+**What it writes**
+
+| Question | Written to | Key |
+|---|---|---|
+| Agent | `.am/config.toml` (project) | `defaults.agent` |
+| Containers disabled | `~/.config/am/config.toml` (global) | `container.enabled` |
+
+Changing the agent always writes to the project file, even when the current value was inherited from the global config — the agent is a per-repo decision. `container.enabled` is a host decision and always goes to the global file.
+
+An existing file is edited in place with `toml_edit`, preserving comments, table order, and formatting; if the answer already matches what's there, nothing is written at all — the file's content and modification time are untouched. If the key already holds something other than a plain string or boolean (a table, an array, an array-of-tables, or an inline table), `am setup` refuses to overwrite it and reports an error instead, leaving the file byte-for-byte unchanged.
+
+**Relationship to `am init` and `am doctor`**
+
+`am init` stays the fast, silent, scriptable primitive — `am setup`'s first action is exactly what `am init` does, so the two share one implementation and cannot drift apart. `am setup`'s verification step *is* `am doctor`: it calls the same check logic and renders the same report, after any answers from steps 3–4 have been written. Use `am init` when you already know what you want and would rather script it; use `am setup` when you want to be walked through it.
+
+**Example output**
+
+```
+Setting up am for the git repository at /home/user/project
+
+Created .am/config.toml
+Added .am/worktrees/ to .gitignore
+Created /home/user/.config/am/config.toml
+Which agent do you use?
+  [1] claude  (already authenticated on this host)
+  [2] copilot
+  [3] gemini
+  [4] codex
+  currently: none configured
+Agent [1-4] (Enter for claude): 
+Set defaults.agent = "claude" in /home/user/project/.am/config.toml
+
+Checking your setup...
+
+[... the same report `am doctor` prints, ending in its verdict line ...]
+Ready.
+
+Start your first session now? [Y/n] n
+
+Next steps:
+  am start feat --agent claude   # start your first session
+  am doctor                      # re-check readiness any time
+  am attach feat                 # jump back into a running session
+```
+
+---
+
 ## `am start <slug>`
 
 Create a new isolated agent session.

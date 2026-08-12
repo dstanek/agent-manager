@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-fn validate_slug(s: &str) -> Result<String, String> {
+pub fn validate_slug(s: &str) -> Result<String, String> {
     if s.is_empty() || s.len() > 40 {
         return Err(format!("slug must be 1–40 characters (got {})", s.len()));
     }
@@ -39,6 +39,16 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize am in the current repo
     Init,
+
+    /// Guided, interactive setup — init plus a short question flow plus verification
+    Setup {
+        /// Skip all prompts; use effective current values for every question
+        #[arg(short, long)]
+        yes: bool,
+        /// Explicitly set (and, if it differs from what's there, write) the agent
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
 
     /// Start a new agent session
     Start {
@@ -153,5 +163,83 @@ mod tests {
         assert!(validate_slug("_leading_underscore").is_err());
         assert!(validate_slug("a-leading-letter").is_ok());
         assert!(validate_slug("1-leading-digit").is_ok());
+    }
+
+    // ── am setup ──────────────────────────────────────────────────────────────
+
+    fn parse(args: &[&str]) -> Commands {
+        Cli::try_parse_from(args).expect("args should parse").command
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn setup_defaults_to_interactive_with_no_agent() {
+        match parse(&["am", "setup"]) {
+            Commands::Setup { yes, agent } => {
+                assert!(!yes);
+                assert_eq!(agent, None);
+            }
+            _ => panic!("expected Setup"),
+        }
+    }
+
+    #[test]
+    fn setup_accepts_yes_in_both_forms() {
+        for args in [&["am", "setup", "--yes"], &["am", "setup", "-y"]] {
+            match parse(args) {
+                Commands::Setup { yes, .. } => assert!(yes, "{args:?} should set yes"),
+                _ => panic!("expected Setup"),
+            }
+        }
+    }
+
+    #[test]
+    fn setup_accepts_agent_in_both_forms() {
+        for args in [
+            &["am", "setup", "--agent", "claude"],
+            &["am", "setup", "-a", "claude"],
+        ] {
+            match parse(args) {
+                Commands::Setup { agent, .. } => assert_eq!(agent.as_deref(), Some("claude")),
+                _ => panic!("expected Setup"),
+            }
+        }
+    }
+
+    #[test]
+    fn setup_accepts_yes_and_agent_together() {
+        // The documented CI form: bootstrap and deterministically set the agent.
+        match parse(&["am", "setup", "--yes", "--agent", "codex"]) {
+            Commands::Setup { yes, agent } => {
+                assert!(yes);
+                assert_eq!(agent.as_deref(), Some("codex"));
+            }
+            _ => panic!("expected Setup"),
+        }
+    }
+
+    #[test]
+    fn setup_does_not_validate_the_agent_name() {
+        // Unknown names are rejected later, by KnownAgent::parse, so the error message
+        // lists the valid agents instead of clap's generic one.
+        match parse(&["am", "setup", "--agent", "not-an-agent"]) {
+            Commands::Setup { agent, .. } => assert_eq!(agent.as_deref(), Some("not-an-agent")),
+            _ => panic!("expected Setup"),
+        }
+    }
+
+    #[test]
+    fn setup_takes_no_positional_arguments() {
+        assert!(Cli::try_parse_from(["am", "setup", "feat"]).is_err());
+    }
+
+    #[test]
+    fn init_still_parses_with_no_arguments() {
+        assert!(matches!(parse(&["am", "init"]), Commands::Init));
     }
 }

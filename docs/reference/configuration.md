@@ -57,6 +57,21 @@ Selecting the agent also selects the container image — `am` ships with built-i
 
 ---
 
+## Writing config with `am setup`
+
+[`am setup`](commands.md#am-setup) can write to both files on your behalf, in addition to creating them. It only ever touches two keys:
+
+| Key | File |
+|---|---|
+| `defaults.agent` | Project (`.am/config.toml`) |
+| `container.enabled` | Global (`~/.config/am/config.toml`) |
+
+Everything else in these tables — `[tmux]`, `[container]` besides `enabled`, `[devcontainer]`, `[agents.<name>]` — is left alone; `am setup` never asks about them, and hand-editing is still the way to change them.
+
+Writes to a file that already exists preserve everything else about it — comments, table order, blank lines — because they go through `toml_edit` rather than a template. If the value being set already matches what's in the file, nothing is written: the file's bytes and modification time are untouched. Writing a key that currently holds a table, an array, an array-of-tables, or an inline table is refused with an error rather than silently discarding it.
+
+---
+
 ## Unrecognised keys
 
 A key `am` does not know is a warning, not an error. The file still loads and every key `am` does recognise still applies:
