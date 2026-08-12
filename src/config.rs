@@ -523,14 +523,14 @@ pub fn global_state_dir() -> Option<PathBuf> {
     Some(base.join("am"))
 }
 
-/// Write the default project config file at `path` (creates parent directories as needed).
-/// The file is written as a fully-commented-out template so it never silently overrides
-/// global or compiled-in defaults.
-pub fn write_defaults(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = r#"# Project-level am configuration — .am/config.toml
+/// The project config skeleton — the text `am init` writes (via `write_defaults` below), and
+/// the base that `am setup`'s agent-aware variant (`onboarding::render_project_config_
+/// skeleton_with_agent`) starts from, so the two front doors cannot produce different repos.
+///
+/// Fully commented out: a project file that activated anything would silently override the
+/// user's global config the moment it was created.
+pub fn render_project_config_skeleton() -> &'static str {
+    r#"# Project-level am configuration — .am/config.toml
 # Uncomment only the values you want to override from your global or compiled-in defaults.
 # Precedence (highest wins): CLI flags > environment variables > project config > global config
 # Run `am generate-config` to see the full global config template with all options documented.
@@ -568,8 +568,17 @@ pub fn write_defaults(path: &Path) -> Result<()> {
 # agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
 # allow_host_commands = false # let initializeCommand run on the HOST — off by default
 # skip_lifecycle = false     # skip postCreateCommand and friends
-"#;
-    std::fs::write(path, content)?;
+"#
+}
+
+/// Write the default project config file at `path` (creates parent directories as needed).
+/// The file is written as a fully-commented-out template so it never silently overrides
+/// global or compiled-in defaults.
+pub fn write_defaults(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, render_project_config_skeleton())?;
     Ok(())
 }
 

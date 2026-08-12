@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::SystemTime;
 
 use cucumber::{given, then, when, World};
 use tempfile::TempDir;
@@ -38,6 +40,13 @@ pub struct AmWorld {
     mock_image_marker: Option<PathBuf>,
     /// The `devcontainer.metadata` label the mock runtime reports.
     mock_label_file: Option<PathBuf>,
+    /// Isolated `$HOME` for `am setup` scenarios, so a run that writes
+    /// `~/.config/am/config.toml` never touches the real developer's file. `None` means
+    /// `HOME`/`XDG_CONFIG_HOME` are inherited unchanged, as every non-`setup` scenario needs.
+    isolated_home: Option<TempDir>,
+    /// mtime + full content snapshots taken by "I record the state of ..." steps, compared
+    /// against by the matching "... is unchanged" steps.
+    recorded_state: HashMap<&'static str, (SystemTime, String)>,
 }
 
 impl Default for AmWorld {
@@ -55,6 +64,8 @@ impl Default for AmWorld {
             mock_devcontainer_log: None,
             mock_image_marker: None,
             mock_label_file: None,
+            isolated_home: None,
+            recorded_state: HashMap::new(),
         }
     }
 }
@@ -67,6 +78,26 @@ impl AmWorld {
     /// Path to the global sessions file: $state_dir/am/sessions.json
     fn global_sessions_path(&self) -> PathBuf {
         self.state_dir.path().join("am").join("sessions.json")
+    }
+
+    /// Set up an isolated `$HOME` for this scenario, creating it if it doesn't already
+    /// exist. Idempotent so "Given an isolated home directory" can be combined freely with
+    /// steps (like "a global config containing ...") that also need it.
+    fn isolated_home_path(&mut self) -> PathBuf {
+        if self.isolated_home.is_none() {
+            self.isolated_home = Some(TempDir::new().expect("create isolated home dir"));
+        }
+        self.isolated_home.as_ref().unwrap().path().to_path_buf()
+    }
+
+    /// `$HOME/.config/am/config.toml` under the isolated home — where `am setup` reads and
+    /// writes the global config when `XDG_CONFIG_HOME` is unset, which is `config::
+    /// global_config_path`'s documented fallback.
+    fn global_config_path(&mut self) -> PathBuf {
+        self.isolated_home_path()
+            .join(".config")
+            .join("am")
+            .join("config.toml")
     }
 
     /// Install a mock tmux binary that logs every invocation to a file.
@@ -254,6 +285,12 @@ impl AmWorld {
             .current_dir(&dir)
             .env("XDG_STATE_HOME", self.state_dir.path());
 
+        // Isolate HOME (and clear any inherited XDG_CONFIG_HOME) so a scenario that writes
+        // ~/.config/am/config.toml — namely `am setup` — never touches the real one.
+        if let Some(ref home) = self.isolated_home {
+            cmd.env("HOME", home.path()).env_remove("XDG_CONFIG_HOME");
+        }
+
         // Container setup: use mock podman when available; disable otherwise.
         if let Some(ref podman_bin) = self.mock_podman_bin.clone() {
             cmd.env("AM_CONTAINER_ENABLED", "true")
@@ -315,6 +352,10 @@ impl AmWorld {
             .stderr(Stdio::piped())
             .env("XDG_STATE_HOME", self.state_dir.path())
             .env("AM_CONTAINER_ENABLED", "false");
+
+        if let Some(ref home) = self.isolated_home {
+            cmd.env("HOME", home.path()).env_remove("XDG_CONFIG_HOME");
+        }
 
         if let Some(ref tmux_bin) = self.mock_tmux_bin.clone() {
             cmd.env("TMUX", "mock-session,0,0")
@@ -428,6 +469,45 @@ async fn given_tmux_window_gone(world: &mut AmWorld) {
 #[given("I am using a mock container runtime")]
 async fn given_mock_container(world: &mut AmWorld) {
     world.setup_mock_podman();
+}
+
+// ── `am setup` — isolated HOME / global config ───────────────────────────────
+
+#[given("an isolated home directory")]
+async fn given_isolated_home(world: &mut AmWorld) {
+    world.isolated_home_path();
+}
+
+#[given(expr = "a global config containing {string}")]
+async fn given_global_config(world: &mut AmWorld, body: String) {
+    let path = world.global_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    // Same unescaping as "a project config containing ...": Gherkin hands the string over
+    // with its escapes intact.
+    let content = body.replace("\\n", "\n").replace("\\\"", "\"");
+    fs::write(&path, content).unwrap();
+}
+
+/// Satisfies `validate_agent_credentials` for claude: it only checks that
+/// `$HOME/.claude` exists, never what's in it.
+#[given("claude credentials are present")]
+async fn given_claude_credentials(world: &mut AmWorld) {
+    let home = world.isolated_home_path();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+}
+
+#[given("I record the state of the project config file")]
+async fn given_record_project_config(world: &mut AmWorld) {
+    let path = world.project_path().join(".am").join("config.toml");
+    world.recorded_state.insert("project", snapshot(&path));
+}
+
+#[given("I record the state of the global config file")]
+async fn given_record_global_config(world: &mut AmWorld) {
+    let path = world.global_config_path();
+    world.recorded_state.insert("global", snapshot(&path));
 }
 
 // ── When ──────────────────────────────────────────────────────────────────────
@@ -639,6 +719,65 @@ async fn then_file_does_not_contain(world: &mut AmWorld, rel_path: String, text:
     );
 }
 
+// ── `am setup` — global config assertions ────────────────────────────────────
+
+#[then("the global config file exists")]
+async fn then_global_config_exists(world: &mut AmWorld) {
+    let path = world.global_config_path();
+    assert!(path.exists(), "expected global config at {path:?} to exist");
+}
+
+#[then("the global config file does not exist")]
+async fn then_global_config_absent(world: &mut AmWorld) {
+    let path = world.global_config_path();
+    assert!(!path.exists(), "expected no global config at {path:?}");
+}
+
+#[then(expr = "the global config file contains {string}")]
+async fn then_global_config_contains(world: &mut AmWorld, text: String) {
+    let path = world.global_config_path();
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    assert!(
+        content.contains(&text),
+        "expected {path:?} to contain {text:?}\ngot:\n{content}",
+    );
+}
+
+#[then(expr = "the global config file does not contain {string}")]
+async fn then_global_config_not_contain(world: &mut AmWorld, text: String) {
+    let path = world.global_config_path();
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    assert!(
+        !content.contains(&text),
+        "expected {path:?} to NOT contain {text:?}\ngot:\n{content}",
+    );
+}
+
+#[then("the project config file is unchanged")]
+async fn then_project_config_unchanged(world: &mut AmWorld) {
+    let path = world.project_path().join(".am").join("config.toml");
+    assert_unchanged(&path, world.recorded_state.get("project"));
+}
+
+#[then("the global config file is unchanged")]
+async fn then_global_config_unchanged(world: &mut AmWorld) {
+    let path = world.global_config_path();
+    let recorded = world.recorded_state.get("global").cloned();
+    assert_unchanged(&path, recorded.as_ref());
+}
+
+#[then(expr = "the project config sets {string} to {string}")]
+async fn then_project_config_key(world: &mut AmWorld, key_path: String, expected: String) {
+    let path = world.project_path().join(".am").join("config.toml");
+    assert_toml_key(&path, &key_path, &expected);
+}
+
+#[then(expr = "the global config sets {string} to {string}")]
+async fn then_global_config_key(world: &mut AmWorld, key_path: String, expected: String) {
+    let path = world.global_config_path();
+    assert_toml_key(&path, &key_path, &expected);
+}
+
 #[then(expr = "the mock tmux log contains {string}")]
 async fn then_tmux_log_contains(world: &mut AmWorld, text: String) {
     let log = world
@@ -704,6 +843,62 @@ async fn then_devcontainer_called_times(world: &mut AmWorld, expected: usize) {
     assert_eq!(
         calls, expected,
         "expected {expected} CLI call(s), got {calls}\n--- log ---\n{contents}"
+    );
+}
+
+/// Read a file's mtime and full content together, so "is unchanged" can assert both at
+/// once — the no-op contract `am setup`'s `update_*` functions promise is "not touched at
+/// all", not merely "produces the same bytes".
+fn snapshot(path: &Path) -> (SystemTime, String) {
+    let meta = fs::metadata(path).unwrap_or_else(|e| panic!("could not stat {path:?}: {e}"));
+    let mtime = meta.modified().unwrap_or_else(|e| {
+        panic!("platform does not support mtime, needed to check {path:?}: {e}")
+    });
+    let content = fs::read_to_string(path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    (mtime, content)
+}
+
+fn assert_unchanged(path: &Path, recorded: Option<&(SystemTime, String)>) {
+    let (recorded_mtime, recorded_content) = recorded.unwrap_or_else(|| {
+        panic!(
+            "no state was recorded for {path:?} — add a matching 'I record the state of ...' step"
+        )
+    });
+    let (mtime, content) = snapshot(path);
+    assert_eq!(
+        &content, recorded_content,
+        "expected {path:?} content to be unchanged"
+    );
+    assert_eq!(
+        &mtime, recorded_mtime,
+        "expected {path:?} mtime to be unchanged, but the file was rewritten"
+    );
+}
+
+/// Assert a dotted key path (e.g. "defaults.agent") in a TOML file equals `expected`,
+/// parsed rather than string-matched — a substring check can't tell a live
+/// `agent = "claude"` line apart from the commented example the skeleton ships with.
+fn assert_toml_key(path: &Path, key_path: &str, expected: &str) {
+    let content = fs::read_to_string(path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    // `Value`'s `FromStr` parses a single bare value expression, not a document — a
+    // document (with `[section]` headers and top-level comments) needs `from_str`'s
+    // document-level deserializer instead.
+    let value: toml::Value = toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("invalid TOML in {path:?}: {e}\n{content}"));
+    let mut current = &value;
+    for part in key_path.split('.') {
+        current = current
+            .get(part)
+            .unwrap_or_else(|| panic!("key {key_path:?} not found in {path:?}\n{content}"));
+    }
+    let actual = match current {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Boolean(b) => b.to_string(),
+        other => other.to_string(),
+    };
+    assert_eq!(
+        actual, expected,
+        "expected {key_path:?} in {path:?} to be {expected:?}, got {actual:?}\nfile:\n{content}",
     );
 }
 

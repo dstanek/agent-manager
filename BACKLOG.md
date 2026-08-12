@@ -37,6 +37,58 @@ Auth mount preset for Google Gemini CLI.
 
 ---
 
+## Onboarding
+
+### Feature: Guided Setup (`am setup`)
+> Spec: [`specs/guided-setup.md`](specs/guided-setup.md)
+
+Interactive alternative to `am init` — a guided front door that asks only the questions
+detected state can't answer, then verifies the result with `am doctor`'s own checks.
+
+**Fully implemented.** `am setup [--yes] [--agent <name>]` runs `am init`'s setup, asks which
+agent to use and (only when no container runtime is found and there's a global config to write
+to) whether to proceed with containers disabled, writes the answers, and runs `doctor::run()`
+to verify — offering to start a first session on success. `cargo clippy --all-targets -- -D
+warnings` is clean and `cargo test` passes (407 unit tests + 77 cucumber scenarios / 573
+steps, 0 failed). Code review passed with all findings resolved.
+
+- [x] `src/cli.rs`: `Commands::Setup { yes, agent }`
+- [x] `main.rs`: `cmd_init`'s directory/`.gitignore` logic extracted into `init_project`, shared
+      by `cmd_init` and `cmd_setup` so the two cannot drift apart
+- [x] `Cargo.toml`: `toml_edit = "0.25"` — format-preserving edits to a config file the user may
+      have hand-edited (comments, table order, and unrelated keys all survive)
+- [x] `src/onboarding.rs`: `DetectedState::gather` (project/global/compiled-default precedence
+      for `defaults.agent` and `container.enabled`), the `Io`/`TermIo`/`ScriptedIo` seam,
+      `ask_agent`/`ask_container_enabled`, the two config skeletons, and the `toml_edit`-based
+      `update_project_agent`/`update_global_container_enabled` (no-op, byte-for-byte, when the
+      requested value already matches; a structural value — table, array, array-of-tables,
+      inline table — is refused with an error rather than overwritten)
+- [x] `main.rs::cmd_setup`: wires detection → prompts → the two writes → `doctor::run` →
+      optional `cmd_start`; TTY-gated via `std::io::IsTerminal`; exit code matches `am doctor`'s
+- [x] `tests/features/setup.feature`: fresh repo, inherited-from-global agent (UC2), `--yes`
+      no-op on an already-configured repo, `--yes --agent` deterministic change and no-op,
+      failing-doctor exit code, unknown-agent rejection before any write, non-TTY without
+      `--yes`
+- [x] Docs: `docs/reference/commands.md` (`## am setup`), `docs/reference/configuration.md`
+      ("Writing config with `am setup`"), `README.md` quick start
+
+Three 🔵 suggestions from code review, deferred rather than dropped:
+
+- [ ] `resolved_agent_answer: Option<Option<container::KnownAgent>>` in `cmd_setup`
+      (`src/main.rs`) is a nested `Option` whose two levels mean different things — "resolved
+      without prompting yet?" and "is there a change to write?" A small named enum would make
+      the states self-documenting.
+- [ ] `src/onboarding.rs` is ~1400 lines. Not a problem yet (comparable to `config.rs`/
+      `main.rs`), but if it grows, the skeleton + `update_key`/`toml_edit` machinery (~250
+      lines) is the cleanest seam to split out first — it has no dependency on the `Io`/prompt
+      machinery.
+- [ ] The structural-value error says "found a table or array" without distinguishing which of
+      the four shapes. `toml_edit` exposes `Item::type_name()`/`Value::type_name()`, returning
+      exactly `"table"`/`"array of tables"`/`"inline table"`/`"array"`, if the message is worth
+      tightening later.
+
+---
+
 ## Polish & Distribution
 > Spec: [`specs/polish-and-distribution.md`](specs/polish-and-distribution.md)
 
