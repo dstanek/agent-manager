@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::SystemTime;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, SystemTime};
 
 use cucumber::{given, then, when, World};
 use tempfile::TempDir;
@@ -12,6 +13,57 @@ use tempfile::TempDir;
 use std::os::unix::fs::PermissionsExt;
 
 const AM_BIN: &str = env!("CARGO_BIN_EXE_am");
+
+/// Wall-clock cap on a single `run_am_pty` invocation. Real scenarios finish in well under a
+/// second; this exists only to turn a hang into a fast, clearly-labeled test failure. The
+/// mechanism is genuinely prone to hanging: `script` gives `am` a real pty, and a scripted
+/// input line missing its trailing `\n` leaves the child blocked in canonical-mode `read()`
+/// forever — it does not resolve on its own. See `wait_with_output_timeout` below and CI's own
+/// `timeout-minutes` on the `test` job, which is the second line of defence.
+const PTY_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits for `child` to exit, but no longer than `timeout` — unlike `Child::wait_with_output`,
+/// which has no deadline. On timeout, kills the child by pid and panics with a message that
+/// names the likely cause, so a hang fails *this one test* instead of blocking the suite (or,
+/// without CI's own timeout, the whole 360-minute Actions default).
+///
+/// A dedicated crate (e.g. `wait-timeout`) would do this more directly, but pulling in a new
+/// dev-dependency for one guard clause isn't worth it here: the wait itself has to run on a
+/// separate thread anyway (this thread owns `child` and blocks on `recv_timeout` instead), and
+/// once that's true, killing-by-pid is the only extra step needed — a handful of lines using
+/// only what's already in scope (`std::process`, `std::sync::mpsc`, `std::thread`).
+fn wait_with_output_timeout(child: Child, timeout: Duration) -> Output {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        // The receiver may already be gone (we already timed out and killed the child) by the
+        // time this send happens — that's expected, not an error worth reporting.
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = handle.join();
+            result.expect("wait for am (pty)")
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            // `child` itself was moved into the worker thread above, so pid + `kill` is the
+            // only handle left on the process from this thread. The worker's own
+            // `wait_with_output()` reaps it and returns immediately after, so joining here
+            // is just to avoid leaking the thread, not to recover a result we still want.
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ = handle.join();
+            panic!(
+                "am (pty) did not exit within {timeout:?} and was killed by the test \
+                 harness's watchdog — likely a scripted input line missing its trailing \
+                 newline, which wedges the child in canonical-mode read() forever"
+            );
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("pty-wait thread for am disconnected without sending a result")
+        }
+    }
+}
 
 // ── World ─────────────────────────────────────────────────────────────────────
 
@@ -341,6 +393,88 @@ impl AmWorld {
         self.last_output = Some(output);
     }
 
+    /// Run `am` with a *real* pseudo-terminal wired to stdin, via the `script` utility —
+    /// this is what makes `std::io::IsTerminal::is_terminal()` return `true` inside the
+    /// child process, the same gate `cmd_setup` uses to decide whether to run interactively
+    /// at all. `run_am_with_input`'s plain pipe cannot exercise this: a pipe is never a TTY,
+    /// so every scenario driving it takes the `--yes` path and never reaches the interactive
+    /// prompts (the layout menu, the customize sub-flow, or the write-target lines, which
+    /// print only inside the interactive branch).
+    ///
+    /// `input` is fed to `script`'s own stdin, which the pty line discipline both delivers to
+    /// the child *and* echoes back into the captured output. That echo lands wherever the
+    /// kernel happens to flush it — observed in practice to be up front, before the child's
+    /// own output — so callers must only ever assert with substring `contains`/`does not
+    /// contain` checks, never on ordering or exact-position of the child's own prompt text
+    /// relative to the echoed input.
+    ///
+    /// Every line of `input` must end in `\n`: the pty's canonical mode buffers a partial
+    /// line until it sees a newline (or an explicit EOF character), so a redirected file or
+    /// pipe that runs out of bytes without one leaves the child blocked forever rather than
+    /// reading a short line at EOF the way a plain pipe would.
+    fn run_am_pty(&mut self, args: &[&str], input: &str) {
+        let dir = self.project_path().to_path_buf();
+        // `script -c` runs its command through `sh -c`, so each arg needs shell quoting —
+        // single-quoted, with embedded single quotes escaped the POSIX way.
+        let quoted_args = args
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command_line = format!("{AM_BIN} {quoted_args}");
+
+        let mut cmd = Command::new("script");
+        cmd.args(["-qec", &command_line, "/dev/null"])
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("XDG_STATE_HOME", self.state_dir.path());
+
+        if let Some(ref home) = self.isolated_home {
+            cmd.env("HOME", home.path()).env_remove("XDG_CONFIG_HOME");
+        }
+
+        if let Some(ref podman_bin) = self.mock_podman_bin.clone() {
+            cmd.env("AM_CONTAINER_ENABLED", "true")
+                .env("AM_PODMAN_BIN", podman_bin)
+                .env("AM_CONTAINER_IMAGE", "test-image:latest");
+            if let Some(ref log) = self.mock_podman_log.clone() {
+                cmd.env("MOCK_PODMAN_LOG", log);
+            }
+        } else {
+            cmd.env("AM_CONTAINER_ENABLED", "false");
+        }
+
+        if let Some(ref tmux_bin) = self.mock_tmux_bin.clone() {
+            cmd.env("TMUX", "mock-session,0,0")
+                .env("AM_TMUX_BIN", tmux_bin);
+            if let Some(ref log) = self.mock_tmux_log.clone() {
+                cmd.env("MOCK_TMUX_LOG", log);
+            }
+        } else {
+            cmd.env_remove("TMUX");
+        }
+
+        for (k, v) in &self.extra_env.clone() {
+            cmd.env(k, v);
+        }
+        self.extra_env.clear();
+
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn 'script' (pty test harness): {e}"));
+
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .expect("write to pty stdin");
+
+        self.last_output = Some(wait_with_output_timeout(child, PTY_WAIT_TIMEOUT));
+    }
+
     /// Like `run_am` but writes `input` to the process's stdin before waiting.
     fn run_am_with_input(&mut self, args: &[&str], input: &str) {
         let dir = self.project_path().to_path_buf();
@@ -607,6 +741,22 @@ async fn when_run_with_input(world: &mut AmWorld, cmd: String, input: String) {
     world.run_am_with_input(args, &format!("{input}\n"));
 }
 
+/// Drives `am` through a real pty (see `AmWorld::run_am_pty`) so the genuinely interactive
+/// prompts — the ones gated on `stdin().is_terminal()` — actually run. `input`'s `\n` tokens
+/// are unescaped the same way `given_project_config`'s are: Gherkin hands the string over
+/// with literal backslash-n, one answer per prompt. A trailing newline is always appended so
+/// the pty's canonical mode never blocks on an unterminated final line.
+#[when(expr = "I run {string} through a pty with input {string}")]
+async fn when_run_pty(world: &mut AmWorld, cmd: String, input: String) {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let args: &[&str] = match parts.first() {
+        Some(&"am") => &parts[1..],
+        _ => &parts[..],
+    };
+    let unescaped = input.replace("\\n", "\n");
+    world.run_am_pty(args, &format!("{unescaped}\n"));
+}
+
 // ── Then ──────────────────────────────────────────────────────────────────────
 
 #[then("the command succeeds")]
@@ -743,6 +893,26 @@ async fn then_global_config_contains(world: &mut AmWorld, text: String) {
     );
 }
 
+/// Asserts table/line order was preserved by an in-place edit — `update_key` (`toml_edit`)
+/// promises never to reorder existing content, only to touch the one key it was asked to
+/// change, and this is the direct way to pin that promise instead of inferring it from
+/// content-only `contains` checks.
+#[then(expr = "the global config file has {string} before {string}")]
+async fn then_global_config_order(world: &mut AmWorld, first: String, second: String) {
+    let path = world.global_config_path();
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    let first_pos = content
+        .find(&first)
+        .unwrap_or_else(|| panic!("{first:?} not found in {path:?}\n{content}"));
+    let second_pos = content
+        .find(&second)
+        .unwrap_or_else(|| panic!("{second:?} not found in {path:?}\n{content}"));
+    assert!(
+        first_pos < second_pos,
+        "expected {first:?} to appear before {second:?} in {path:?}\n{content}",
+    );
+}
+
 #[then(expr = "the global config file does not contain {string}")]
 async fn then_global_config_not_contain(world: &mut AmWorld, text: String) {
     let path = world.global_config_path();
@@ -772,10 +942,27 @@ async fn then_project_config_key(world: &mut AmWorld, key_path: String, expected
     assert_toml_key(&path, &key_path, &expected);
 }
 
+/// The absence counterpart to "the project config sets ..." — see `then_global_config_key_
+/// unset` for why this has to be parsed rather than string-matched.
+#[then(expr = "the project config does not set {string}")]
+async fn then_project_config_key_unset(world: &mut AmWorld, key_path: String) {
+    let path = world.project_path().join(".am").join("config.toml");
+    assert_toml_key_absent(&path, &key_path);
+}
+
 #[then(expr = "the global config sets {string} to {string}")]
 async fn then_global_config_key(world: &mut AmWorld, key_path: String, expected: String) {
     let path = world.global_config_path();
     assert_toml_key(&path, &key_path, &expected);
+}
+
+/// The absence counterpart to "the global config sets ...": parsed, not string-matched, so a
+/// commented-out example (`# agent_pane = "left"`) — which a substring search cannot
+/// distinguish from a live key — correctly reads as "unset".
+#[then(expr = "the global config does not set {string}")]
+async fn then_global_config_key_unset(world: &mut AmWorld, key_path: String) {
+    let path = world.global_config_path();
+    assert_toml_key_absent(&path, &key_path);
 }
 
 #[then(expr = "the mock tmux log contains {string}")]
@@ -899,6 +1086,23 @@ fn assert_toml_key(path: &Path, key_path: &str, expected: &str) {
     assert_eq!(
         actual, expected,
         "expected {key_path:?} in {path:?} to be {expected:?}, got {actual:?}\nfile:\n{content}",
+    );
+}
+
+/// Assert a dotted key path is absent from a TOML file — parsed the same way as
+/// `assert_toml_key`, for the same reason: a substring search can't tell a commented-out
+/// example apart from a live key that happens to hold the same text.
+fn assert_toml_key_absent(path: &Path, key_path: &str) {
+    let content = fs::read_to_string(path).unwrap_or_else(|_| panic!("could not read {path:?}"));
+    let value: toml::Value = toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("invalid TOML in {path:?}: {e}\n{content}"));
+    let mut current = Some(&value);
+    for part in key_path.split('.') {
+        current = current.and_then(|v| v.get(part));
+    }
+    assert!(
+        current.is_none(),
+        "expected {key_path:?} to be unset in {path:?}, found {current:?}\nfile:\n{content}",
     );
 }
 
