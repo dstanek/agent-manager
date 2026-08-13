@@ -234,6 +234,13 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     } else {
         onboarding::ask_container_enabled(&mut io, &detected)?
     };
+    // Layout, like containers, is skipped entirely under `--yes` — neither has an "unanswered
+    // means broken" stake the way an unset agent does, so `--yes` writes nothing for either.
+    let layout_answer = if yes {
+        None
+    } else {
+        onboarding::ask_layout(&mut io, &detected)?
+    };
 
     if let Some(agent) = agent_answer {
         let written = onboarding::update_project_agent(&detected.project_config_path, agent)?;
@@ -248,11 +255,33 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
                 detected.project_config_path.display()
             );
         }
+        // Only reachable when the answer was genuinely interactive (the flag/`--yes` path
+        // above already rendered the active line at creation, so `written` is false there):
+        // the file may still have `defaults.agent`'s commented example sitting above the key
+        // `update_project_agent` just inserted, and it needs removing. Not gated on whether
+        // this run created the file — `strip_project_agent_example` only ever removes a line
+        // that is byte-for-byte identical to our own skeleton's, which is what makes it safe
+        // against a file `am init` wrote in an earlier invocation, or one a teammate committed,
+        // just as much as one this run just wrote.
+        if written {
+            onboarding::strip_project_agent_example(&detected.project_config_path)?;
+        }
     }
     if let Some(enabled) = container_answer {
         if let Some(path) = detected.global_config_path.as_deref() {
             if onboarding::update_global_container_enabled(path, enabled)? {
                 println!("Set container.enabled = {enabled} in {}", path.display());
+                onboarding::strip_global_container_enabled_example(path)?;
+            }
+        }
+    }
+    if let Some((agent_pane, split, split_percent)) = layout_answer {
+        if let Some(path) = detected.global_config_path.as_deref() {
+            let written =
+                onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
+            if !written.is_empty() {
+                println!("Set tmux.{} in {}", written.join(", tmux."), path.display());
+                onboarding::strip_global_tmux_layout_examples(path, &written)?;
             }
         }
     }

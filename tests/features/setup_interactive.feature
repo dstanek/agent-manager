@@ -1,0 +1,128 @@
+Feature: am setup — the interactive prompts
+  setup.feature exercises only `am setup --yes[, --agent <name>]`, because a plain-pipe
+  subprocess is never a TTY and `cmd_setup` gates every prompt on `stdin().is_terminal()`.
+  These scenarios drive the real binary through an actual pseudo-terminal (via the `script`
+  utility — see `AmWorld::run_am_pty`), so the prompts that only run interactively — the
+  write-target lines, the pane-layout menu, and its customize sub-flow — get end-to-end
+  coverage against the real process and a real filesystem, not just `onboarding.rs`'s
+  `ScriptedIo` unit tests.
+
+  Every scenario passes `--agent claude` and mocks a container runtime so the only prompt
+  left to drive is the layout question, unless a scenario is specifically about a different
+  question (the write-target-line scenario) or needs the containers question too.
+
+  Background:
+    Given an isolated home directory
+    And a git repository
+    And claude credentials are present
+    And I am using a mock container runtime
+
+  Scenario Outline: choosing a layout preset writes exactly that triple to the global config, never the project one
+    Given a global config containing "[tmux]\nagent_pane = \"right\"\nsplit = \"vertical\"\nsplit_percent = 33\n"
+    When I run "am setup --agent claude" through a pty with input "<answer>\nn"
+    Then the command succeeds
+    And the global config sets "tmux.agent_pane" to "<agent_pane>"
+    And the global config sets "tmux.split" to "<split>"
+    And the global config sets "tmux.split_percent" to "<split_percent>"
+    And the project config does not set "tmux.agent_pane"
+    And the project config does not set "tmux.split"
+    And the project config does not set "tmux.split_percent"
+
+    Examples:
+      | answer | agent_pane | split      | split_percent |
+      | 1      | left       | horizontal | 50             |
+      | 2      | right      | horizontal | 50             |
+      | 3      | left       | horizontal | 70             |
+      | 4      | left       | vertical   | 50             |
+
+  Scenario: customize words the pane question left/right after a horizontal split, and writes the chosen triple
+    When I run "am setup --agent claude" through a pty with input "5\n1\n2\n60\ny\nn"
+    Then the command succeeds
+    And the output contains "Which side should the agent be on?"
+    And the output contains "[1] left"
+    And the output contains "[2] right"
+    And the output does not contain "top or on the bottom"
+    And the global config sets "tmux.agent_pane" to "right"
+    And the global config sets "tmux.split" to "horizontal"
+    And the global config sets "tmux.split_percent" to "60"
+
+  Scenario: customize words the pane question top/bottom after a vertical split, and writes the chosen triple
+    When I run "am setup --agent claude" through a pty with input "5\n2\n1\n40\ny\nn"
+    Then the command succeeds
+    And the output contains "Should the agent be on top or on the bottom?"
+    And the output contains "[1] top"
+    And the output contains "[2] bottom"
+    And the output does not contain "Which side should the agent be on?"
+    And the global config sets "tmux.agent_pane" to "left"
+    And the global config sets "tmux.split" to "vertical"
+    And the global config sets "tmux.split_percent" to "40"
+
+  Scenario: declining the customize preview re-shows the preset menu instead of the whole flow restarting elsewhere
+    When I run "am setup --agent claude" through a pty with input "5\n\n\n\nn\n2\nn"
+    Then the command succeeds
+    And the output contains "Use this layout?"
+    And the global config sets "tmux.agent_pane" to "right"
+    And the global config sets "tmux.split" to "horizontal"
+    And the global config sets "tmux.split_percent" to "50"
+
+  Scenario: every question states where its answer will be saved, with paths shortened for display
+    # Overrides the Background's mock runtime with two nonexistent binaries, so the containers
+    # question — normally skipped once a runtime is found — actually fires, and its own
+    # write-target line can be pinned alongside the other two.
+    Given I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
+    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
+    When I run "am setup" through a pty with input "\ny\n\nn"
+    Then the output contains "Agent — just this repo; saved to .am/config.toml."
+    And the output contains "Containers — every repo on this machine; saved to ~/.config/am/config.toml."
+    And the output contains "Pane layout — every repo on this machine; saved to ~/.config/am/config.toml."
+
+  Scenario: an interactive first run leaves no stale example above any value it activates
+    When I run "am setup" through a pty with input "\n5\n2\n2\n77\ny\nn"
+    Then the command succeeds
+    And the file ".am/config.toml" does not contain '# agent = "claude"'
+    And the file ".am/config.toml" contains 'agent = "claude"'
+    And the global config file does not contain '# agent_pane = "left"'
+    And the global config file does not contain '# split = "horizontal"'
+    And the global config file does not contain "# split_percent = 50"
+    And the global config sets "tmux.agent_pane" to "right"
+    And the global config sets "tmux.split" to "vertical"
+    And the global config sets "tmux.split_percent" to "77"
+
+  Scenario: a project config from an earlier "am init" invocation also loses its stale agent example
+    Given am init has been run
+    When I run "am setup" through a pty with input "\n1\nn"
+    Then the command succeeds
+    And the file ".am/config.toml" contains 'agent = "claude"'
+    And the file ".am/config.toml" does not contain '# agent = "claude"'
+
+  Scenario: a hand-edited near-miss example line survives, alongside unrelated keys and table order
+    Given a global config containing "# my machine\n[container]\nenabled = true\n\n[tmux]\nagent_pane = \"left\"\n# agent_pane = \"left\"   # example I kept deliberately\nsplit_percent = 50\n"
+    When I run "am setup --agent claude" through a pty with input "5\n1\n2\n80\ny\nn"
+    Then the command succeeds
+    And the global config file contains "# my machine"
+    And the global config file contains "enabled = true"
+    And the global config file contains '# agent_pane = "left"   # example I kept deliberately'
+    And the global config file has "[container]" before "[tmux]"
+    And the global config sets "tmux.agent_pane" to "right"
+    And the global config sets "tmux.split_percent" to "80"
+
+  Scenario: pressing Enter through every interactive question is a genuine no-op on both files
+    Given a project config containing "[defaults]\nagent = \"claude\"\n"
+    And a global config containing "[tmux]\nagent_pane = \"right\"\nsplit = \"vertical\"\nsplit_percent = 30\n[container]\nenabled = true\n"
+    And I record the state of the project config file
+    And I record the state of the global config file
+    When I run "am setup" through a pty with input "\n\nn"
+    Then the command succeeds
+    And the project config file is unchanged
+    And the global config file is unchanged
+
+  Scenario: the project-override caveat appears only when the project config sets its own layout
+    Given a project config containing "[defaults]\nagent = \"claude\"\n[tmux]\nsplit_percent = 65\n"
+    When I run "am setup --agent claude" through a pty with input "1\nn"
+    Then the command succeeds
+    And the output contains "this project's config already sets its own pane layout"
+
+  Scenario: no project-override caveat when the project config sets nothing of its own
+    When I run "am setup --agent claude" through a pty with input "1\nn"
+    Then the command succeeds
+    And the output does not contain "already sets its own"

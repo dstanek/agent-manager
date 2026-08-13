@@ -53,6 +53,125 @@ impl Source {
             Source::CompiledDefault => "am's default",
         }
     }
+
+    /// The most specific of several sources, using the same project → global → compiled-
+    /// default precedence `resolve_effective` reads with. Used only where several tracked
+    /// values are summarized on one line (the layout question's "currently:" line spans all
+    /// three `tmux.*` keys at once) — an individual value's own source is always shown
+    /// wherever there is room for one.
+    fn most_specific(sources: [Source; 3]) -> Source {
+        sources
+            .into_iter()
+            .min_by_key(|source| match source {
+                Source::Project => 0,
+                Source::Global => 1,
+                Source::CompiledDefault => 2,
+            })
+            .expect("non-empty array")
+    }
+}
+
+// ── The write-target line, shared by every question ────────────────────────────
+
+/// Where a question's answer is saved — fixed per question, independent of where the
+/// *displayed default* happens to be read from (that's [`Source`], a different question:
+/// "where did this value come from" vs. "where would a change go").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteScope {
+    Project,
+    Global,
+}
+
+impl WriteScope {
+    fn phrase(self) -> &'static str {
+        match self {
+            WriteScope::Project => "just this repo",
+            WriteScope::Global => "every repo on this machine",
+        }
+    }
+}
+
+/// One line, shared by `ask_agent`, `ask_container_enabled`, and `ask_layout` — a single
+/// implementation so the wording cannot drift between them, and so it's pinned by one set of
+/// tests instead of three copies that could disagree. Always the first line printed by the
+/// question it belongs to, before the "currently: ..." line.
+///
+/// `base` is what `path` gets shortened against for display — `detected.repo_root` for
+/// `WriteScope::Project`, `detected.home_dir` for `WriteScope::Global` — never the raw
+/// absolute path: an un-shortened project path routinely runs to 80+ characters and wraps,
+/// defeating the whole point of a line that exists for at-a-glance clarity. `None` (no known
+/// base, or `path` isn't actually under it) falls back to the absolute path.
+fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
+    let shown = shorten_for_display(scope, path, base);
+    format!("{label} — {}; saved to {}.", scope.phrase(), shown.display())
+}
+
+/// The one shortening rule both scopes share: relative to `base` when `path` is under it,
+/// `~`-prefixed on top of that for `WriteScope::Global` (a repo-relative path already reads
+/// clearly without a marker of its own — `.am/config.toml` — while a home-relative one needs
+/// the `~` to say so, the same convention a shell prompt uses).
+fn shorten_for_display(scope: WriteScope, path: &Path, base: Option<&Path>) -> PathBuf {
+    let Some(relative) = base.and_then(|base| path.strip_prefix(base).ok()) else {
+        return path.to_path_buf();
+    };
+    match scope {
+        WriteScope::Project => relative.to_path_buf(),
+        WriteScope::Global => Path::new("~").join(relative),
+    }
+}
+
+/// `PaneSide` and `SplitDirection` have no `Display` impl (matching the rest of the codebase,
+/// which hand-matches these strings at each call site rather than adding one) — one place for
+/// the words that also double as the TOML values `update_global_tmux_layout` writes.
+fn pane_side_str(side: &config::PaneSide) -> &'static str {
+    match side {
+        config::PaneSide::Left => "left",
+        config::PaneSide::Right => "right",
+    }
+}
+
+fn split_str(direction: &config::SplitDirection) -> &'static str {
+    match direction {
+        config::SplitDirection::Horizontal => "horizontal",
+        config::SplitDirection::Vertical => "vertical",
+    }
+}
+
+/// Names where the agent pane sits, worded the same way the customize sub-flow's own
+/// pane-side question (6b) already words it: "left"/"right" for a horizontal split,
+/// "top"/"bottom" for a vertical one — a vertical `render_layout` preview can't show
+/// proportion, so the words describing *position* shouldn't silently switch back to
+/// left/right either.
+fn agent_position_str(
+    agent_pane: &config::PaneSide,
+    split: &config::SplitDirection,
+) -> &'static str {
+    match (split, agent_pane) {
+        (config::SplitDirection::Horizontal, config::PaneSide::Left) => "left",
+        (config::SplitDirection::Horizontal, config::PaneSide::Right) => "right",
+        (config::SplitDirection::Vertical, config::PaneSide::Left) => "top",
+        (config::SplitDirection::Vertical, config::PaneSide::Right) => "bottom",
+    }
+}
+
+/// One line, printed right alongside a customize preview (both directions, not just the
+/// stacked one), stating in text what percentage each pane actually gets. A stacked preview
+/// renders as two equally-sized boxes regardless of `percent` — `render_layout`'s own doc
+/// comment calls this "cosmetic best-effort" — so without this line a user confirming a
+/// lopsided vertical split (e.g. 95/5) would be looking at a picture that contradicts the
+/// value about to be saved. Horizontal previews already convey proportion through box width,
+/// but this line is shown there too so the wording doesn't quietly differ between the two —
+/// the same property in text, every time.
+fn layout_proportion_line(
+    agent_pane: &config::PaneSide,
+    split: &config::SplitDirection,
+    percent: u8,
+) -> String {
+    format!(
+        "  agent ({}) gets {percent}%, the other pane gets {}%.",
+        agent_position_str(agent_pane, split),
+        100 - percent
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +190,19 @@ pub struct Effective<T> {
 pub struct DetectedState {
     /// `None` when the current directory is not inside a repository.
     pub vcs: Option<config::Vcs>,
+    /// The base `write_target_line` shortens `project_config_path` against for display.
+    /// `None` alongside `vcs` being `None`.
+    pub repo_root: Option<PathBuf>,
     pub project_config_path: PathBuf,
     pub project_config_exists: bool,
     /// `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set.
     pub global_config_path: Option<PathBuf>,
     pub global_config_exists: bool,
+    /// `$HOME`, kept only so `write_target_line` can show `global_config_path` with `~`
+    /// substituted instead of the full absolute path — a question about "every repo on this
+    /// machine" earns nothing from also spelling out one specific machine's home directory.
+    /// `None` when `HOME` isn't set, in which case the absolute path is shown as-is.
+    pub home_dir: Option<PathBuf>,
     pub tmux_present: bool,
     /// Empty, one, or both — the containers question turns on this being empty.
     pub runtimes_found: Vec<container::RuntimeKind>,
@@ -84,6 +211,9 @@ pub struct DetectedState {
     pub agent_credentials: Vec<(container::KnownAgent, bool)>,
     pub effective_agent: Effective<Option<container::KnownAgent>>,
     pub effective_container_enabled: Effective<bool>,
+    pub effective_tmux_agent_pane: Effective<config::PaneSide>,
+    pub effective_tmux_split: Effective<config::SplitDirection>,
+    pub effective_tmux_split_percent: Effective<u8>,
 }
 
 impl DetectedState {
@@ -103,8 +233,15 @@ impl DetectedState {
         let project_config_exists = project_config_path.is_file();
         let global_config_path = config::global_config_path();
         let global_config_exists = global_config_path.as_deref().is_some_and(Path::is_file);
+        let home_dir = std::env::var_os("HOME").map(PathBuf::from);
 
-        let (effective_agent, effective_container_enabled) = resolve_effective(
+        let (
+            effective_agent,
+            effective_container_enabled,
+            effective_tmux_agent_pane,
+            effective_tmux_split,
+            effective_tmux_split_percent,
+        ) = resolve_effective(
             project_config_exists.then_some(project_config_path.as_path()),
             global_config_path.as_deref().filter(|p| p.is_file()),
         );
@@ -138,16 +275,21 @@ impl DetectedState {
 
         Ok(Self {
             vcs,
+            repo_root: repo_root.map(Path::to_path_buf),
             project_config_path,
             project_config_exists,
             global_config_path,
             global_config_exists,
+            home_dir,
             tmux_present: tmux::find_tmux().is_some(),
             runtimes_found,
             devcontainer,
             agent_credentials,
             effective_agent,
             effective_container_enabled,
+            effective_tmux_agent_pane,
+            effective_tmux_split,
+            effective_tmux_split_percent,
         })
     }
 
@@ -172,7 +314,7 @@ impl DetectedState {
     }
 }
 
-/// The two keys `am setup` tracks, read from one file on its own.
+/// The tracked keys `am setup` reads from one file on its own.
 ///
 /// Deliberately not `config::load_with_global`: that merges the layers into a single answer,
 /// and knowing *which* layer an answer came from is the whole point here.
@@ -180,6 +322,7 @@ impl DetectedState {
 struct TrackedKeys {
     defaults: TrackedDefaults,
     container: TrackedContainer,
+    tmux: TrackedTmux,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -192,15 +335,22 @@ struct TrackedContainer {
     enabled: Option<bool>,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct TrackedTmux {
+    agent_pane: Option<config::PaneSide>,
+    split: Option<config::SplitDirection>,
+    split_percent: Option<u8>,
+}
+
 /// Read the tracked keys out of one config file. A missing or unparseable file reads as
 /// "sets nothing" — `doctor::run` is what reports a broken config, and it runs a few steps
 /// later against the same file.
 ///
-/// `defaults` and `container` are deserialized independently rather than as one
-/// `toml::from_str::<TrackedKeys>` call: that call fails the whole read the moment either
+/// `defaults`, `container`, and `tmux` are deserialized independently rather than as one
+/// `toml::from_str::<TrackedKeys>` call: that call fails the whole read the moment any one
 /// sub-table is malformed, which would let a bad `defaults.agent` mask a perfectly
-/// well-formed `container.enabled` in the same file (and vice versa) — turning one broken
-/// key into two questions asked without cause.
+/// well-formed `container.enabled` (or `tmux.*`) in the same file, and vice versa — turning
+/// one broken key into extra questions asked without cause.
 fn read_tracked(path: Option<&Path>) -> TrackedKeys {
     let Some(path) = path else {
         return TrackedKeys::default();
@@ -222,18 +372,31 @@ fn read_tracked(path: Option<&Path>) -> TrackedKeys {
         .cloned()
         .and_then(|value| value.try_into::<TrackedContainer>().ok())
         .unwrap_or_default();
+    let tmux = root
+        .get("tmux")
+        .cloned()
+        .and_then(|value| value.try_into::<TrackedTmux>().ok())
+        .unwrap_or_default();
 
-    TrackedKeys { defaults, container }
+    TrackedKeys {
+        defaults,
+        container,
+        tmux,
+    }
 }
 
-/// Resolve both tracked keys with project → global → compiled-default precedence, keeping
+/// Resolve every tracked key with project → global → compiled-default precedence, keeping
 /// the layer each answer came from.
+#[allow(clippy::type_complexity)]
 fn resolve_effective(
     project: Option<&Path>,
     global: Option<&Path>,
 ) -> (
     Effective<Option<container::KnownAgent>>,
     Effective<bool>,
+    Effective<config::PaneSide>,
+    Effective<config::SplitDirection>,
+    Effective<u8>,
 ) {
     let project = read_tracked(project);
     let global = read_tracked(global);
@@ -271,7 +434,51 @@ fn resolve_effective(
         },
     };
 
-    (agent, enabled)
+    let default_tmux = config::TmuxConfig::default();
+    let agent_pane = match (project.tmux.agent_pane, global.tmux.agent_pane) {
+        (Some(value), _) => Effective {
+            value,
+            source: Source::Project,
+        },
+        (None, Some(value)) => Effective {
+            value,
+            source: Source::Global,
+        },
+        (None, None) => Effective {
+            value: default_tmux.agent_pane,
+            source: Source::CompiledDefault,
+        },
+    };
+    let split = match (project.tmux.split, global.tmux.split) {
+        (Some(value), _) => Effective {
+            value,
+            source: Source::Project,
+        },
+        (None, Some(value)) => Effective {
+            value,
+            source: Source::Global,
+        },
+        (None, None) => Effective {
+            value: default_tmux.split,
+            source: Source::CompiledDefault,
+        },
+    };
+    let split_percent = match (project.tmux.split_percent, global.tmux.split_percent) {
+        (Some(value), _) => Effective {
+            value,
+            source: Source::Project,
+        },
+        (None, Some(value)) => Effective {
+            value,
+            source: Source::Global,
+        },
+        (None, None) => Effective {
+            value: default_tmux.split_percent,
+            source: Source::CompiledDefault,
+        },
+    };
+
+    (agent, enabled, agent_pane, split, split_percent)
 }
 
 // ── The IO seam ───────────────────────────────────────────────────────────────
@@ -349,6 +556,12 @@ pub fn ask_agent(
     }
 
     let default = detected.default_agent();
+    io.println(&write_target_line(
+        "Agent",
+        WriteScope::Project,
+        &detected.project_config_path,
+        detected.repo_root.as_deref(),
+    ));
     io.println("Which agent do you use?");
     for (index, agent) in MENU.iter().enumerate() {
         // Presence of credentials, never their contents.
@@ -409,11 +622,20 @@ fn parse_agent_answer(answer: &str) -> Option<container::KnownAgent> {
 /// acted on is worse than not asking it. `cmd_setup` has already told the user about the
 /// missing environment once, at the point it skips creating the global file itself.
 pub fn ask_container_enabled(io: &mut dyn Io, detected: &DetectedState) -> Result<Option<bool>> {
-    if !detected.runtimes_found.is_empty() || detected.global_config_path.is_none() {
+    if !detected.runtimes_found.is_empty() {
         return Ok(None);
     }
+    let Some(path) = detected.global_config_path.as_deref() else {
+        return Ok(None);
+    };
 
     let currently_enabled = detected.effective_container_enabled.value;
+    io.println(&write_target_line(
+        "Containers",
+        WriteScope::Global,
+        path,
+        detected.home_dir.as_deref(),
+    ));
     io.println("No container runtime found on this machine (neither podman nor docker).");
     io.println(&format!(
         "  currently: container.enabled = {currently_enabled} ({})",
@@ -451,6 +673,341 @@ fn parse_yes_no(answer: &str) -> Option<bool> {
         "n" | "no" => Some(false),
         _ => None,
     }
+}
+
+// ── Question 6: pane layout ───────────────────────────────────────────────────
+
+/// The four fixed presets `ask_layout`'s menu offers, in the order shown. Preset 1 is `am`'s
+/// compiled default (`TmuxConfig::default()`), which is why it's what a first-time user with
+/// nothing configured sees pre-selected.
+const LAYOUT_PRESETS: [(config::PaneSide, config::SplitDirection, u8); 4] = [
+    (config::PaneSide::Left, config::SplitDirection::Horizontal, 50),
+    (config::PaneSide::Right, config::SplitDirection::Horizontal, 50),
+    (config::PaneSide::Left, config::SplitDirection::Horizontal, 70),
+    (config::PaneSide::Left, config::SplitDirection::Vertical, 50),
+];
+
+/// One label per entry of [`LAYOUT_PRESETS`], same order — kept as a parallel array rather
+/// than derived from the triple because "stacked, agent on top" is a name for the *shape*,
+/// not something worth re-deriving from `(PaneSide, SplitDirection, u8)` for a fixed set of
+/// four.
+const LAYOUT_PRESET_LABELS: [&str; 4] = [
+    "agent left, 50/50",
+    "agent right, 50/50",
+    "agent left, 70/30",
+    "stacked, agent on top, 50/50",
+];
+
+/// Printed once, before the layout question's menu, only when the project config already
+/// pins its own value for at least one of the three keys this question writes. A project-
+/// level `tmux.*` override outranks the global file for this repo specifically, so an answer
+/// here would otherwise look like it silently did nothing the next time a session starts in
+/// this repo.
+const PROJECT_LAYOUT_OVERRIDE_NOTE: &str = "Note: this project's config already sets its own \
+    pane layout — your answer here is saved globally and won't change sessions in this repo \
+    until that override is removed.";
+
+fn layout_has_project_override(detected: &DetectedState) -> bool {
+    detected.effective_tmux_agent_pane.source == Source::Project
+        || detected.effective_tmux_split.source == Source::Project
+        || detected.effective_tmux_split_percent.source == Source::Project
+}
+
+/// The menu's "currently: ..." line, spanning all three keys at once. Its single source
+/// label is the most specific of the three (see [`Source::most_specific`]) — in the common
+/// case all three come from the same file, and this reads correctly there; a config that
+/// mixes sources across the three keys is an edge case this line does not attempt to spell
+/// out further, since the per-key sub-questions inside `ask_layout_custom` each show their
+/// own value's actual source.
+fn current_layout_line(detected: &DetectedState) -> String {
+    let source = Source::most_specific([
+        detected.effective_tmux_agent_pane.source,
+        detected.effective_tmux_split.source,
+        detected.effective_tmux_split_percent.source,
+    ]);
+    format!(
+        "  currently: agent_pane={}, split={}, split_percent={} ({})",
+        pane_side_str(&detected.effective_tmux_agent_pane.value),
+        split_str(&detected.effective_tmux_split.value),
+        detected.effective_tmux_split_percent.value,
+        source.label()
+    )
+}
+
+/// Interior width of the two-pane preview box, in characters — wide enough that a 50/50 (or
+/// 70/30) split reads comfortably, narrow enough to sit next to a preset's label on one line.
+const PREVIEW_WIDTH: usize = 20;
+
+/// A small fixed-width ASCII diagram, [`PREVIEW_WIDTH`] characters wide, proportioned by
+/// `percent` and clamped so neither label is ever squeezed below its own length. Used both
+/// for the four preset previews and for the one customize preview, so there is exactly one
+/// rendering implementation to keep correct.
+///
+/// A horizontal split renders as one line, two boxes side by side, proportioned by width. A
+/// vertical (stacked) split renders as two lines, one box per line — height can't be
+/// meaningfully proportioned in single-line ASCII the way width can, so a stacked preview
+/// always shows two equally-sized boxes regardless of `percent`. `percent` still governs
+/// which value actually gets written; it just doesn't change how the stacked preview looks,
+/// which is exactly what makes this a "cosmetic best-effort" render — see the spec.
+fn render_layout(
+    agent_pane: &config::PaneSide,
+    split: &config::SplitDirection,
+    percent: u8,
+) -> Vec<String> {
+    const AGENT: &str = "agent";
+    const OTHER: &str = "shell";
+
+    match split {
+        config::SplitDirection::Horizontal => {
+            let (left_label, right_label, left_percent) = match agent_pane {
+                config::PaneSide::Left => (AGENT, OTHER, percent),
+                config::PaneSide::Right => (OTHER, AGENT, 100 - percent),
+            };
+            vec![render_horizontal_box(left_label, right_label, left_percent)]
+        }
+        config::SplitDirection::Vertical => {
+            let (top_label, bottom_label) = match agent_pane {
+                config::PaneSide::Left => (AGENT, OTHER),
+                config::PaneSide::Right => (OTHER, AGENT),
+            };
+            vec![render_stacked_box(top_label), render_stacked_box(bottom_label)]
+        }
+    }
+}
+
+fn render_horizontal_box(left_label: &str, right_label: &str, left_percent: u8) -> String {
+    let left_min = left_label.len() + 2;
+    let right_min = right_label.len() + 2;
+    let total = PREVIEW_WIDTH.max(left_min + right_min);
+    let raw_left = total * left_percent as usize / 100;
+    let left_width = raw_left.clamp(left_min, total - right_min);
+    let right_width = total - left_width;
+    format!("[{left_label:^left_width$}|{right_label:^right_width$}]")
+}
+
+fn render_stacked_box(label: &str) -> String {
+    let width = PREVIEW_WIDTH.max(label.len() + 2);
+    format!("[{label:^width$}]")
+}
+
+/// The write implied by choosing `(agent_pane, split, split_percent)`, or `None` when it
+/// exactly matches what all three keys already resolve to.
+fn layout_write(
+    detected: &DetectedState,
+    agent_pane: config::PaneSide,
+    split: config::SplitDirection,
+    split_percent: u8,
+) -> Option<(config::PaneSide, config::SplitDirection, u8)> {
+    let unchanged = detected.effective_tmux_agent_pane.value == agent_pane
+        && detected.effective_tmux_split.value == split
+        && detected.effective_tmux_split_percent.value == split_percent;
+    (!unchanged).then_some((agent_pane, split, split_percent))
+}
+
+/// Ask for a pane layout — the preset menu, falling through to [`ask_layout_custom`] on
+/// "customize…" — and return the chosen `(agent_pane, split, split_percent)` triple to write,
+/// or `None` when it exactly matches what's already effective.
+///
+/// Not asked at all when `detected.global_config_path` is `None` (same rule as
+/// `ask_container_enabled`); `cmd_setup` is what skips calling this under `--yes`.
+///
+/// The outer `loop` is what re-shows the whole menu (write-target line, caveat, presets, and
+/// all) when the customize sub-flow's preview is declined — a plain iteration rather than
+/// `ask_layout_custom` recursing back into this function, so repeated declines cannot grow the
+/// call stack.
+pub fn ask_layout(
+    io: &mut dyn Io,
+    detected: &DetectedState,
+) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>> {
+    let Some(path) = detected.global_config_path.as_deref() else {
+        return Ok(None);
+    };
+    // What Enter resolves to — the currently effective triple, not a hardcoded preset. This
+    // mirrors `ask_agent`'s `default` (effective value) and `ask_container_enabled`'s
+    // `currently_enabled` (also effective value): every question in this flow accepts Enter
+    // as "keep what's already in effect," never a fixed preset unrelated to detected state.
+    let default_triple = (
+        detected.effective_tmux_agent_pane.value.clone(),
+        detected.effective_tmux_split.value.clone(),
+        detected.effective_tmux_split_percent.value,
+    );
+
+    loop {
+        io.println(&write_target_line(
+            "Pane layout",
+            WriteScope::Global,
+            path,
+            detected.home_dir.as_deref(),
+        ));
+        if layout_has_project_override(detected) {
+            io.println(PROJECT_LAYOUT_OVERRIDE_NOTE);
+        }
+        io.println("Which layout do you want?");
+        for (index, (side, split, percent)) in LAYOUT_PRESETS.iter().enumerate() {
+            io.println(&format!("  [{}] {}", index + 1, LAYOUT_PRESET_LABELS[index]));
+            for line in render_layout(side, split, *percent) {
+                io.println(&format!("      {line}"));
+            }
+        }
+        io.println("  [5] customize…");
+        io.println(&current_layout_line(detected));
+
+        let preset = loop {
+            let Some(answer) = io.prompt_line("Layout [1-5] (Enter to keep current): ") else {
+                return Err(eof_aborted());
+            };
+            if answer.is_empty() {
+                break Some(default_triple.clone());
+            } else if answer.eq_ignore_ascii_case("customize") {
+                break None;
+            } else {
+                match answer.parse::<usize>() {
+                    Ok(n @ 1..=4) => break Some(LAYOUT_PRESETS[n - 1].clone()),
+                    Ok(5) => break None,
+                    _ => io.println(&format!("'{answer}' is not one of 1-5 or 'customize'.")),
+                }
+            }
+        };
+
+        let (agent_pane, split, split_percent) = match preset {
+            Some(triple) => triple,
+            // `None` here means the customize preview was declined, not EOF (which returns
+            // early above) — back to the top of this loop, which re-shows the menu.
+            None => match ask_layout_custom(io, detected)? {
+                Some(triple) => triple,
+                None => continue,
+            },
+        };
+        return Ok(layout_write(detected, agent_pane, split, split_percent));
+    }
+}
+
+/// The customize sub-flow: direction, then a direction-worded pane-side question, then
+/// percent, then a preview-and-confirm.
+///
+/// Returns `Ok(Some(triple))` on confirmation, `Ok(None)` when the preview is declined — the
+/// caller (`ask_layout`'s own loop) is what re-shows the preset menu in that case, not this
+/// function recursing into it.
+fn ask_layout_custom(
+    io: &mut dyn Io,
+    detected: &DetectedState,
+) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>> {
+    // 6a: direction first — the pane-side question's wording (6b) depends on it, so it can't
+    // be asked second.
+    let default_split = &detected.effective_tmux_split.value;
+    io.println("Side by side, or stacked?");
+    io.println("  [1] side by side (horizontal)");
+    io.println("  [2] stacked (vertical)");
+    io.println(&format!(
+        "  currently: split={} ({})",
+        split_str(default_split),
+        detected.effective_tmux_split.source.label()
+    ));
+    let default_split_choice: u8 = match default_split {
+        config::SplitDirection::Horizontal => 1,
+        config::SplitDirection::Vertical => 2,
+    };
+    let split = loop {
+        let Some(answer) =
+            io.prompt_line(&format!("Direction [1-2] (Enter for {default_split_choice}): "))
+        else {
+            return Err(eof_aborted());
+        };
+        let choice = if answer.is_empty() {
+            Some(default_split_choice)
+        } else {
+            answer.parse::<u8>().ok()
+        };
+        match choice {
+            Some(1) => break config::SplitDirection::Horizontal,
+            Some(2) => break config::SplitDirection::Vertical,
+            _ => io.println(&format!("'{answer}' is not 1 or 2.")),
+        }
+    };
+
+    // 6b: the pane-side question, worded to match the direction just chosen — "left"/"right"
+    // for a horizontal split, "top"/"bottom" for a vertical one. `PaneSide::Left` is the
+    // value stored either way; only the words in the prompt change.
+    let (question, option_1, option_2) = match split {
+        config::SplitDirection::Horizontal => {
+            ("Which side should the agent be on?", "left", "right")
+        }
+        config::SplitDirection::Vertical => (
+            "Should the agent be on top or on the bottom?",
+            "top",
+            "bottom",
+        ),
+    };
+    let default_side = &detected.effective_tmux_agent_pane.value;
+    io.println(question);
+    io.println(&format!("  [1] {option_1}"));
+    io.println(&format!("  [2] {option_2}"));
+    io.println(&format!(
+        "  currently: agent_pane={} ({})",
+        pane_side_str(default_side),
+        detected.effective_tmux_agent_pane.source.label()
+    ));
+    let default_side_choice: u8 = match default_side {
+        config::PaneSide::Left => 1,
+        config::PaneSide::Right => 2,
+    };
+    let agent_pane = loop {
+        let Some(answer) = io.prompt_line(&format!("[1-2] (Enter for {default_side_choice}): "))
+        else {
+            return Err(eof_aborted());
+        };
+        let choice = if answer.is_empty() {
+            Some(default_side_choice)
+        } else {
+            answer.parse::<u8>().ok()
+        };
+        match choice {
+            Some(1) => break config::PaneSide::Left,
+            Some(2) => break config::PaneSide::Right,
+            _ => io.println(&format!("'{answer}' is not 1 or 2.")),
+        }
+    };
+
+    // 6c: percent — reuses `config::validate_split_percent`'s 1-99 constraint rather than
+    // reimplementing it.
+    let default_percent = detected.effective_tmux_split_percent.value;
+    io.println("What percentage of the window should the agent pane get?");
+    io.println(&format!(
+        "  currently: split_percent={default_percent} ({})",
+        detected.effective_tmux_split_percent.source.label()
+    ));
+    let split_percent = loop {
+        let Some(answer) = io.prompt_line(&format!("[1-99] (Enter for {default_percent}): "))
+        else {
+            return Err(eof_aborted());
+        };
+        if answer.is_empty() {
+            break default_percent;
+        }
+        match answer.parse::<u8>() {
+            Ok(n) if config::validate_split_percent(n).is_ok() => break n,
+            _ => io.println(&format!("'{answer}' must be a number between 1 and 99.")),
+        }
+    };
+
+    // 6d: preview and confirm.
+    io.println("Here's what that looks like:");
+    for line in render_layout(&agent_pane, &split, split_percent) {
+        io.println(&format!("  {line}"));
+    }
+    // The preview picture alone can't be trusted for proportion on a stacked (vertical)
+    // split — see `layout_proportion_line` — so the confirm prompt is never based on the
+    // picture alone.
+    io.println(&layout_proportion_line(&agent_pane, &split, split_percent));
+    let Some(answer) = io.prompt_line("Use this layout? [Y/n] ") else {
+        return Err(eof_aborted());
+    };
+    if answer.is_empty() || parse_yes_no(&answer) == Some(true) {
+        return Ok(Some((agent_pane, split, split_percent)));
+    }
+
+    // Declined: the caller's loop re-shows the preset menu, not a partial retry of 6a-6c.
+    Ok(None)
 }
 
 // ── Step 8: the first session ─────────────────────────────────────────────────
@@ -563,6 +1120,96 @@ pub fn render_global_config_skeleton() -> &'static str {
 "#
 }
 
+// ── Skeleton cleanup ──────────────────────────────────────────────────────────
+//
+// A project or global config file that starts out as our own fully-commented skeleton —
+// whether written moments ago by this run, by an earlier `am init`/`am setup` invocation, by
+// an older `am`, or checked into the repo by a teammate — has a commented example line for
+// every key `am setup` knows how to write. When an interactive answer activates one of those
+// keys (the value wasn't known yet at skeleton-creation time the way `--agent`/`--yes` are —
+// see `render_project_config_skeleton_with_agent`), `update_key` inserts the real key as new
+// text, leaving the original commented example sitting right above it — reading as if the
+// same setting were made twice. The four functions below remove exactly that stale example
+// line.
+//
+// This is *not* gated on when or by whom the file was created: `strip_skeleton_example` only
+// ever removes a line that is byte-for-byte identical to our own skeleton's — never a line
+// that merely looks similar (different spacing, a different trailing comment, one a user
+// deliberately kept). That exact-match requirement is the entire safety story now that
+// there's no "only touch a file this run just wrote" gate to fall back on; see the
+// near-miss test below for the boundary it draws.
+
+/// The commented example lines inside [`render_global_config_skeleton`] that each of the
+/// three `tmux.*` keys and `container.enabled` activate. Kept as literals — like
+/// [`AGENT_EXAMPLE_LINE`] — so the skeleton's text and the cleanup logic cannot silently
+/// drift apart; a test pins each one against the skeleton itself.
+const TMUX_AGENT_PANE_EXAMPLE_LINE: &str =
+    "# agent_pane = \"left\"    # which pane gets the agent: \"left\" | \"right\"";
+const TMUX_SPLIT_EXAMPLE_LINE: &str =
+    "# split = \"horizontal\"   # split direction: \"horizontal\" | \"vertical\"";
+const TMUX_SPLIT_PERCENT_EXAMPLE_LINE: &str =
+    "# split_percent = 50     # percentage of the window given to the agent pane (1-99)";
+const CONTAINER_ENABLED_EXAMPLE_LINE: &str =
+    "# enabled = true         # false runs sessions directly on the host, with no isolation";
+
+/// Remove one commented example line from a config file, once an interactive answer has
+/// activated the key that line documents — regardless of when or by whom the file was
+/// written.
+///
+/// A no-op, not an error, when `example_line` is not found verbatim. That covers two distinct
+/// cases the caller does not need to tell apart: the flag/`--yes` path pre-activated the line
+/// at creation instead (see [`render_project_config_skeleton_with_agent`]), so there was never
+/// a stale comment to remove; or the file's line merely resembles the example — different
+/// spacing, a different trailing comment, a line a user deliberately kept — in which case it
+/// is not our text and must survive untouched. Byte-exact identity to `example_line` is the
+/// only signal this function trusts.
+fn strip_skeleton_example(path: &Path, example_line: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    if !text.lines().any(|line| line == example_line) {
+        return Ok(());
+    }
+
+    let mut new_text = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line == example_line {
+            continue;
+        }
+        new_text.push_str(line);
+        new_text.push('\n');
+    }
+    std::fs::write(path, new_text)
+        .with_context(|| format!("writing config file {}", path.display()))?;
+    Ok(())
+}
+
+/// Clean up after [`update_project_agent`].
+pub fn strip_project_agent_example(path: &Path) -> Result<()> {
+    strip_skeleton_example(path, AGENT_EXAMPLE_LINE)
+}
+
+/// Clean up after [`update_global_container_enabled`].
+pub fn strip_global_container_enabled_example(path: &Path) -> Result<()> {
+    strip_skeleton_example(path, CONTAINER_ENABLED_EXAMPLE_LINE)
+}
+
+/// Clean up after [`update_global_tmux_layout`] — `written_keys` is that call's own return
+/// value, so only the keys actually written have their example line removed; a customize
+/// answer that only changed `split_percent` leaves the still-accurate `agent_pane`/`split`
+/// examples in place.
+pub fn strip_global_tmux_layout_examples(path: &Path, written_keys: &[&str]) -> Result<()> {
+    for key in written_keys {
+        let example_line = match *key {
+            "agent_pane" => TMUX_AGENT_PANE_EXAMPLE_LINE,
+            "split" => TMUX_SPLIT_EXAMPLE_LINE,
+            "split_percent" => TMUX_SPLIT_PERCENT_EXAMPLE_LINE,
+            _ => continue,
+        };
+        strip_skeleton_example(path, example_line)?;
+    }
+    Ok(())
+}
+
 // ── Existing-file updates ─────────────────────────────────────────────────────
 
 /// Set `defaults.agent` in an existing project config.
@@ -577,6 +1224,45 @@ pub fn update_project_agent(path: &Path, agent: container::KnownAgent) -> Result
 /// contract as [`update_project_agent`].
 pub fn update_global_container_enabled(path: &Path, enabled: bool) -> Result<bool> {
     update_key(path, "container", "enabled", Value::from(enabled))
+}
+
+/// Set all three `tmux.*` layout keys in an existing global config, one [`update_key`] call
+/// per key — so a customize answer that only changes `split_percent` doesn't also touch
+/// already-correct `agent_pane`/`split` lines (and their comments). Returns the names of the
+/// keys that were actually written, a subset of `["agent_pane", "split", "split_percent"]`,
+/// empty when the chosen layout already matched what was there.
+pub fn update_global_tmux_layout(
+    path: &Path,
+    agent_pane: config::PaneSide,
+    split: config::SplitDirection,
+    split_percent: u8,
+) -> Result<Vec<&'static str>> {
+    let mut written = Vec::new();
+    if update_key(
+        path,
+        "tmux",
+        "agent_pane",
+        Value::from(pane_side_str(&agent_pane).to_string()),
+    )? {
+        written.push("agent_pane");
+    }
+    if update_key(
+        path,
+        "tmux",
+        "split",
+        Value::from(split_str(&split).to_string()),
+    )? {
+        written.push("split");
+    }
+    if update_key(
+        path,
+        "tmux",
+        "split_percent",
+        Value::from(i64::from(split_percent)),
+    )? {
+        written.push("split_percent");
+    }
+    Ok(written)
 }
 
 /// Set one key in an existing TOML file, preserving everything else about it.
@@ -647,12 +1333,14 @@ fn structural_value_error(table: &str, key: &str, path: &Path) -> anyhow::Error 
     )
 }
 
-/// Value equality for the two shapes `am setup` writes. A key holding some other type (or
-/// a string where a bool belongs) is not equal to anything, so it gets corrected.
+/// Value equality for the three shapes `am setup` writes (a string, a bool, or — since the
+/// layout revision — an integer for `split_percent`). A key holding some other type (or a
+/// string where a bool belongs) is not equal to anything, so it gets corrected.
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a.value() == b.value(),
         (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::Integer(a), Value::Integer(b)) => a.value() == b.value(),
         _ => false,
     }
 }
@@ -703,10 +1391,12 @@ mod tests {
     ) -> DetectedState {
         DetectedState {
             vcs: Some(config::Vcs::Git),
+            repo_root: Some(PathBuf::from("/repo")),
             project_config_path: PathBuf::from("/repo/.am/config.toml"),
             project_config_exists: true,
             global_config_path: Some(PathBuf::from("/home/u/.config/am/config.toml")),
             global_config_exists: true,
+            home_dir: Some(PathBuf::from("/home/u")),
             tmux_present: true,
             runtimes_found: runtimes,
             devcontainer: None,
@@ -716,6 +1406,18 @@ mod tests {
                 .collect(),
             effective_agent: agent,
             effective_container_enabled: enabled,
+            effective_tmux_agent_pane: Effective {
+                value: config::PaneSide::Left,
+                source: Source::CompiledDefault,
+            },
+            effective_tmux_split: Effective {
+                value: config::SplitDirection::Horizontal,
+                source: Source::CompiledDefault,
+            },
+            effective_tmux_split_percent: Effective {
+                value: 50,
+                source: Source::CompiledDefault,
+            },
         }
     }
 
@@ -1076,7 +1778,7 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = true\n",
         );
 
-        let (agent, enabled) = resolve_effective(Some(&project), Some(&global));
+        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global));
 
         assert_eq!(agent.value, Some(KnownAgent::Codex));
         assert_eq!(agent.source, Source::Project);
@@ -1094,7 +1796,7 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = false\n",
         );
 
-        let (agent, enabled) = resolve_effective(Some(&project), Some(&global));
+        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global));
 
         assert_eq!(agent.value, Some(KnownAgent::Claude));
         assert_eq!(agent.source, Source::Global);
@@ -1104,7 +1806,7 @@ mod tests {
 
     #[test]
     fn compiled_defaults_apply_when_neither_file_sets_anything() {
-        let (agent, enabled) = resolve_effective(None, None);
+        let (agent, enabled, ..) = resolve_effective(None, None);
 
         assert_eq!(agent.value, None);
         assert_eq!(agent.source, Source::CompiledDefault);
@@ -1122,7 +1824,7 @@ mod tests {
             render_project_config_skeleton(),
         );
 
-        let (agent, enabled) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
 
         assert_eq!(agent.source, Source::CompiledDefault);
         assert_eq!(enabled.source, Source::CompiledDefault);
@@ -1134,7 +1836,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = write(tmp.path(), "config.toml", "this is not = = toml\n");
 
-        let (agent, _) = resolve_effective(Some(&project), None);
+        let (agent, ..) = resolve_effective(Some(&project), None);
 
         assert_eq!(agent.source, Source::CompiledDefault);
     }
@@ -1152,7 +1854,7 @@ mod tests {
             "[defaults]\nagent = 5\n[container]\nenabled = true\n",
         );
 
-        let (agent, enabled) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
 
         assert_eq!(
             agent.source,
@@ -1172,7 +1874,7 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = \"yes please\"\n",
         );
 
-        let (agent, enabled) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
 
         assert_eq!(agent.value, Some(KnownAgent::Claude));
         assert_eq!(agent.source, Source::Project);
@@ -1186,7 +1888,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = write(tmp.path(), "config.toml", "[defaults]\nagent = \"nope\"\n");
 
-        let (agent, _) = resolve_effective(Some(&project), None);
+        let (agent, ..) = resolve_effective(Some(&project), None);
 
         assert_eq!(agent.value, None);
         assert_eq!(agent.source, Source::Project);
@@ -1356,7 +2058,7 @@ custom_key = "left alone"
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("split_percent = 30"), "{after}");
-        let (agent, _) = resolve_effective(Some(&path), None);
+        let (agent, ..) = resolve_effective(Some(&path), None);
         assert_eq!(agent.value, Some(KnownAgent::Claude));
     }
 
@@ -1410,7 +2112,7 @@ custom_key = "left alone"
 
         assert!(update_global_container_enabled(&path, false).unwrap());
 
-        let (_, enabled) = resolve_effective(None, Some(&path));
+        let (_, enabled, ..) = resolve_effective(None, Some(&path));
         assert!(!enabled.value);
         assert_eq!(enabled.source, Source::Global);
     }
@@ -1523,6 +2225,271 @@ custom_key = "left alone"
         );
     }
 
+    // ── Skeleton cleanup ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_skeleton_example_lines_match_render_global_config_skeleton_verbatim() {
+        let skeleton = render_global_config_skeleton();
+        for line in [
+            TMUX_AGENT_PANE_EXAMPLE_LINE,
+            TMUX_SPLIT_EXAMPLE_LINE,
+            TMUX_SPLIT_PERCENT_EXAMPLE_LINE,
+            CONTAINER_ENABLED_EXAMPLE_LINE,
+        ] {
+            assert!(
+                skeleton.lines().any(|l| l == line),
+                "{line:?} is not a verbatim line of render_global_config_skeleton()"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interactively_activated_project_agent_leaves_no_duplicate_commented_example() {
+        // The exact sequence `cmd_setup` runs on the interactive path: a plain skeleton
+        // (nothing known yet), then the answer written afterward.
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_project_config_skeleton());
+
+        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        strip_project_agent_example(&path).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("agent = \"claude\""), "{after}");
+        assert!(
+            !after.contains(AGENT_EXAMPLE_LINE),
+            "the commented example must not survive next to the active line: {after}"
+        );
+    }
+
+    #[test]
+    fn stripping_the_project_agent_example_is_a_no_op_when_it_was_never_written() {
+        // The flag/`--yes` path renders the active line directly at creation (see
+        // `render_project_config_skeleton_with_agent`), so the commented example was never
+        // in the file to begin with — stripping it must be a harmless no-op.
+        let tmp = TempDir::new().unwrap();
+        let path = write(
+            tmp.path(),
+            "config.toml",
+            &render_project_config_skeleton_with_agent(KnownAgent::Claude),
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        strip_project_agent_example(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn an_interactively_activated_container_enabled_leaves_no_duplicate_commented_example() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        assert!(update_global_container_enabled(&path, false).unwrap());
+        strip_global_container_enabled_example(&path).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("enabled = false"), "{after}");
+        assert!(
+            !after.contains(CONTAINER_ENABLED_EXAMPLE_LINE),
+            "the commented example must not survive next to the active line: {after}"
+        );
+    }
+
+    #[test]
+    fn an_interactively_activated_layout_leaves_no_duplicate_commented_examples() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            30,
+        )
+        .unwrap();
+        assert_eq!(written, vec!["agent_pane", "split", "split_percent"]);
+        strip_global_tmux_layout_examples(&path, &written).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("agent_pane = \"right\""), "{after}");
+        assert!(after.contains("split = \"vertical\""), "{after}");
+        assert!(after.contains("split_percent = 30"), "{after}");
+        for example in [
+            TMUX_AGENT_PANE_EXAMPLE_LINE,
+            TMUX_SPLIT_EXAMPLE_LINE,
+            TMUX_SPLIT_PERCENT_EXAMPLE_LINE,
+        ] {
+            assert!(
+                !after.contains(example),
+                "no commented example may survive next to the active line it duplicates: {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_global_tmux_layout_examples_only_strips_the_keys_named() {
+        // A bare skeleton has no active tmux keys at all, so `update_global_tmux_layout`
+        // always writes all three the first time any of them changes (there is nothing yet
+        // to compare a single key against) — the case where only one key's example needs
+        // removing happens on a file that already has the *other* two active, which is
+        // exactly what `tmux_layout_writes_only_the_key_that_actually_changed` covers above.
+        // This test pins `strip_global_tmux_layout_examples`'s own per-key selectivity
+        // directly: only the keys named in `written_keys` lose their commented example.
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        strip_global_tmux_layout_examples(&path, &["split_percent"]).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(TMUX_SPLIT_PERCENT_EXAMPLE_LINE), "{after}");
+        assert!(after.contains(TMUX_AGENT_PANE_EXAMPLE_LINE), "{after}");
+        assert!(after.contains(TMUX_SPLIT_EXAMPLE_LINE), "{after}");
+    }
+
+    #[test]
+    fn strip_skeleton_example_is_a_no_op_when_the_line_is_not_present() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", "[tmux]\nagent_pane = \"left\"\n");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        strip_skeleton_example(&path, TMUX_AGENT_PANE_EXAMPLE_LINE).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    // The boundary case that removed the old "only a file this run created" gate: the project
+    // config may equally well come from `am init` in an earlier invocation, an older `am`, or
+    // one a teammate committed — `cmd_setup` no longer distinguishes, and neither do these two
+    // functions. Byte-exact identity to our own skeleton line is what makes that safe; the
+    // near-miss test right after these two is what pins that boundary.
+
+    #[test]
+    fn a_config_from_an_earlier_am_init_invocation_gets_its_stale_agent_example_removed() {
+        // `config::write_defaults` — not `render_project_config_skeleton` directly — is the
+        // actual function `am init` calls, so this is genuinely "a file `am init` wrote",
+        // simulating it having happened in a prior, unrelated invocation of `am`.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        config::write_defaults(&path).unwrap();
+
+        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        strip_project_agent_example(&path).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("agent = \"claude\""), "{after}");
+        assert!(
+            !after.contains(AGENT_EXAMPLE_LINE),
+            "a stale example must be removed even though this run didn't write the file: {after}"
+        );
+    }
+
+    #[test]
+    fn a_config_from_an_earlier_invocation_gets_its_stale_container_enabled_example_removed() {
+        // Global config has no separate "am init"-style writer the way the project file does
+        // (there is no `am init` equivalent for it) — `render_global_config_skeleton` is the
+        // only skeleton it's ever written from, whether that happened moments ago or in an
+        // earlier `am setup` invocation. This models the latter: the skeleton already sitting
+        // on disk before this run touches anything.
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        assert!(update_global_container_enabled(&path, false).unwrap());
+        strip_global_container_enabled_example(&path).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("enabled = false"), "{after}");
+        assert!(
+            !after.contains(CONTAINER_ENABLED_EXAMPLE_LINE),
+            "a stale example must be removed even though this run didn't write the file: {after}"
+        );
+    }
+
+    #[test]
+    fn a_config_from_an_earlier_invocation_gets_all_three_stale_layout_examples_removed() {
+        // Same rationale as the container.enabled case above, but forcing all three tmux keys
+        // to actually change (unlike the split/split_percent-only test below, which exists to
+        // pin per-key selectivity) so each of the three example lines is proven removable, not
+        // just two of three.
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            40,
+        )
+        .unwrap();
+        assert_eq!(written, vec!["agent_pane", "split", "split_percent"]);
+        strip_global_tmux_layout_examples(&path, &written).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("agent_pane = \"right\""), "{after}");
+        assert!(after.contains("split = \"vertical\""), "{after}");
+        assert!(after.contains("split_percent = 40"), "{after}");
+        for example in [
+            TMUX_AGENT_PANE_EXAMPLE_LINE,
+            TMUX_SPLIT_EXAMPLE_LINE,
+            TMUX_SPLIT_PERCENT_EXAMPLE_LINE,
+        ] {
+            assert!(
+                !after.contains(example),
+                "a stale example must be removed even though this run didn't write the file: {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_from_an_earlier_invocation_gets_its_stale_layout_examples_removed() {
+        // `agent_pane` is already live here — as if an earlier interactive `am setup` run had
+        // already activated it — while `split`/`split_percent` are still at their commented
+        // skeleton defaults, exactly what a later run that only touches the percentage sees.
+        let tmp = TempDir::new().unwrap();
+        let content = "[tmux]\nagent_pane = \"left\"\n\
+            # split = \"horizontal\"   # split direction: \"horizontal\" | \"vertical\"\n\
+            # split_percent = 50     # percentage of the window given to the agent pane (1-99)\n";
+        let path = write(tmp.path(), "config.toml", content);
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Left,
+            config::SplitDirection::Vertical,
+            40,
+        )
+        .unwrap();
+        assert_eq!(written, vec!["split", "split_percent"]);
+        strip_global_tmux_layout_examples(&path, &written).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("split = \"vertical\""), "{after}");
+        assert!(after.contains("split_percent = 40"), "{after}");
+        assert!(
+            !after.contains(TMUX_SPLIT_EXAMPLE_LINE) && !after.contains(TMUX_SPLIT_PERCENT_EXAMPLE_LINE),
+            "stale examples must be removed even though this run didn't write the file: {after}"
+        );
+    }
+
+    #[test]
+    fn a_near_miss_example_line_survives_because_it_is_not_byte_exact() {
+        // The whole safety story, now that stripping is no longer gated on file freshness:
+        // only a line that is byte-for-byte identical to our own skeleton's is ever removed.
+        // A line that merely resembles it — different spacing, a different trailing comment,
+        // one a user deliberately kept — is not our text and must never be touched. A future
+        // refactor toward a looser match (e.g. "starts with `# agent =`") would fail this.
+        let tmp = TempDir::new().unwrap();
+        let content =
+            "[defaults]\nagent = \"claude\"\n# agent = \"claude\"   # example I kept deliberately\n";
+        let path = write(tmp.path(), "config.toml", content);
+
+        strip_project_agent_example(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "a near-miss commented line must never be stripped"
+        );
+    }
+
     // ── The menu ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1540,5 +2507,554 @@ custom_key = "left alone"
         assert_eq!(parse_agent_answer("5"), None);
         assert_eq!(parse_agent_answer("0"), None);
         assert_eq!(parse_agent_answer(""), None);
+    }
+
+    // ── The write-target line ─────────────────────────────────────────────────
+
+    #[test]
+    fn write_target_line_shortens_a_project_path_relative_to_the_repo_root() {
+        let project = Path::new("/repo/.am/config.toml");
+        assert_eq!(
+            write_target_line(
+                "Agent",
+                WriteScope::Project,
+                project,
+                Some(Path::new("/repo"))
+            ),
+            "Agent — just this repo; saved to .am/config.toml."
+        );
+    }
+
+    #[test]
+    fn write_target_line_shortens_a_global_path_to_a_tilde() {
+        let global = Path::new("/home/u/.config/am/config.toml");
+        assert_eq!(
+            write_target_line(
+                "Containers",
+                WriteScope::Global,
+                global,
+                Some(Path::new("/home/u"))
+            ),
+            "Containers — every repo on this machine; saved to ~/.config/am/config.toml."
+        );
+    }
+
+    #[test]
+    fn write_target_line_falls_back_to_the_absolute_path_without_a_known_base() {
+        let project = Path::new("/repo/.am/config.toml");
+        assert_eq!(
+            write_target_line("Agent", WriteScope::Project, project, None),
+            "Agent — just this repo; saved to /repo/.am/config.toml."
+        );
+
+        let global = Path::new("/home/u/.config/am/config.toml");
+        assert_eq!(
+            write_target_line("Pane layout", WriteScope::Global, global, None),
+            "Pane layout — every repo on this machine; saved to /home/u/.config/am/config.toml."
+        );
+    }
+
+    #[test]
+    fn write_target_line_falls_back_to_the_absolute_path_when_not_under_the_base() {
+        // A path that is not actually under `base` (e.g. XDG_CONFIG_HOME pointed somewhere
+        // outside $HOME) must not be silently mis-shortened.
+        let global = Path::new("/mnt/config/am/config.toml");
+        assert_eq!(
+            write_target_line(
+                "Containers",
+                WriteScope::Global,
+                global,
+                Some(Path::new("/home/u"))
+            ),
+            "Containers — every repo on this machine; saved to /mnt/config/am/config.toml."
+        );
+    }
+
+    // ── The pane layout question ──────────────────────────────────────────────
+
+    /// A `DetectedState` whose three tmux effective values are set independently of the
+    /// agent/container ones `configured` already covers.
+    fn layout_state(
+        agent_pane: config::PaneSide,
+        split: config::SplitDirection,
+        split_percent: u8,
+        source: Source,
+    ) -> DetectedState {
+        let mut state = configured(Some(KnownAgent::Claude), Source::Project);
+        state.effective_tmux_agent_pane = Effective {
+            value: agent_pane,
+            source,
+        };
+        state.effective_tmux_split = Effective { value: split, source };
+        state.effective_tmux_split_percent = Effective {
+            value: split_percent,
+            source,
+        };
+        state
+    }
+
+    #[test]
+    fn layout_is_not_asked_about_without_a_global_config_to_write_to() {
+        let mut state = configured(Some(KnownAgent::Claude), Source::Project);
+        state.global_config_path = None;
+        let mut io = ScriptedIo::new(&[]);
+
+        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+        assert!(io.output.is_empty(), "{}", io.output);
+    }
+
+    #[test]
+    fn ask_layout_returns_none_when_the_choice_matches_every_effective_value() {
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::Global,
+        );
+        // Enter accepts preset 1, which is exactly `am`'s compiled default and also this
+        // state's effective triple.
+        let mut io = ScriptedIo::new(&[""]);
+
+        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+    }
+
+    #[test]
+    fn ask_layout_returns_some_when_the_choice_differs() {
+        let state = layout_state(
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            30,
+            Source::Global,
+        );
+        // Explicitly picking a preset that differs from the effective triple (right/vertical/
+        // 30 is not any of the four presets) must return `Some` — the write-if-changed half of
+        // the contract, exercised via an explicit choice rather than Enter.
+        let mut io = ScriptedIo::new(&["1"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some(LAYOUT_PRESETS[0].clone())
+        );
+    }
+
+    #[test]
+    fn ask_layout_enter_resolves_to_the_effective_triple_and_writes_nothing() {
+        // This is the exact scenario the reported bug lost data on: a customized, non-preset-1
+        // layout (agent_pane=right, split=vertical, split_percent=30) with a global config
+        // already set to it. Pressing Enter must resolve to *that* effective triple, not
+        // `LAYOUT_PRESETS[0]` — and because the resolved triple then exactly matches what's
+        // already effective, `ask_layout` must report `None` (nothing to write), never `Some`
+        // of a hardcoded preset that would silently clobber the customization on disk.
+        let state = layout_state(
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            30,
+            Source::Global,
+        );
+        let mut io = ScriptedIo::new(&[""]);
+
+        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+    }
+
+    #[test]
+    fn preset_selection_by_number_returns_the_fixed_triple() {
+        let state = layout_state(
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            30,
+            Source::Global,
+        );
+
+        for (index, preset) in LAYOUT_PRESETS.iter().enumerate() {
+            let answer = (index + 1).to_string();
+            let mut io = ScriptedIo::new(&[answer.as_str()]);
+
+            assert_eq!(
+                ask_layout(&mut io, &state).unwrap(),
+                Some(preset.clone()),
+                "preset {}",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_layout_selection_re_asks_with_a_reason() {
+        let state = layout_state(
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            30,
+            Source::Global,
+        );
+        let mut io = ScriptedIo::new(&["9", "nope", "1"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some(LAYOUT_PRESETS[0].clone())
+        );
+        assert_eq!(io.output.matches("is not one of 1-5").count(), 2, "{}", io.output);
+    }
+
+    #[test]
+    fn customize_words_the_pane_question_for_a_horizontal_split() {
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        let mut io = ScriptedIo::new(&["5", "1", "2", "60", "y"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some((
+                config::PaneSide::Right,
+                config::SplitDirection::Horizontal,
+                60
+            ))
+        );
+        assert!(
+            io.output.contains("Which side should the agent be on?"),
+            "{}",
+            io.output
+        );
+        assert!(io.output.contains("[1] left"), "{}", io.output);
+        assert!(io.output.contains("[2] right"), "{}", io.output);
+        assert!(
+            !io.output.contains("top or on the bottom"),
+            "a horizontal split must not ask about top/bottom: {}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn customize_words_the_pane_question_for_a_vertical_split() {
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        let mut io = ScriptedIo::new(&["5", "2", "1", "40", "y"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some((
+                config::PaneSide::Left,
+                config::SplitDirection::Vertical,
+                40
+            ))
+        );
+        assert!(
+            io.output.contains("Should the agent be on top or on the bottom?"),
+            "{}",
+            io.output
+        );
+        assert!(io.output.contains("[1] top"), "{}", io.output);
+        assert!(io.output.contains("[2] bottom"), "{}", io.output);
+        assert!(
+            !io.output.contains("Which side should the agent be on?"),
+            "a vertical split must not ask left/right: {}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn customize_preview_states_the_proportion_in_text_for_a_vertical_split() {
+        // A stacked preview can't show proportion in its ASCII (both boxes render equal size
+        // regardless of `percent`), so the confirm step must not be based on the picture
+        // alone — a skewed 95/5 split is exactly the case that would otherwise mislead.
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        let mut io = ScriptedIo::new(&["5", "2", "1", "95", "y"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some((
+                config::PaneSide::Left,
+                config::SplitDirection::Vertical,
+                95
+            ))
+        );
+        assert!(
+            io.output.contains("agent (top) gets 95%, the other pane gets 5%."),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn customize_preview_states_the_proportion_in_text_for_a_horizontal_split_too() {
+        // Applied consistently: a horizontal preview's box width already conveys proportion,
+        // but the same text line is shown there too so the wording doesn't differ between the
+        // two directions.
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        let mut io = ScriptedIo::new(&["5", "1", "2", "60", "y"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some((
+                config::PaneSide::Right,
+                config::SplitDirection::Horizontal,
+                60
+            ))
+        );
+        assert!(
+            io.output.contains("agent (right) gets 60%, the other pane gets 40%."),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn declining_the_customize_preview_re_shows_the_preset_menu() {
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        // Enter customize, accept every default, decline the preview, then pick preset 2
+        // from the (re-shown) preset menu.
+        let mut io = ScriptedIo::new(&["5", "", "", "", "n", "2"]);
+
+        assert_eq!(
+            ask_layout(&mut io, &state).unwrap(),
+            Some((
+                config::PaneSide::Right,
+                config::SplitDirection::Horizontal,
+                50
+            ))
+        );
+        assert_eq!(
+            io.output.matches("Which layout do you want?").count(),
+            2,
+            "the preset menu must be shown again after declining: {}",
+            io.output
+        );
+        let target_line = write_target_line(
+            "Pane layout",
+            WriteScope::Global,
+            state.global_config_path.as_deref().unwrap(),
+            state.home_dir.as_deref(),
+        );
+        assert_eq!(
+            io.output.matches(target_line.as_str()).count(),
+            2,
+            "the write-target line must be shown again after declining: {}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn invalid_customize_direction_re_asks() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&["5", "9", "1", "", "", "y"]);
+
+        ask_layout(&mut io, &state).unwrap();
+
+        assert!(io.output.contains("'9' is not 1 or 2."), "{}", io.output);
+    }
+
+    #[test]
+    fn invalid_customize_percent_re_asks() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&["5", "", "", "150", "50", "y"]);
+
+        ask_layout(&mut io, &state).unwrap();
+
+        assert!(
+            io.output.contains("must be a number between 1 and 99"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn end_of_input_aborts_the_layout_question() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&[]);
+
+        assert!(ask_layout(&mut io, &state).is_err());
+    }
+
+    #[test]
+    fn end_of_input_aborts_the_customize_direction_question() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&["5"]);
+
+        assert!(ask_layout(&mut io, &state).is_err());
+    }
+
+    #[test]
+    fn end_of_input_aborts_the_customize_pane_side_question() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&["5", ""]);
+
+        assert!(ask_layout(&mut io, &state).is_err());
+    }
+
+    #[test]
+    fn end_of_input_aborts_the_customize_percent_question() {
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&["5", "", ""]);
+
+        assert!(ask_layout(&mut io, &state).is_err());
+    }
+
+    #[test]
+    fn the_project_override_caveat_is_shown_only_when_a_project_value_exists() {
+        let mut state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::Global,
+        );
+        let mut io = ScriptedIo::new(&[""]);
+        ask_layout(&mut io, &state).unwrap();
+        assert!(
+            !io.output.contains("already sets its own"),
+            "no project override, no caveat: {}",
+            io.output
+        );
+
+        state.effective_tmux_split_percent.source = Source::Project;
+        let mut io = ScriptedIo::new(&[""]);
+        ask_layout(&mut io, &state).unwrap();
+        assert!(
+            io.output
+                .contains("this project's config already sets its own pane layout"),
+            "{}",
+            io.output
+        );
+    }
+
+    // ── render_layout ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_layout_matches_each_fixed_preset_exactly() {
+        assert_eq!(
+            render_layout(
+                &config::PaneSide::Left,
+                &config::SplitDirection::Horizontal,
+                50
+            ),
+            vec!["[  agent   |  shell   ]".to_string()]
+        );
+        assert_eq!(
+            render_layout(
+                &config::PaneSide::Right,
+                &config::SplitDirection::Horizontal,
+                50
+            ),
+            vec!["[  shell   |  agent   ]".to_string()]
+        );
+        assert_eq!(
+            render_layout(
+                &config::PaneSide::Left,
+                &config::SplitDirection::Horizontal,
+                70
+            ),
+            vec!["[    agent    | shell ]".to_string()]
+        );
+        assert_eq!(
+            render_layout(
+                &config::PaneSide::Left,
+                &config::SplitDirection::Vertical,
+                50
+            ),
+            vec![
+                "[       agent        ]".to_string(),
+                "[       shell        ]".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_layout_degrades_sensibly_at_an_extreme_percentage() {
+        let lines = render_layout(
+            &config::PaneSide::Left,
+            &config::SplitDirection::Horizontal,
+            95,
+        );
+        assert_eq!(lines.len(), 1);
+        // Neither label is ever squeezed below its own length, however lopsided the split.
+        assert!(lines[0].contains(" agent "), "{lines:?}");
+        assert!(lines[0].contains(" shell "), "{lines:?}");
+    }
+
+    // ── update_global_tmux_layout ─────────────────────────────────────────────
+
+    #[test]
+    fn tmux_layout_matching_the_file_already_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(
+            tmp.path(),
+            "config.toml",
+            "[tmux]\nagent_pane = \"left\"\nsplit = \"horizontal\"\nsplit_percent = 50\n",
+        );
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+        )
+        .unwrap();
+
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn tmux_layout_writes_only_the_key_that_actually_changed() {
+        let tmp = TempDir::new().unwrap();
+        let content =
+            "[tmux]\nagent_pane = \"left\"   # keep me\nsplit = \"horizontal\"\nsplit_percent = 50\n";
+        let path = write(tmp.path(), "config.toml", content);
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            70,
+        )
+        .unwrap();
+
+        assert_eq!(written, vec!["split_percent"]);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("agent_pane = \"left\"   # keep me"), "{after}");
+        assert!(after.contains("split = \"horizontal\""), "{after}");
+        assert!(after.contains("split_percent = 70"), "{after}");
+    }
+
+    #[test]
+    fn tmux_layout_is_added_to_a_skeleton_global_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = write(tmp.path(), "config.toml", render_global_config_skeleton());
+
+        let written = update_global_tmux_layout(
+            &path,
+            config::PaneSide::Right,
+            config::SplitDirection::Vertical,
+            80,
+        )
+        .unwrap();
+
+        assert_eq!(written, vec!["agent_pane", "split", "split_percent"]);
+        let (_, _, agent_pane, split, split_percent) = resolve_effective(None, Some(&path));
+        assert_eq!(agent_pane.value, config::PaneSide::Right);
+        assert_eq!(split.value, config::SplitDirection::Vertical);
+        assert_eq!(split_percent.value, 80);
     }
 }

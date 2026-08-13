@@ -23,6 +23,8 @@ make build-copilot       # Build Copilot Docker image
 - Tests run single-threaded: `.cargo/config.toml` sets `RUST_TEST_THREADS = "1"`. A test that writes a mock script and then execs it fails with `ETXTBSY` if any other thread forks while the file is still open for writing, because the child inherits the write descriptor. Per-module mutexes cannot prevent this — the contended resource is the process-wide fd table — so the whole binary is serialized instead. Do not remove this without moving the exec-mock tests to their own test target.
 - Test git fixtures commit with `--no-verify`: a developer's global `init.templatedir` can install a `commit-msg` hook into every `git init`
 - Tests mutating env vars use a mutex to serialize execution
+- The `cucumber` crate's `{string}` capture does not unescape `\"`, so a step written as `does not contain "agent = \"codex\""` compares against text containing literal backslashes and is always true — a silently vacuous assertion. Use single-quoted Gherkin strings when the expected text itself contains double quotes: `does not contain 'agent = "codex"'`.
+- The pty-based interactive test harness (`run_am_pty` in `tests/cucumber.rs`) gives `am` a real pty via `script`; a scripted input line missing its trailing `\n` leaves the child blocked forever in canonical-mode `read()` rather than failing fast.
 
 **After every code change:** run `cargo test` and `cargo clippy --all-targets -- -D warnings`. Fix any failures before proceeding. `--all-targets` matters — without it clippy skips test code, which is what CI lints.
 

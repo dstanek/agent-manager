@@ -46,11 +46,14 @@ Interactive alternative to `am init` — a guided front door that asks only the 
 detected state can't answer, then verifies the result with `am doctor`'s own checks.
 
 **Fully implemented.** `am setup [--yes] [--agent <name>]` runs `am init`'s setup, asks which
-agent to use and (only when no container runtime is found and there's a global config to write
-to) whether to proceed with containers disabled, writes the answers, and runs `doctor::run()`
-to verify — offering to start a first session on success. `cargo clippy --all-targets -- -D
-warnings` is clean and `cargo test` passes (407 unit tests + 77 cucumber scenarios / 573
-steps, 0 failed). Code review passed with all findings resolved.
+agent to use, whether to proceed with containers disabled (only when no container runtime is
+found and there's a global config to write to), and a pane layout (always asked, unless `--yes`
+or there's no global config to write to), writes the answers, and runs `doctor::run()` to
+verify — offering to start a first session on success. Every question now states, as its own
+first line, the scope and file path its answer is saved to (`Agent — just this repo; saved to
+.am/config.toml.`), so a change's destination is never left to be inferred. `cargo clippy
+--all-targets -- -D warnings` is clean and `cargo test` passes (446 unit tests + 93 cucumber
+scenarios / 753 steps, 0 failed). Code review passed with all findings resolved.
 
 - [x] `src/cli.rs`: `Commands::Setup { yes, agent }`
 - [x] `main.rs`: `cmd_init`'s directory/`.gitignore` logic extracted into `init_project`, shared
@@ -58,34 +61,51 @@ steps, 0 failed). Code review passed with all findings resolved.
 - [x] `Cargo.toml`: `toml_edit = "0.25"` — format-preserving edits to a config file the user may
       have hand-edited (comments, table order, and unrelated keys all survive)
 - [x] `src/onboarding.rs`: `DetectedState::gather` (project/global/compiled-default precedence
-      for `defaults.agent` and `container.enabled`), the `Io`/`TermIo`/`ScriptedIo` seam,
-      `ask_agent`/`ask_container_enabled`, the two config skeletons, and the `toml_edit`-based
-      `update_project_agent`/`update_global_container_enabled` (no-op, byte-for-byte, when the
-      requested value already matches; a structural value — table, array, array-of-tables,
-      inline table — is refused with an error rather than overwritten)
-- [x] `main.rs::cmd_setup`: wires detection → prompts → the two writes → `doctor::run` →
+      for `defaults.agent`, `container.enabled`, and the three `tmux.*` layout keys), the
+      `Io`/`TermIo`/`ScriptedIo` seam, `ask_agent`/`ask_container_enabled`/`ask_layout`
+      (`ask_layout_custom`'s direction-first sub-flow, `render_layout`'s ASCII previews), the
+      shared `write_target_line` helper all three questions print as their first line, the
+      config skeletons, and the `toml_edit`-based `update_project_agent`/
+      `update_global_container_enabled`/`update_global_tmux_layout` (no-op, byte-for-byte, when
+      the requested value already matches, and per-key for the three layout keys, so a
+      percentage-only change doesn't also touch already-correct `agent_pane`/`split` lines; a
+      structural value — table, array, array-of-tables, inline table — is refused with an error
+      rather than overwritten)
+- [x] `main.rs::cmd_setup`: wires detection → prompts → the three writes → `doctor::run` →
       optional `cmd_start`; TTY-gated via `std::io::IsTerminal`; exit code matches `am doctor`'s
 - [x] `tests/features/setup.feature`: fresh repo, inherited-from-global agent (UC2), `--yes`
       no-op on an already-configured repo, `--yes --agent` deterministic change and no-op,
       failing-doctor exit code, unknown-agent rejection before any write, non-TTY without
-      `--yes`
+      `--yes`, `--yes` never touching pane layout (fresh or already-configured global config)
+- [x] `tests/features/setup_interactive.feature`: the write-target line on all three questions,
+      the customize sub-flow's direction-dependent wording (left/right vs. top/bottom), and the
+      project-override caveat note
 - [x] Docs: `docs/reference/commands.md` (`## am setup`), `docs/reference/configuration.md`
       ("Writing config with `am setup`"), `README.md` quick start
 
-Three 🔵 suggestions from code review, deferred rather than dropped:
+Deferred review items, not dropped:
 
 - [ ] `resolved_agent_answer: Option<Option<container::KnownAgent>>` in `cmd_setup`
       (`src/main.rs`) is a nested `Option` whose two levels mean different things — "resolved
       without prompting yet?" and "is there a change to write?" A small named enum would make
       the states self-documenting.
-- [ ] `src/onboarding.rs` is ~1400 lines. Not a problem yet (comparable to `config.rs`/
-      `main.rs`), but if it grows, the skeleton + `update_key`/`toml_edit` machinery (~250
-      lines) is the cleanest seam to split out first — it has no dependency on the `Io`/prompt
-      machinery.
 - [ ] The structural-value error says "found a table or array" without distinguishing which of
       the four shapes. `toml_edit` exposes `Item::type_name()`/`Value::type_name()`, returning
       exactly `"table"`/`"array of tables"`/`"inline table"`/`"array"`, if the message is worth
       tightening later.
+- [ ] `shorten_for_display` (`src/onboarding.rs`) produces an empty string when `path == base`
+      (`WriteScope::Project`) or a trailing-slash `~/` (`WriteScope::Global`). Unreachable today
+      since neither config path ever equals its base, but nothing pins that invariant.
+- [ ] `src/onboarding.rs` is ~2900 lines. The natural seam if it grows: "Question 6: pane
+      layout" (`render_layout` through `update_global_tmux_layout`, ~330 lines) plus "Skeleton
+      cleanup" (~90 lines) extracted into `src/onboarding/layout.rs`.
+- [ ] `strip_skeleton_example` (`src/onboarding.rs`) normalises a missing trailing newline when
+      rewriting a file. Harmless for current callers (all files originate from `am`'s own
+      skeleton), but not byte-preserving in that one respect.
+- [ ] `wait_with_output_timeout` (`tests/cucumber.rs`) kills by pid via an external `kill -9`
+      because `child` was moved into the worker thread. Theoretical pid-reuse TOCTOU at the
+      timeout boundary; keeping `child` on the main thread and threading only the blocking read
+      would allow `child.kill()` directly.
 
 ---
 

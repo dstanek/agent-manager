@@ -800,7 +800,10 @@ fn validate_env_passthrough(env: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_split_percent(percent: u8) -> Result<()> {
+/// `pub(crate)` so `onboarding::ask_layout_custom` can validate a typed-in percentage against
+/// the exact same 1-99 constraint `load_with_global` enforces on the config file, rather than
+/// reimplementing the range.
+pub(crate) fn validate_split_percent(percent: u8) -> Result<()> {
     if !(1..=99).contains(&percent) {
         return Err(anyhow::anyhow!(
             "invalid tmux.split_percent {percent}: must be between 1 and 99"

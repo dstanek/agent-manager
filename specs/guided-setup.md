@@ -4,6 +4,16 @@ A new, interactive command that walks a first-time or new-repo user through conf
 `am`, asking only the questions that detected state can't answer on its own, then verifying
 the result and optionally launching a first session.
 
+**Status:** the agent/containers flow described here shipped in PR #47. This revision adds a
+third question — pane layout — because the shipped flow, on a machine that already has a
+container runtime installed, asked exactly one question (agent), which undershot the user's
+original "make this as easy as possible" goal by collapsing hand-holding to almost nothing
+in the common case. A follow-up resolution then extended all three questions to state where
+their answer will be saved, not just the new one — see
+[Resolved Decisions](#resolved-decisions) #9. This document also brings the API/data-model
+sections in line with what actually shipped, since both additions sit directly alongside
+them.
+
 ## Background
 
 Today the on-ramp is `am init`: it creates `.am/config.toml` (fully commented out),
@@ -23,13 +33,16 @@ existing commands, not a hole in functionality. `am setup` fills it.
   repository. `am setup` does not run `git init` on their behalf, the same way `am init`
   doesn't today.
 - "As easy as possible" means *fewer decisions*, not *more dialog*. Every question below has
-  to earn its place by being something detected state genuinely cannot answer.
+  to earn its place — but "earning its place" cannot mean "collapses to zero questions on a
+  well-equipped machine," which is the specific failure the pane-layout addition corrects. A
+  question about a genuine, undetectable user preference earns its place by existing at all,
+  not by being gated behind a rare failure condition.
 - Users already comfortable with `am` keep using `am init` for new repos, `am doctor` to
-  debug, and hand-editing `.am/config.toml` for anything outside the two settings `am setup`
-  knows how to ask about. `am setup` doesn't replace those workflows or grow into a general
-  config editor — see [Resolved Decisions](#resolved-decisions) #4.
+  debug, and hand-editing `.am/config.toml` for anything outside the handful of settings
+  `am setup` knows how to ask about. `am setup` doesn't replace those workflows or grow into
+  a general config editor — see [Resolved Decisions](#resolved-decisions) #4.
 - No new prompt-UI dependency is worth adding for this; a format-preserving TOML-edit
-  dependency is (see #2 and #5 below, and [What it writes](#what-it-writes)).
+  dependency is (see #2 and #5, and [What it writes](#what-it-writes)).
 
 ## Use cases
 
@@ -45,42 +58,56 @@ existing commands, not a hole in functionality. `am setup` fills it.
    `.gitignore` entry (the same work `am init` does today — see
    [Scope boundary](#scope-boundary-vs-am-init-and-am-doctor)), and creates a fresh
    `~/.config/am/config.toml` skeleton.
-3. The agent question is asked — every prompt shows a default derived from the *effective*
-   current value, and here nothing is configured anywhere, so the default is "none" (see
-   [Question flow](#question-flow)). Answering writes it into the project file.
-4. The containers question is asked only if no runtime is currently found on the host; if
-   answered, it's written into the global file.
-5. `am setup` runs the same checks `am doctor` runs and prints the report inline.
-6. If the report is clean, `am setup` offers to start a first session.
-7. User accepts, provides a slug, `am setup` calls the same code path as `am start`.
+3. The agent question is asked — stating up front that it saves to *this repo's* config
+   (`.am/config.toml`) — with a default derived from the *effective* current value; here
+   nothing is configured anywhere, so the default is the first agent already authenticated
+   on this host, else `claude` (see [Question flow](#question-flow)). Answering writes it
+   into the project file.
+4. The containers question — stating up front that it saves *machine-wide*
+   (`~/.config/am/config.toml`) — is asked only if no runtime is currently found on the
+   host; if answered, it's written into the global file.
+5. The pane layout question — same machine-wide framing — is always asked (this is the
+   point of the layout revision — it is not gated behind any detection condition beyond
+   "there is a global file to write it to"). A chosen preset or a customized combination is
+   written into the global file.
+6. `am setup` runs the same checks `am doctor` runs and prints the report inline.
+7. If the report is clean, `am setup` offers to start a first session.
+8. User accepts, provides a slug, `am setup` calls the same code path as `am start`.
 
 **Postcondition:** `.am/config.toml` and `~/.config/am/config.toml` exist with the user's
 choices active; a running session may exist if the user opted in.
 
 ### UC2 — Existing user, adding `am` to a new repo
 
-**Actor:** a user with a working global config from a previous repo.
+**Actor:** a user with a working global config from a previous repo, including a pane layout
+they already chose once.
 **Preconditions:** inside a repo with no `.am/config.toml`. `~/.config/am/config.toml`
-already exists and sets an agent.
+already exists, sets an agent, and sets a non-default pane layout.
 **Main flow:**
 
 1. User runs `am setup`.
-2. A fresh project config skeleton is created (as UC1 step 2); the existing global config is
-   opened, not recreated.
-3. The agent question is asked with its default sourced from the **global** config
-   ("agent: claude *(from your global config)*"). Pressing Enter accepts it — and because the
-   answer didn't change, nothing is written to the project file, which keeps its `agent` line
-   commented and continues to inherit from global, exactly as if the question had been
-   skipped. Typing a different agent instead writes an explicit override into the project
-   file only.
+2. A fresh project config skeleton is created; the existing global config is opened, not
+   recreated.
+3. The agent question states it saves to *this repo's* file, and shows its default sourced
+   from the **global** config ("currently: claude (from your global config)") — the prompt
+   makes both facts legible together: where a change would land (this repo only) and where
+   the value shown is actually coming from right now (global). Pressing Enter accepts the
+   default, and because the answer didn't change, nothing is written to the project file,
+   which keeps its `agent` line commented and continues to inherit from global.
 4. The containers question is asked only if the trigger condition currently holds (no
-   runtime found); if the global config already resolved this in a previous run, the default
-   shown reflects that, and accepting it writes nothing.
-5. Verification runs and prints; offer to start a first session, as UC1.
+   runtime found); if a previous run already resolved this, accepting its default writes
+   nothing.
+5. The layout question is still asked (it is not gated by "global config already sets one" —
+   see [Question flow](#question-flow)), but its default is now the layout already saved
+   globally, labeled `(from your global config)`. Pressing Enter through the preset menu (or
+   picking the preset that happens to match) writes nothing.
+6. Verification runs and prints; offer to start a first session, as UC1.
 
-This is the common case after the very first repo. With a healthy global config and a
-detected runtime, it now involves exactly one real question (agent) that a single Enter
-press answers correctly.
+Once a user has a healthy global config, this now involves at most three real answers —
+agent, containers, layout — each defaulting correctly, so a returning user who wants nothing
+to change can press Enter three times and land on the same "verify and report" outcome the
+previous revision reached with fewer prompts. The tradeoff is deliberate: see
+[Resolved Decisions](#resolved-decisions) #8.
 
 ### UC3 — `am start` failed, user wants to be walked through fixing it
 
@@ -97,37 +124,38 @@ are disabled with no runtime installed.
 3. The user can now genuinely fix the problem here: e.g. switch from `agent = "codex"`
    (no `OPENAI_API_KEY` set) to `agent = "claude"` (credentials already present on this
    host) by typing a new answer. This is the one place `am setup` can change an existing
-   choice, not just re-report it.
+   choice, not just re-report it. The prompt's write-target line already told them this
+   lands in `.am/config.toml` — the file they're here to fix.
 4. If no runtime is currently found, the containers question offers to disable containers so
    the user can keep working without one, or the user can leave it as-is and go install one.
-5. `doctor::run()` re-verifies against whatever is now in the (possibly just-updated) config
-   and prints the report — reflecting any change just made.
-6. Clean → offer a first session. Not clean → the report's own hints are the guidance;
+5. The layout question runs too, unrelated to whatever brought the user here — it's asked on
+   every run, not conditioned on there being a problem to fix.
+6. `doctor::run()` re-verifies against whatever is now in the (possibly just-updated) project
+   config and prints the report — reflecting any change just made in step 3-4 (layout has no
+   bearing on doctor's checks).
+7. Clean → offer a first session. Not clean → the report's own hints are the guidance;
    `am setup` stops there.
 
-**Scope boundary, restated for the revised flow:** `am setup` can now change the two things
-it already knows how to ask about — which agent, and whether containers are enabled — on an
-existing config. It still does **not** become a general repair tool: it never installs a
-container runtime, never runs `gh auth login` or writes a token, and never edits any config
-key outside `defaults.agent` and `container.enabled`. That boundary is unchanged in kind; the
-[OQ5 override](#resolved-decisions) only moved "agent" from "fixed once written" to "always
-revisitable," it didn't add new categories of automated repair.
+**Scope boundary, restated:** `am setup` can change the things it already knows how to ask
+about — which agent, whether containers are enabled, and pane layout — on an existing
+config. It still does **not** become a general repair tool: it never installs a container
+runtime, never runs `gh auth login` or writes a token, and never edits any config key outside
+`defaults.agent`, `container.enabled`, and the three `tmux.*` layout keys.
 
 ## Scope boundary vs. `am init` and `am doctor`
 
 **A new, separate command — `am setup` — not a flag on `init`.** `am init` must stay fast,
 silent, and scriptable: it's invoked from the cucumber fixtures and (per the docs) from setup
 scripts as an idempotent, non-interactive primitive, and making it interactive by default
-inverts that contract for every existing caller. A flag (`am init --interactive`) also buries
-the feature — the whole point is discoverability for someone who doesn't know what to type
-yet, and a bare, guessable verb serves that better than a flag. This also matches the
-"fast path vs. custom path" split BACKLOG.md already calls for: `am init` (fast, scriptable)
-and `am setup` (guided, interactive) become the two doors.
+inverts that contract for every existing caller. This also matches the "fast path vs. custom
+path" split BACKLOG.md already calls for: `am init` (fast, scriptable) and `am setup`
+(guided, interactive) are the two doors.
 
 **`am setup` is additive, not a rewrite:** its first action is running the exact same logic
-`am init` runs (`.am/` + `.gitignore`), extracted into a shared helper so `cmd_init` and
-`cmd_setup` cannot drift apart — the same "don't let a passing check and a working command
-disagree" principle `am doctor` already follows for `cmd_start`'s preflight functions.
+`am init` runs (`.am/` + `.gitignore`), factored into a shared helper (`init_project`, in
+`main.rs`) so the two commands cannot drift apart — the same "don't let a passing check and a
+working command disagree" principle `am doctor` already follows for `cmd_start`'s preflight
+functions.
 
 **Relationship to `am doctor`: `am setup`'s verification step *is* `doctor::run()`.** No new
 check logic is written. `am setup` computes what's already configured using the same
@@ -135,6 +163,9 @@ primitives `doctor::run()` and `cmd_start` already call (`container::detect_runt
 `container::validate_agent_credentials`, `devcontainer::find_config`, `tmux::find_tmux`), and
 after writing config it calls `doctor::run()` for real and renders it with the existing
 `Report::render()` — byte-for-byte the same output `am doctor` would print for that repo.
+Pane layout is not a doctor check (a "wrong" layout doesn't stop `am start` from working), so
+it plays no part in the pass/fail verdict — it's purely a preference question layered
+alongside the two questions that do matter to readiness.
 
 This does **not** reverse the stance BACKLOG.md records for `am doctor` ("the alternative to
 auto-bootstrapping `.am/` as a side effect of `am start`"). `am start` still does not
@@ -143,11 +174,21 @@ auto-bootstrap anything. `am setup` is an explicit, user-invoked command whose e
 
 ## Question flow
 
-The guiding rule is unchanged: **ask only what detected state can't answer.** What changed
-(per [Resolved Decision #5](#resolved-decisions)) is what "answer" means when a file already
-has a value — the question is still asked (gated exactly as before), but its default is now
-the *effective current value*, shown with where it comes from, and accepting that default is
-a guaranteed no-op.
+The guiding rule remains **ask only what detected state can't answer** — but the layout
+revision draws a sharper line for what counts as "answerable by detection." Agent credentials
+and container runtimes are things a probe can genuinely determine. Pane layout is not: no
+amount of host inspection tells `am` whether a user wants the agent on the left, on the
+right, or stacked on top. A question in the second category doesn't lose its justification
+just because it's always asked.
+
+A second, orthogonal rule now applies uniformly to all three questions (the follow-up
+resolution — see [Resolved Decisions](#resolved-decisions) #9): **every question states
+where its answer will be saved**, in terms of scope first ("just this repo" vs. "every repo
+on this machine") and the file path second. This is a distinct concern from the "currently:"
+line each question already showed — that line says where the *displayed default* came from;
+the new line says where a *change* would go. For the agent question specifically these two
+facts can point at different files at once (default from global, write to project), which is
+exactly why both need to be legible in the same prompt, not just one or the other.
 
 ```
 1. Preconditions (no prompt)
@@ -156,486 +197,678 @@ a guaranteed no-op.
 
 2. Project config file (no prompt — an action, not a question)
    ├─ .am/config.toml missing     → write skeleton + .gitignore entry (= `am init`)
-   └─ .am/config.toml exists      → open it, don't touch it yet — its values feed step 3
+   └─ .am/config.toml exists      → open it, don't touch it yet — its values feed step 4
 
 3. Global config file (no prompt — an action, not a question)
    ├─ ~/.config/am/config.toml missing  → write skeleton
-   └─ ~/.config/am/config.toml exists   → open it, don't touch it yet — feeds steps 3-4
+   └─ ~/.config/am/config.toml exists   → open it, don't touch it yet — feeds steps 4-6
 
 4. Agent question — ALWAYS asked, unless --agent or --yes was passed
-   "Which agent do you use? [1] claude  [2] copilot  [3] gemini  [4] codex"
-   Default shown = the effective value read via project config → global config → compiled
-   default (none), labeled with its source, e.g.:
-     "agent: claude (from your global config)"
-     "agent: codex (from this project's config)"
-     "agent: none configured"
-   If nothing sets an effective value yet, the menu's pre-selected option is instead the
-   first agent with credentials already detected on this host (same probe
-   `validate_agent_credentials` uses), falling back to "claude" — this is the only case
-   where the shown default isn't literally "what's already configured," because nothing is.
-   Accepting the default (Enter, or an --yes/--agent value equal to it) writes NOTHING.
-   A genuinely different answer writes `defaults.agent` into the PROJECT file only — never
-   the global file, regardless of where the shown default came from (see
-   "What it writes" below for why).
+   States: saves to THIS REPO's config. Default = effective value via project → global →
+   compiled default, labeled with source. Accepting it writes nothing. A change writes
+   `defaults.agent` into the PROJECT file only, regardless of which file the shown default
+   came from.
 
-5. Containers question — asked ONLY if neither podman nor docker is currently on PATH
-   "No container runtime found on this machine. Proceed with containers disabled for now?
-   [y/N]"
-   Default shown = the effective `container.enabled` value read from the GLOBAL config
-   (project-level overrides of this key are intentionally out of scope for this question —
-   see Resolved Decision #4), labeled with its source.
-   Accepting the default writes nothing. A changed answer writes `container.enabled` into
-   the GLOBAL file only.
-   If a runtime IS found, this question is not asked at all, regardless of what's already
-   configured — see the edge case on stale disables below.
+5. Containers question — asked ONLY if neither podman nor docker is currently on PATH (and
+   there is a global file to write to — see below)
+   States: saves MACHINE-WIDE. Default = effective `container.enabled`, read from the GLOBAL
+   file only (a project-level override of this key, if one exists, is intentionally out of
+   scope for this question). Accepting it writes nothing. A change writes `container.enabled`
+   into the GLOBAL file.
 
-6. Project-specific notes (no prompt — informational only)
+6. Pane layout question — ALWAYS asked, unless --yes was passed or there is no global file
+   to write to (`detected.global_config_path` is `None`) — the same "nowhere to save the
+   answer" gate `ask_container_enabled` already uses, and the only gate this question has.
+   States: saves MACHINE-WIDE, same as containers. See the dedicated section below.
+
+7. Project-specific notes (no prompt — informational only)
    ├─ .devcontainer/devcontainer.json found → one line: "found — sessions will use it
    │    automatically (container.mode = auto)". No question: auto is already the correct
-   │    default, and asking "use your devcontainer?" when the answer is obviously yes
-   │    fails the "every question must justify itself" bar.
+   │    default, and asking "use your devcontainer?" when the answer is obviously yes fails
+   │    the "every question must justify itself" bar.
    │    If it also contains `initializeCommand` (which `am` refuses by default): a warning
    │    line pointing at `am doctor` and `devcontainer.allow_host_commands`, NOT a prompt —
    │    silently enabling host command execution from a wizard default is not acceptable.
    └─ none found                 → nothing printed; image mode is already the default
 
-7. Verification (no prompt)
+8. Verification (no prompt)
    → run doctor::run() against the resolved repo + agent (reflecting whatever was just
-     written in steps 4-5), render exactly as `am doctor`
-   → 0 failures  → continue to step 8
-   → failures>0  → print the report, exit 1 (see UC3); step 8 is not reached
+     written in steps 4-6), render exactly as `am doctor`
+   → 0 failures  → continue to step 9
+   → failures>0  → print the report, exit 1 (see UC3); step 9 is not reached
 
-8. First session (prompt only if step 7 passed AND session is interactive, i.e. not --yes
+9. First session (prompt only if step 8 passed AND session is interactive, i.e. not --yes
    and stdin is a TTY)
    → "Start your first session now? [Y/n]"
         no / declined  → print next-step commands, exit 0
-        yes            → "Session name: " (no default — an empty answer re-prompts once,
-                           then falls back to declining and printing next steps rather than
-                           looping forever on a required field)
+        yes            → "Session name: " (two tries, no default; falls through to
+                           declining rather than looping forever on a required field)
                         → calls the same function `cmd_start` uses, with the resolved agent
 ```
 
-**Empty input:** accepts the shown default. For the agent menu, empty input accepts the
-marked default option.
+**Why the layout question sits between containers and the informational notes, not
+elsewhere:** it groups with the other two prompts (agent, containers) as the third and last
+thing the user is actually asked, keeping every interactive Q&A together before the flow
+moves into report-only territory (the devcontainer note, then verification). Putting it after
+verification would suggest it's diagnostic, which it isn't; putting it before the agent
+question would ask about *how a session looks* before establishing *what runs in it*, the
+wrong order for a first-time user building a mental model of the tool.
 
-**Invalid input** (an out-of-range menu number, or `y`/`n`/blank being none of those): the
-question is re-asked with a one-line reason; there's no retry limit because the underlying
-validation is trivial and an infinite loop here is no worse than a normal shell prompt
-rejecting bad input.
+**Empty input, invalid input, Ctrl-C, EOF:** unchanged — accept the shown default on empty
+input; re-ask with a one-line reason on invalid input, no retry limit; Ctrl-C is default
+process behavior with no rollback needed (every write is independently idempotent); EOF
+aborts with one message and a non-zero exit. The layout question's sub-flow (see below)
+follows the same idiom at each of its own prompts.
 
-**Ctrl-C / SIGINT:** default process behavior (immediate exit). Both config writes (steps 4
-and 5) are independent, atomic, single-file operations, so an interrupt between them leaves
-each file in a fully valid, already-correct-for-what-was-answered state; re-running `am
-setup` resumes cleanly because every step is idempotent by construction (the effective-value
-defaulting means re-asking an already-answered question is a no-op).
+### The write-target line, shared by all three questions
 
-**EOF on stdin** (e.g. `am setup </dev/null` without `--yes`): the first prompt receiving
-`Ok(0)` from `read_line` treats it as an abort — one message ("no input received; re-run
-with --yes for non-interactive setup"), exit 1, no further steps run. This is a backstop for
-stdin being a TTY that unexpectedly closes mid-flow, not the primary non-interactive path
-(see below).
+One line, printed before each question's body, naming the scope first and the path second —
+scope is what a user actually decides between ("do I want this everywhere, or just here?"),
+the path is the detail that makes it verifiable:
+
+```rust
+/// Where a question's answer is saved — fixed per question, independent of where the
+/// *displayed default* happens to be read from (that's `Source`, a different question:
+/// "where did this value come from" vs. "where would a change go").
+enum WriteScope {
+    Project,
+    Global,
+}
+
+impl WriteScope {
+    fn phrase(self) -> &'static str {
+        match self {
+            WriteScope::Project => "just this repo",
+            WriteScope::Global => "every repo on this machine",
+        }
+    }
+}
+
+/// One line, shared by `ask_agent`, `ask_container_enabled`, and `ask_layout` — a single
+/// implementation so the wording cannot drift between them, and so it's pinned by one set
+/// of tests instead of three copies that could disagree.
+///
+/// `base` is what `path` gets shortened against for display — `detected.repo_root` for
+/// `WriteScope::Project`, `detected.home_dir` for `WriteScope::Global` — so a 80+ character
+/// absolute project path doesn't wrap and defeat the point of an at-a-glance line. `None`
+/// (no known base, or `path` isn't actually under it) falls back to the absolute path.
+fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
+    let shown = shorten_for_display(scope, path, base);
+    format!("{label} — {}; saved to {}.", scope.phrase(), shown.display())
+}
+```
+
+Concrete output for each question:
+
+```
+Agent — just this repo; saved to .am/config.toml.
+```
+```
+Containers — every repo on this machine; saved to ~/.config/am/config.toml.
+```
+```
+Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
+```
+
+Each is printed as the first line of the question, before the menu/prompt body, and before
+the existing "currently: ..." line. For the agent question in particular, the two lines
+together answer both of the user's questions in the order they'd ask them: "where would my
+answer go?" (this line) then "where's the current default coming from?" (the existing
+`Source`-labeled line, which may name a *different* file — see UC2).
+
+**This changes already-shipped output.** `ask_agent` and `ask_container_enabled` did not
+print this line before this revision; adding it is an intentional behavior change, not a
+regression, so existing assertions that pinned their exact prompt text move with it — called
+out explicitly in [Testing strategy](#testing-strategy) and
+[Task breakdown](#task-breakdown) so it isn't mistaken for a broken test during review.
+
+### The pane layout question, in detail
+
+**Presets, not three granular questions up front.** A single question offers four common
+layouts plus "customize…", each shown with a small preview so the user doesn't have to
+mentally simulate what "agent right, 70/30" looks like:
+
+| # | Preset | `agent_pane` | `split` | `split_percent` |
+|---|---|---|---|---|
+| 1 | agent left, 50/50 | `left` | `horizontal` | 50 |
+| 2 | agent right, 50/50 | `right` | `horizontal` | 50 |
+| 3 | agent left, 70/30 | `left` | `horizontal` | 70 |
+| 4 | stacked, agent on top, 50/50 | `left` | `vertical` | 50 |
+| 5 | customize… | — falls through to three granular sub-questions | | |
+
+Preset 1 is `am`'s compiled default (`TmuxConfig::default()`), which is why it's what a
+first-time user with nothing configured sees pre-selected.
+
+**Why `left` for "stacked, agent on top" (#4), and why it isn't ambiguous:** `PaneSide::Left`
+already means "the agent's pane is the one placed *before* the other" — `tmux.rs`'s
+`split_window` takes a `before: bool` that "places the new pane left of (horizontal) or
+above (vertical) the existing one," and `pane_layout(&PaneSide::Left)` passes `before: true`
+and puts the agent in the resulting first pane. So `left` already means "top" the moment
+`split` is `vertical`; the schema doesn't grow a fourth value for stacked layouts, it reuses
+the two it has. **This is exactly the wrinkle the customize path must not paper over**: for a
+horizontal split, the natural words are "left"/"right"; for a vertical split, the same
+`PaneSide` values read as "top"/"bottom", and asking "left or right?" once the user has
+already chosen a stacked split would be simply wrong. Only one stacked preset is offered
+(agent on top) — the inverse (agent on bottom) is reachable through customize, which is
+enough given the goal is fewer decisions, not a preset for every combination.
+
+**Preview rendering — one shared function, computed, not authored per preset.** The four
+preset previews and the one customize preview all go through the same `render_layout`, rather
+than being hand-written text for the fixed set — one rendering implementation to keep correct,
+not four-plus-one. Each preset's preview prints on its own indented line(s) below the preset's
+label line, not inline with it. Illustrative shape (exact spacing is an implementation detail,
+not load-bearing):
+
+```
+Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
+Which layout do you want?
+  [1] agent left, 50/50
+      [  agent   |  shell   ]
+  [2] agent right, 50/50
+      [  shell   |  agent   ]
+  [3] agent left, 70/30
+      [    agent    | shell ]
+  [4] stacked, agent on top, 50/50
+      [       agent        ]
+      [       shell        ]
+  [5] customize…
+  currently: agent_pane=left, split=horizontal, split_percent=50 (am's default)
+Layout [1-5] (Enter to keep current):
+```
+
+Enter accepts the currently effective triple, not a hardcoded preset — the same "Enter means keep what's already in effect" idiom `ask_agent`'s and `ask_container_enabled`'s own defaults follow. On a first-time run with nothing configured, the effective triple happens to equal preset 1, but the prompt's wording does not assume that.
+
+The opening line is `write_target_line`'s output, described above — the same helper the
+agent and containers questions now use, not a one-off sentence specific to layout.
+
+**Customize sub-flow — direction first, then a direction-aware pane question, then
+percent.** This ordering is the only one that produces correctly worded questions: the pane
+question's wording (left/right vs. top/bottom) *depends on* the direction, so direction
+cannot be asked second. Concretely:
+
+```
+6a. "Side by side, or stacked?
+       [1] side by side (horizontal)   [2] stacked (vertical)"
+     Default = current effective split, with source. → chosen direction
+
+6b. Horizontal chosen: "Which side should the agent be on? [1] left  [2] right"
+    Vertical chosen:   "Should the agent be on top or on the bottom? [1] top  [2] bottom"
+    Default = current effective agent_pane, worded to match the chosen direction.
+    → chosen side ("top"/"left" both map to PaneSide::Left; "bottom"/"right" to
+      PaneSide::Right — the prompt's words change, the stored value's meaning does not)
+
+6c. "What percentage of the window should the agent pane get? [1-99] (Enter for 50):"
+    Default = current effective split_percent, with source. Out-of-range or non-numeric
+    input re-asks, same as every other invalid-input case in this flow.
+
+6d. Render the resulting layout with the same preview format as the preset menu, then:
+    "Use this layout? [Y/n]"
+      accepted → the (side, direction, percent) triple is the answer
+      declined → back to the top of the layout question (the preset menu), not a partial
+                 retry of 6a-6c — simpler to reason about, and customize is rare enough that
+                 re-entering it is not a real cost
+```
+
+The write-target line is shown once, at the top of the outer question (before "Which layout
+do you want?"); the sub-questions don't repeat it — they're all still answering the one
+question the header already scoped.
+
+**Write target and per-key granularity.** All three keys are a per-user preference and are
+always written to the **global** file, regardless of where the current effective value came
+from — including the case where a project happens to already override one of them (see the
+caveat below). Unlike the single-key agent/containers writes, a layout answer can touch up to
+three keys at once, and a customize answer that only changes the percentage should not also
+uncomment `agent_pane`/`split` lines that already say the right thing. `update_key` (see
+[What it writes](#what-it-writes)) is called once per key, independently, so only the keys
+that actually changed are touched.
+
+**Caveat: a project-level `tmux.*` override.** The schema allows a project config to set its
+own `[tmux]` values, which would outrank the global file for that repo specifically. If any
+of the three effective values' source is `Project` when the layout question is about to be
+asked, `am setup` prints one line before the prompt: "Note: this project's config already
+sets its own pane layout — your answer here is saved globally and won't change sessions in
+this repo until that override is removed." This is a judgment call, not something the user
+was asked about directly, flagged as such in
+[Resolved Decisions](#resolved-decisions) #8.5 — reasonable to ship as-is, cheap to adjust
+later if it reads as noise in practice.
 
 ## Non-interactive / non-TTY behaviour
 
-- **`am setup --yes`**: never prompts. Every question above resolves to its effective
-  current value — which, per the no-op rule, means **`am setup --yes` on an already-fully-
-  configured repo writes nothing at all** and degrades to "run doctor verification and print
-  the report." On a fresh repo it writes the skeleton files with the detected-credential/
-  compiled defaults (no explicit overrides), exactly as UC1 with every prompt Enter'd
-  through. Exit code **is doctor's exit code** (0 clean, 1 on any failure), so
-  `am setup --yes && am start feat --agent claude` is a valid CI bootstrap step. Step 8
-  (first session) never runs under `--yes` regardless of outcome — starting a session is a
-  meaningfully mutating, possibly slow (image build) action a non-interactive bootstrap step
-  should not take unasked.
-- **`--agent <name>`** is not a prompt-default, it's a direct instruction: it's evaluated and
-  potentially written **identically whether or not `--yes` is also passed**. If it names an
-  agent different from the project file's current explicit value (or from the effective
-  value if nothing is explicit yet), it's written; if it matches, nothing is written. This is
-  why `am setup --yes --agent claude` is a meaningful, deterministic way to *change* an
-  existing repo's agent from a script — it does not fall under the "yes means no-op" rule
-  above, because a flag is not "accepting a default," it's supplying an answer.
+- **`am setup --yes`**: never prompts, so none of the write-target lines above are ever
+  printed under `--yes` either — they're part of the interactive prompt bodies, not the
+  summary output. The agent question still resolves to a proactive best-guess default when
+  nothing is configured (the first agent already authenticated on this host, else `claude`)
+  — because "no agent configured" is a real functional gap `am doctor` and `--auto` both
+  care about. The containers question and the layout question are both **skipped entirely
+  under `--yes`**, writing nothing, because neither has an analogous "unanswered means
+  broken" stake: an unset `container.enabled` and an unset `tmux.*` both fall back to a
+  working compiled default with no functional consequence. This is a deliberate asymmetry,
+  not an oversight — see [Resolved Decisions](#resolved-decisions) #8.4. Net effect:
+  `am setup --yes` on an already-fully-configured repo writes nothing at all and degrades to
+  "run doctor verification and print the report"; on a fresh repo it writes only what's
+  needed for a session to actually start. Exit code **is doctor's exit code**, so
+  `am setup --yes && am start feat --agent claude` is a valid CI bootstrap step. Step 9
+  (first session) never runs under `--yes` regardless of outcome.
+- **`--agent <name>`** is not a prompt-default, it's a direct instruction, evaluated
+  identically whether or not `--yes` is also passed, and it also skips the prompt (and
+  therefore the write-target line) entirely — there's nothing to show a write-target line
+  for when nothing was asked. There is no equivalent flag for layout or containers — see
+  [Resolved Decisions](#resolved-decisions) #8.6 for why that's deliberately out of scope.
 - **`am setup` with stdin not a TTY and no `--yes`**: detected via `std::io::IsTerminal`
-  (stable since Rust 1.70, well under `am`'s actual build floor — the crate graph today
-  already requires 1.88 via transitive dependencies, `home` 0.5.12 in particular; this
-  requires no MSRV concession). Fails fast with one message: `am setup requires an
-  interactive terminal — pass --yes for non-interactive setup, or use 'am init' +
-  'am generate-config'` — no files are touched. This protects against a CI script or a piped
-  invocation silently hanging on a prompt that will never receive input.
+  (`std::io::stdin().is_terminal()`, already the exact check in the shipped `cmd_setup`).
+  Fails fast with one message before any file is touched.
 
 ## What it writes
 
-**Rule: `defaults.agent` is a per-repo decision and is always written to `.am/config.toml`
-(never to the global file, no matter where the shown default came from). `container.enabled`
-is a host decision and is always written to `~/.config/am/config.toml`.** These are the only
-two keys `am setup` ever writes — see [Resolved Decision #4](#resolved-decisions) for why the
-scope stays this narrow.
+**Rule: `defaults.agent` always goes to `.am/config.toml`; `container.enabled` and the three
+`tmux.*` layout keys always go to `~/.config/am/config.toml`.** These are the only five keys
+`am setup` ever writes — see [Resolved Decisions](#resolved-decisions) #4 for why the scope
+stays this narrow, and #8 for why layout joined the list. Every one of the three questions
+now states this rule to the user in its own prompt (see above), so it's no longer only
+documented here — it's legible at the point of decision.
 
-There are two distinct write paths, because a file that doesn't exist yet and a file the user
-may have hand-edited need different treatment:
+Two distinct write paths, unchanged in kind by this revision:
 
-**Creating a file that doesn't exist** uses a plain string template — `render_project_config_
-skeleton()` / `render_global_config_skeleton()` — matching `config::write_defaults`'s existing
-style: fully commented, documented, human-readable. There's no existing content to preserve,
-so there's nothing format-preservation buys here.
+**Creating a file that doesn't exist** uses a plain string template
+(`config::render_project_config_skeleton` / `onboarding::render_global_config_skeleton`),
+fully commented, matching `config::write_defaults`'s existing style — there's no existing
+content to preserve, so format preservation buys nothing here. One special case:
+`onboarding::render_project_config_skeleton_with_agent` renders the skeleton with
+`defaults.agent` already active, used only when `am setup` already knows the agent to write
+(a flag, or `--yes`'s resolved default) *and* the project file doesn't exist yet — this
+avoids inserting a real value next to its own commented-out example on a brand-new file.
 
-**Updating a file that already exists** uses **`toml_edit`** (new dependency — see below),
-which parses the file into an editable document, finds-or-inserts exactly the one key being
-changed, and re-serializes — preserving every comment, blank line, table order, and
-formatting choice the user (or a previous `am setup` run) made everywhere else. This is the
-part of the [OQ5 override](#resolved-decisions) that matters: an update path built on line
-matching or regex would be the first thing to break on a file someone has actually edited,
-which is precisely the file `am setup` is now expected to handle correctly.
+**Updating a file that already exists** uses `toml_edit` (`onboarding::update_key`), which
+parses the file into an editable document, finds-or-inserts exactly the key being changed,
+and re-serializes — preserving every comment, blank line, table order, and formatting choice
+already there. It refuses (rather than clobbers) a key that already holds a table, an inline
+table, or an array — a hand-edited `[defaults.agent]` sub-table, say — since `am setup` only
+ever writes a plain string or bool and silently discarding something structural is worse
+than stopping and asking the user to fix it by hand.
 
 ```rust
-/// Returns Ok(true) if the file was written, Ok(false) if the requested value already
-/// matched what's there (no-op — the file's mtime is not touched).
+// One key, one call each — already shipped.
 pub fn update_project_agent(path: &Path, agent: container::KnownAgent) -> Result<bool>;
 pub fn update_global_container_enabled(path: &Path, enabled: bool) -> Result<bool>;
+
+// Three keys, one call per key internally — new in the layout revision. Returns the names
+// of the keys actually written (a subset of ["agent_pane", "split", "split_percent"]), empty
+// when the chosen layout already matched what was there.
+pub fn update_global_tmux_layout(
+    path: &Path,
+    agent_pane: config::PaneSide,
+    split: config::SplitDirection,
+    split_percent: u8,
+) -> Result<Vec<&'static str>>;
 ```
 
-**Why hand-roll prompts but add a dependency for TOML editing — these are not
-inconsistent.** The prompt flow is a handful of short, linear questions with no need for
-cursor-based navigation; the strongest reason to avoid a prompt crate is that `dialoguer`-
-style crates read the TTY directly, which fights the very `Io`/`ScriptedIo` seam that makes
-the question logic unit-testable (see [Resolved Decision #2](#resolved-decisions)) — that
-argument has nothing to do with dependency count and doesn't apply to `toml_edit` at all.
-`toml_edit` isn't chosen to save code, it's chosen because *correctness of an in-place edit
-to a file the user may have hand-edited* is a category of bug (silently mangling their
-comments, dropping a table, reordering things) that hand-rolled line-matching cannot be made
-to reliably avoid, and getting it wrong writes bad data into a file `am` itself asked to be
-allowed to edit. Different problems, different tools, both reasoned about explicitly here so
-the choice doesn't read as an inconsistency.
+Every write compares the requested value against what's already there (parsed, not
+string-matched) before touching the file, and skips the `std::fs::write` entirely when
+they're equal — this is what makes "press Enter through everything" and `--yes` on an
+already-configured repo genuinely no-ops, not merely idempotent rewrites that happen to
+produce the same bytes.
 
-`toml_edit` 0.25.13's MSRV is 1.85, which matches the floor `am` already needs to build, so
-this adds no new constraint. It also shares its dependency graph with `toml` (already a direct
-dependency): with `toml` 1.0, `cargo tree -d` reports **no duplicates at all** across
-`toml_datetime`, `toml_parser`, `toml_writer`, `winnow`, and `indexmap` — the two crates agree
-on a major version of each, so the marginal addition to the crate graph is only `toml_edit`
-itself.
-
-(Under the `toml` 0.9 this spec was originally written against, `toml_datetime` and `winnow`
-each resolved to two versions. The `toml` 1.0 upgrade on `main` removed that split.)
-
-**No-op writes never touch the file.** `update_project_agent`/`update_global_container_
-enabled` compare the requested value against what's already there (parsed, not
-string-matched) before writing anything, and return `Ok(false)` — no `std::fs::write` call at
-all — when they're equal. This is what makes "press Enter through everything" and
-`am setup --yes` on an already-configured repo genuinely no-ops, not merely idempotent
-rewrites that happen to produce the same bytes.
+**Why hand-roll prompts but use a dependency for TOML editing.** Different problems: the
+prompt flow needs no cursor-based navigation, and the strongest reason to avoid a prompt
+crate is that `dialoguer`-style crates read the TTY directly, fighting the `Io`/`ScriptedIo`
+seam the unit tests depend on. `toml_edit` isn't chosen to save code — it's chosen because
+correctness of an in-place edit to a file the user may have hand-edited is a category of bug
+(mangled comments, a dropped table, silent reordering) hand-rolled line matching cannot
+reliably avoid, and it's exactly the file `am setup` was given permission to edit. `toml_edit`
+0.25's MSRV (1.85) is below `am`'s actual floor (1.88, via `home`/`clap_builder`/`sha2`), so
+this adds no new constraint, and it shares much of its dependency graph
+(`toml_datetime`, `toml_parser`, `toml_writer`, `winnow`, `indexmap`) with the `toml` 0.9
+dependency `am` already has.
 
 ## Verification step
 
-`am setup`'s verification step is not a new check catalogue — it is a direct call to
-`doctor::run(Some((&repo_root, vcs)), agent_flag)` (the identical function `am doctor`'s
-command handler calls), rendered with the existing `Report::render()`, run *after* steps 4-5
-have made whatever changes they made. The only thing `am setup` adds on top is the framing
-text ("Checking your setup...") before it and, on success, a "Next steps" block after it:
-
-```
-Ready.
-
-Next steps:
-  am start feat --agent claude   # start your first session
-  am doctor                      # re-check readiness any time
-  am attach feat                 # jump back into a running session
-```
-
-On failure, the report itself (with its `hint` lines) is the guidance; `am setup` adds
-nothing beyond a pointer to re-run once the flagged items are fixed.
+Unchanged: `am setup`'s verification is a direct call to
+`doctor::run(Some((&repo_root, vcs)), agent_flag)`, run after every write (steps 4-6) has
+happened, rendered with the existing `Report::render()`. On success it's followed by a
+"Next steps" block (`print_next_steps` in `main.rs`); on failure the report's own hints are
+the guidance and `am setup` exits 1 without reaching step 9.
 
 ## API / contract surface
 
-### CLI (`src/cli.rs`)
+This section matches the shipped module (`src/onboarding.rs`, `main.rs::cmd_setup`) for
+everything except the layout addition and the write-target line, both new.
+
+### CLI (`src/cli.rs`) — unchanged
 
 ```rust
-/// Guided, interactive setup — init plus a short question flow plus verification.
 Setup {
-    /// Skip all prompts; use effective current values for every question.
     #[arg(short, long)]
     yes: bool,
-    /// Explicitly set (and, if it differs from what's there, write) the agent.
     #[arg(short, long)]
     agent: Option<String>,
 },
 ```
 
-### New module: `src/onboarding.rs`
+No new flag for layout — see [Resolved Decisions](#resolved-decisions) #8.6.
 
-Owns everything specific to the guided flow. Reuses `config`, `container`, `devcontainer`,
-`doctor`, `tmux` for detection and verification; reuses `main::cmd_init`'s extracted helper
-and `main::cmd_start` for the two mutating actions it delegates rather than reimplements.
+### `src/onboarding.rs`
+
+Already shipped, agent/container question logic unchanged except that `ask_agent` and
+`ask_container_enabled` now each print `write_target_line(...)` as their first line:
 
 ```rust
-/// Where an effective value currently comes from — needed to label prompts ("(from your
-/// global config)") and, for the agent question specifically, to decide the prompt's
-/// pre-filled default without ever deciding the WRITE target (that's a fixed rule, not
-/// derived from source — see "What it writes").
-pub enum Source {
-    Project,
-    Global,
-    CompiledDefault,
-}
+pub enum Source { Project, Global, CompiledDefault }
+pub struct Effective<T> { pub value: T, pub source: Source }
 
-pub struct Effective<T> {
-    pub value: T,
-    pub source: Source,
-}
-
-/// What `am setup` already knows without asking, gathered once up front so the question
-/// flow can decide what to skip and what default to show. Mirrors the inputs `doctor::run`
-/// and `cmd_start` use, so a question is never asked about something those functions could
-/// answer themselves.
 pub struct DetectedState {
-    pub vcs: Option<config::Vcs>,             // None if not in a repo
+    pub vcs: Option<config::Vcs>,
+    // New in the layout revision, alongside `write_target_line`: the bases it shortens
+    // `project_config_path`/`global_config_path` against for display. `repo_root` is `None`
+    // alongside `vcs` being `None`; `home_dir` is `None` only when `HOME` isn't set.
+    pub repo_root: Option<PathBuf>,
     pub project_config_path: PathBuf,
     pub project_config_exists: bool,
     pub global_config_path: Option<PathBuf>,
     pub global_config_exists: bool,
+    pub home_dir: Option<PathBuf>,
     pub tmux_present: bool,
-    pub runtimes_found: Vec<container::RuntimeKind>,   // 0, 1, or 2 entries
+    pub runtimes_found: Vec<container::RuntimeKind>,
     pub devcontainer: Option<PathBuf>,
-    pub agent_credentials: Vec<(container::KnownAgent, bool)>, // probed, never displays secrets
+    pub agent_credentials: Vec<(container::KnownAgent, bool)>,
     pub effective_agent: Effective<Option<container::KnownAgent>>,
     pub effective_container_enabled: Effective<bool>,
+    // New in the layout revision:
+    pub effective_tmux_agent_pane: Effective<config::PaneSide>,
+    pub effective_tmux_split: Effective<config::SplitDirection>,
+    pub effective_tmux_split_percent: Effective<u8>,
 }
 
-impl DetectedState {
-    pub fn gather(repo_root: Option<&Path>) -> Result<Self> { /* ... */ }
-}
-
-/// Resolved answers — `None` means "no write needed for this key."
-pub struct Answers {
-    pub agent: Option<container::KnownAgent>,
-    pub container_enabled: Option<bool>,
-    pub start_session: Option<String>,               // slug, if the user opted in
-}
-
-/// The IO seam. `TermIo` is the real terminal; `ScriptedIo` (test-only) replays a fixed
-/// list of answers and captures output, so prompt logic (defaults, retry-on-invalid, EOF)
-/// is unit-testable without a subprocess or a real TTY.
 pub trait Io {
-    fn prompt_line(&mut self, question: &str) -> Option<String>; // None = EOF
+    fn prompt_line(&mut self, question: &str) -> Option<String>;
     fn println(&mut self, line: &str);
 }
-
-pub struct TermIo;              // std::io::IsTerminal-gated in the caller
-#[cfg(test)]
-pub struct ScriptedIo { /* Vec<String> answers, String captured output */ }
-
-/// Steps 4-5 of the question flow, against any `Io`. Returns only the keys that actually
-/// changed; steps 2-3 (ensure-file-exists) and 6-8 live in `cmd_setup` because they call
-/// into `main`/`doctor` directly.
-pub fn ask_agent(
-    io: &mut dyn Io,
-    detected: &DetectedState,
-    agent_flag: Option<container::KnownAgent>,
-) -> Option<container::KnownAgent>;
-
-pub fn ask_container_enabled(
-    io: &mut dyn Io,
-    detected: &DetectedState,
-) -> Option<bool>;
-
-// Greenfield creation — no existing file, nothing to preserve.
-pub fn render_project_config_skeleton() -> &'static str;
-pub fn render_global_config_skeleton() -> &'static str;
-
-// Existing-file update — format-preserving, via toml_edit. Ok(true) = wrote, Ok(false) =
-// no-op (value already matched, file untouched).
-pub fn update_project_agent(path: &Path, agent: container::KnownAgent) -> anyhow::Result<bool>;
-pub fn update_global_container_enabled(path: &Path, enabled: bool) -> anyhow::Result<bool>;
+pub struct TermIo;
 ```
 
-### `main.rs`
+`DetectedState::gather` extends its internal `TrackedKeys`/`resolve_effective` machinery
+(the project-vs-global-vs-compiled-default reader already used for `defaults.agent` and
+`container.enabled`) with a third tracked group:
 
 ```rust
-fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
-    // 2-3: ensure project + global config files exist (shared helper with cmd_init for the
-    //      project half; an equivalent trivial helper for the global skeleton).
-    // 4-5: onboarding::DetectedState::gather, then ask_agent / ask_container_enabled
-    //      (skipped/auto-answered under --yes; --agent always evaluated regardless of --yes);
-    //      any Some(value) returned is applied via update_project_agent /
-    //      update_global_container_enabled.
-    // 7:   doctor::run(...) + report.render(), matching cmd_doctor's exit-code rule.
-    // 8:   only when report.failures() == 0 && !yes && stdin is a TTY: prompt, then
-    //      call cmd_start(&slug, agent_flag, false, false, false) directly — no
-    //      duplicated worktree/tmux/container logic.
+#[derive(Debug, Default, serde::Deserialize)]
+struct TrackedTmux {
+    agent_pane: Option<config::PaneSide>,
+    split: Option<config::SplitDirection>,
+    split_percent: Option<u8>,
 }
 ```
 
-### `Cargo.toml`
+added to `TrackedKeys` alongside `defaults`/`container`, deserialized independently for the
+same reason those two already are: a malformed `[tmux]` table should not mask a well-formed
+`[container]` table in the same file, and vice versa.
 
-```toml
-[dependencies]
-toml_edit = "0.25"
+New functions, this document's two additions combined:
+
+```rust
+// Write-target line — shared by all three questions.
+enum WriteScope { Project, Global }
+impl WriteScope {
+    fn phrase(self) -> &'static str { /* "just this repo" | "every repo on this machine" */ }
+}
+fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String;
+
+// Pane layout.
+const LAYOUT_PRESETS: [(config::PaneSide, config::SplitDirection, u8); 4] = [
+    (config::PaneSide::Left, config::SplitDirection::Horizontal, 50),
+    (config::PaneSide::Right, config::SplitDirection::Horizontal, 50),
+    (config::PaneSide::Left, config::SplitDirection::Horizontal, 70),
+    (config::PaneSide::Left, config::SplitDirection::Vertical, 50),
+];
+
+/// Ask for a pane layout — the preset menu, falling through to `ask_layout_custom` on
+/// "customize…" — and return the chosen (agent_pane, split, split_percent) triple, or `None`
+/// if it exactly matches what's already effective (a cheap early exit; `update_global_tmux_
+/// layout` still diffs per-key on top of this for the case where only one of three changed).
+///
+/// Not asked at all when `detected.global_config_path` is `None` (same rule as
+/// `ask_container_enabled`) or when called under `--yes` (the caller skips it — see
+/// `cmd_setup`).
+pub fn ask_layout(
+    io: &mut dyn Io,
+    detected: &DetectedState,
+) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>>;
+
+/// The customize sub-flow: direction, then a direction-worded pane-side question, then
+/// percent, then a preview-and-confirm. `Ok(Some(triple))` on confirmation; `Ok(None)` when
+/// the preview is declined — the caller (`ask_layout`'s own loop) re-shows the preset menu in
+/// that case rather than this function recursing into it, so repeated declines cannot grow the
+/// call stack.
+fn ask_layout_custom(
+    io: &mut dyn Io,
+    detected: &DetectedState,
+) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>>;
+
+/// A small fixed-width ASCII diagram, `PREVIEW_WIDTH` characters wide, proportioned by
+/// `percent` and clamped so neither label is ever squeezed below its own length. Used both for
+/// the four preset previews and for the one customize preview, so there is exactly one
+/// rendering implementation to keep correct.
+fn render_layout(
+    agent_pane: &config::PaneSide,
+    split: &config::SplitDirection,
+    percent: u8,
+) -> Vec<String>;
+
+pub fn update_global_tmux_layout(
+    path: &Path,
+    agent_pane: config::PaneSide,
+    split: config::SplitDirection,
+    split_percent: u8,
+) -> Result<Vec<&'static str>>;
+```
+
+### `main.rs::cmd_setup` — insertion point
+
+The shipped function already asks the agent and container questions and writes their
+answers; this revision inserts the layout question between them and the devcontainer note.
+The agent/containers questions themselves are unchanged at the call site — the write-target
+line is printed from inside `ask_agent`/`ask_container_enabled`, not by `cmd_setup`:
+
+```rust
+let container_answer = if yes { None } else { onboarding::ask_container_enabled(&mut io, &detected)? };
+// ... existing agent/container write-back and confirmation printing ...
+
+// New:
+let layout_answer = if yes { None } else { onboarding::ask_layout(&mut io, &detected)? };
+if let Some((agent_pane, split, split_percent)) = layout_answer {
+    if let Some(path) = detected.global_config_path.as_deref() {
+        let written = onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
+        if !written.is_empty() {
+            println!("Set tmux.{} in {}", written.join(", tmux."), path.display());
+        }
+    }
+}
+
+// ... existing devcontainer note, doctor::run, next steps / first session unchanged ...
 ```
 
 ## Data model
 
-No changes to `config::Config` or `session::Session` — `am setup` only ever produces the
-same `.am/config.toml` / `~/.config/am/config.toml` shapes those types already parse, and
-reads existing files through `toml_edit::DocumentMut` purely to preserve formatting on write,
-not to replace `config::load_with_global`'s own parsing for actually running a session. The
-new types (`DetectedState`, `Effective<T>`, `Source`, `Answers`, `Io`) live entirely in
-`onboarding.rs` and don't persist anywhere; they exist only for the duration of one
-`am setup` invocation.
+Still no changes to `config::Config` or `session::Session` — every value `am setup` writes
+was already a valid, parseable field before this feature existed (`TmuxConfig`'s three
+fields, `ContainerConfig::enabled`, `defaults.agent`). The new types
+(`DetectedState`'s three added `Effective<...>` fields, `TrackedTmux`, `LAYOUT_PRESETS`,
+`WriteScope`) live entirely in `onboarding.rs` and exist only for the duration of one
+`am setup` invocation, the same as the agent/container tracking that already shipped.
 
 ## Testing strategy
 
-Two layers, matching how the project already separates concerns:
+**Unit tests in `onboarding.rs`**, extending the existing `ScriptedIo`-based suite:
 
-- **Unit tests in `onboarding.rs`**, against `ScriptedIo` and temp files:
-  - default-on-empty-input, re-prompt-on-invalid-input, EOF-aborts-cleanly
-  - `render_project_config_skeleton`/`render_global_config_skeleton` produce fully commented
-    output (nothing pre-activated)
-  - `update_project_agent`/`update_global_container_enabled` on a file **with comments and
-    non-default formatting** (hand-restructured tables, blank lines, trailing comments): the
-    changed key's value updates and everything else round-trips byte-for-byte
-  - calling either `update_*` function with a value equal to what's already there returns
-    `Ok(false)` and leaves the file's mtime and bytes untouched
-  - `DetectedState::effective_agent`/`effective_container_enabled` correctly label source as
-    `Project`/`Global`/`CompiledDefault` across the three precedence cases
-- **Cucumber integration tests** (`tests/features/setup.feature`), exercising only
-  `am setup --yes[, --agent <name>]` — the project's existing subprocess harness has no seam
-  for feeding interactive stdin, and this combination happens to cover both the no-op path
-  and the deterministic-change path without needing one:
-  - fresh repo, nothing configured → both config files written, doctor section (mocked
-    runtime/tmux) reports ready, exit 0
-  - fresh repo with an existing global config setting `agent = "claude"` → project file is
-    written but its `agent` line stays commented (inherited), matching UC2
-  - `am setup --yes` on an already-fully-configured, doctor-clean repo → neither config
-    file's mtime changes (asserted via the step definitions), exit 0
-  - `am setup --yes --agent claude` on a project file that already has `agent = "codex"` →
-    the file is rewritten to `claude`, and a snapshot assertion confirms surrounding comments
-    are unchanged
-  - `am setup --yes --agent codex` on a project file that already has `agent = "codex"` → no
-    rewrite (mtime unchanged) — exercises the no-op comparison end-to-end, not just at the
-    unit level
-  - no container runtime mocked in → doctor section fails, exit code is 1, "Next steps" is
-    NOT printed (verifies step 8 is unreachable on failure)
-  - `--agent unknown-agent` → fails immediately with the existing unknown-agent error, before
-    any file is written
-  - non-TTY without `--yes` → the cucumber harness already runs subprocesses with piped
-    stdin, so this is the default condition for every scenario above too; a dedicated
-    scenario asserts the specific "requires an interactive terminal" message when `--yes` is
-    omitted.
+- `write_target_line` produces the two pinned strings ("... — just this repo; saved to
+  .../config.toml." and "... — every repo on this machine; saved to .../config.toml.") for
+  each `WriteScope` — one test, reused in spirit by every question that calls it.
+- `ask_agent`'s captured output now includes the write-target line as its first line, and
+  `ask_container_enabled`'s likewise — **these are updates to already-shipped tests, not new
+  regressions**; anyone touching them should expect the diff and not "fix" it back.
+- preset selection by number (1-4) returns the corresponding fixed triple; "5" (or
+  "customize") enters the sub-flow
+- the sub-flow's pane-side question is worded "left/right" after choosing horizontal and
+  "top/bottom" after choosing vertical — this is the one behavior in this whole feature
+  that's actually a correctness bug if it's wrong, so it gets a test that asserts on the
+  literal prompt text, not just the resulting value
+- accepting the customize preview returns the chosen triple; declining it re-shows the
+  preset menu (assert the preset menu's text, including its write-target line, appears again
+  in captured output)
+- `render_layout` produces the expected diagram for each of the four fixed presets (pinned,
+  exact-string tests, since there's no algorithm to fuzz there) and degrades sensibly at an
+  extreme customize percentage (e.g. 95/5) without either label being squeezed to nothing
+- `ask_layout` returns `None` when the chosen preset/customize result exactly matches
+  `DetectedState`'s three effective values; returns `Some` otherwise
+- `update_global_tmux_layout` on a file that already has all three keys correct returns an
+  empty vec and does not touch the file's mtime; on a file that only disagrees on
+  `split_percent` writes only that key and returns `["split_percent"]`, leaving any existing
+  `agent_pane`/`split` lines (and their comments) untouched
+- EOF at any of the three customize sub-questions aborts the same way every other question
+  in the flow does
+- the project-override caveat note is printed when (and only when) one of the three
+  effective values' source is `Source::Project`
+
+**Cucumber integration tests** (`tests/features/setup.feature`):
+
+- any existing scenario that matches on `ask_agent`'s or `ask_container_enabled`'s prompt
+  text (if the harness asserts against interactive-mode output anywhere, or against captured
+  stdout for a scenario that happens to trigger a prompt before failing/aborting) needs its
+  expected text updated for the new leading line — **flagged explicitly so this is treated
+  as an intentional update alongside the feature, not a CI regression to chase separately**
+- `am setup --yes` on a repo with no `[tmux]` anywhere → the global config file (freshly
+  created or pre-existing) has no `[tmux]` keys added — locks in that layout is skipped, not
+  silently defaulted, under `--yes`
+- `am setup --yes` on a repo whose global config already sets a non-default layout → that
+  file's mtime and bytes are unchanged (nothing about `--yes` should ever touch layout)
+
+No new interactive cucumber coverage is added for the preset/customize prompts themselves —
+same limitation as the existing agent/containers questions: the subprocess harness has no
+seam for interactive stdin, so that logic is unit-tested only, per the bullets above.
 
 ## Task breakdown
 
-1. **backend-engineer** — `src/cli.rs`: add `Commands::Setup { yes, agent }` with clap tests
-   matching the existing `Start`/`Session` patterns.
-2. **backend-engineer** — refactor: extract the body of `cmd_init` (directory + gitignore
-   handling) into a helper function callable from both `cmd_init` and `cmd_setup`, with
-   existing `init.feature` scenarios re-run unchanged to confirm no behavior shift.
-3. **backend-engineer** — `Cargo.toml`: add `toml_edit = "0.25"`; confirm `cargo build` and
-   `cargo tree` show no MSRV or duplicate-TOML-stack surprise beyond what's noted above.
-4. **backend-engineer** — `src/onboarding.rs`: `Effective<T>`/`Source`, `DetectedState::
-   gather` (including the project/global/compiled-default precedence resolution for both
-   tracked keys), `Io`/`TermIo`/`ScriptedIo`, `ask_agent`, `ask_container_enabled`,
-   `render_project_config_skeleton`, `render_global_config_skeleton`,
-   `update_project_agent`, `update_global_container_enabled` (`toml_edit`-based), plus the
-   unit tests described above.
-5. **backend-engineer** — `main.rs::cmd_setup`: wire detection → prompts → the two `update_*`
-   calls → `doctor::run` → optional `cmd_start` call; TTY detection via
-   `std::io::IsTerminal`; exit code matches doctor's.
-6. **integration-tester** — `tests/features/setup.feature` per the scenarios above,
-   including a mtime-unchanged assertion helper if the existing step definitions don't
-   already have one.
-7. **code-reviewer** — standard review pass once 1-6 are green; particular attention to:
-   the no-secrets-written rule (credentials are only ever probed for presence, never
-   displayed or written into a config file); the exit-code contract for `--yes`; and
-   `toml_edit` correctness on documents with tables in non-default order or with unrelated
-   custom keys — this is exactly the class of file the update path exists to handle safely.
-8. **documentation-writer** — `docs/reference/commands.md`: new `## am setup` section
-   matching the existing per-command format (Usage / What it does / example output);
-   `README.md` quick-start: mention `am setup` as the guided alternative to `am init` for
-   first-time users; `BACKLOG.md`: add a tracked entry linking this spec.
+Already shipped (the original agent/containers pass) is not repeated here. New work:
+
+1. **backend-engineer** — `onboarding.rs`: `WriteScope`, `write_target_line`, and wiring it
+   into `ask_agent` and `ask_container_enabled` as their first printed line. **This changes
+   already-shipped prompt output** — update the existing unit tests that capture and assert
+   on those two functions' output rather than treating the diff as a break.
+2. **backend-engineer** — `onboarding.rs`: extend `TrackedKeys`/`resolve_effective` with
+   `TrackedTmux` and the three new `DetectedState` fields, mirroring the existing
+   `defaults`/`container` handling exactly.
+3. **backend-engineer** — `onboarding.rs`: `LAYOUT_PRESETS`, `render_layout`, `ask_layout`
+   (using `write_target_line` for its own header), `ask_layout_custom`,
+   `update_global_tmux_layout`, plus the unit tests above.
+4. **backend-engineer** — `main.rs::cmd_setup`: insert the layout question and its write-back
+   between the containers question and the devcontainer note, per the insertion point above.
+5. **integration-tester** — audit `tests/features/setup.feature` for any assertion against
+   `ask_agent`/`ask_container_enabled` prompt text that the new leading line would break, and
+   update it as part of this change (not as a separate bug); add the two new layout-under-
+   `--yes` scenarios above.
+6. **code-reviewer** — in addition to the existing review focus (no-secrets, exit codes,
+   `toml_edit` correctness): confirm the write-target line reads identically across all three
+   questions (same helper, not three hand-written near-duplicates); confirm the
+   direction-first customize ordering never produces a "left/right" prompt after a vertical
+   choice or a "top/bottom" prompt after a horizontal one; confirm
+   `update_global_tmux_layout`'s per-key diffing genuinely avoids touching keys that didn't
+   change.
+7. **documentation-writer** — `docs/reference/commands.md`: update the `am setup` section's
+   example flow to show the new question and the write-target line on all three prompts;
+   note in the write-target summary table which file each question saves to.
 
 ## Edge cases & considerations
 
-- **Security — no secret ever transits a prompt or a config file.** `am setup` only ever
-  probes for the *presence* of credentials (file exists / env var set), the same booleans
-  `validate_agent_credentials` already produces for `am doctor`. It never asks a user to
-  paste a token and never writes one into `.am/config.toml` (which is meant to be committed)
-  or `~/.config/am/config.toml`. If `OPENAI_API_KEY` isn't set for `codex`, the output is a
-  hint to `export` it, identical in spirit to what `am doctor` already prints.
-- **Race conditions:** none introduced. Greenfield writes are a single complete
-  `std::fs::write`; existing-file updates via `toml_edit` read-modify-write the whole file
-  in one pass, same single-writer assumption every other `am` config write already makes (no
-  concurrent-writer protection exists anywhere in the codebase today, and `am setup` doesn't
-  need to be the first place that adds it).
-- **Cosmetic wrinkle in the update path, narrowed during implementation:** the greenfield case
-  (no project file yet, and `am setup` already knows the agent from `--agent` or `--yes`'s
-  default) no longer produces a duplicate — `render_project_config_skeleton_with_agent`
-  renders the `defaults.agent` line active from creation instead of inserting it next to its
-  own commented example (`am init`'s own output is unchanged: still fully commented). The
-  wrinkle can still occur on the update path proper — `update_project_agent` inserting into a
-  project file that predates this run and still carries the commented example — and that case
-  is accepted for the same reason as before: the alternative is detecting and rewriting the
-  specific commented example line, which is exactly the class of fragile line-matching adopting
-  `toml_edit` was meant to avoid. It doesn't affect correctness (TOML comments have no semantic
-  weight), only tidiness.
-- **Devcontainer `initializeCommand` gate:** explicitly never auto-enabled by the wizard
-  (see step 6) — this is the one place a guided default would be actively unsafe, so it's a
-  hard no rather than a "maybe ask" question.
-- **Stale `container.enabled = false` after a runtime becomes available:** if a previous
-  `am setup` run disabled containers (no runtime was found at the time) and a runtime is
-  later installed, `am setup` does not proactively re-offer re-enabling it on a subsequent
-  run, because the containers question's trigger ("no runtime found") no longer holds. This
-  is an explicit, narrow scope boundary, not an oversight: `container.enabled = false` is a
-  valid deliberate state, `am doctor` reports it as a warning (not a failure) either way, and
-  the user can flip it by hand or via `am setup --yes` is not the mechanism for that (it only
-  writes what a question resolves to, and this question won't be asked). Worth a one-line
-  mention in the "Next steps" summary is out of scope for v1.
-- **First-session step and image builds:** if the repo resolves to devcontainer mode and no
-  image is built yet, accepting step 8 can take minutes (the same build `am start` would
-  trigger). The prompt text should say so ("this may take a few minutes to build the
-  environment") rather than let the wizard appear to hang.
-- **Idempotency:** running `am setup` twice in a row is safe and, past the first run,
-  effectively silent when nothing has changed on the host or in the files — it degrades to
-  "verify and report" precisely because every write is now genuinely a no-op when the
-  effective value is unchanged, not because the second run takes a different code path.
+Carried over, still accurate: no secret ever transits a prompt or a config file; no
+write-time race condition beyond the single-writer assumption already made everywhere else in
+`am`; the `initializeCommand` gate is never auto-enabled by the wizard.
+
+- **A project-level `tmux.*` override makes a global-config write for that repo
+  not-immediately-visible.** Handled with the one-line caveat note described above — an
+  explicit, cheap mitigation for an edge case that's expected to be rare (layout is framed
+  throughout this spec as a global-only preference, so a project overriding it is already an
+  unusual, deliberate act by definition).
+- **Extreme customize percentages (e.g. 95/5) in the preview.** `render_layout`'s width
+  clamp keeps both labels legible; this is a cosmetic best-effort, not a hard requirement —
+  `am` already accepts and correctly applies any value in `tmux.split_percent`'s existing
+  1-99 range regardless of how its preview renders.
+- **Re-running `am setup` after picking "customize" once does not "remember" that the user
+  came from customize** — the next run's default is simply whatever the three effective
+  values now are, shown via the normal preset-menu "currently:" line (which may not match any
+  of the four fixed presets, in which case none of [1]-[4] is visually marked as current
+  beyond that line — no preset is falsely highlighted as selected when the saved layout is a
+  genuine custom combination).
+- **The write-target line is static per question, not per invocation.** It always says "just
+  this repo" for agent and "every repo on this machine" for containers/layout, regardless of
+  whether a global or project file happens to exist yet at the moment the question is asked
+  (steps 2-3 guarantee both files exist by the time any question runs, so this is never
+  actually ambiguous in practice — noted here only because the line's wording is fixed at
+  compile time, not computed from `DetectedState`, and that's deliberate: the *scope* of a
+  question never changes at runtime, only its default value does).
 
 ## Resolved Decisions
 
-All seven items originally raised as Open Questions have been decided with the user. Recorded
-here so they aren't re-litigated during implementation.
+All decisions from the original Open Questions pass, plus both follow-up revisions.
 
-1. **Command name: `am setup`.** Accepted as recommended.
-2. **Prompt crate vs. hand-rolled: hand-rolled**, behind the `Io` trait, extending the
-   existing `print!`/`read_line` pattern (`am destroy`/`am session rm`). Accepted, but the
-   original justification leaned on the project's Rust-version floor, which turned out to be
-   1.88 (via `home`/`clap_builder`/`sha2`/`toml_parser`), not the 1.70 the docs claim
-   (`docs/reference/building.md` is stale — tracked separately in BACKLOG.md, not part of
-   this feature). Both `dialoguer` and `inquire` would have been fine on MSRV grounds, so
-   that reasoning is dropped. The decision stands on two arguments that don't depend on it:
-   (a) `dialoguer`-style crates read the TTY directly, which fights the `Io`/`ScriptedIo`
-   seam the unit tests above depend on — this is the load-bearing reason; (b) dependency
-   surface (8-36 additional crates) against a release profile tuned hard for size
-   (`opt-level = "z"`, LTO, strip).
-3. **Relationship to `am init`: separate command.** Accepted as recommended — `am setup`
-   calls `init`'s extracted logic as step one; `am init` itself is unchanged.
-4. **Global config scope: narrow — `defaults.agent` and `container.enabled` only.**
-   Accepted, with one precision fix along the way: the original write-up called the second
-   item "container runtime," which could be misread as picking between podman and docker.
-   `RuntimePreference::Auto` already resolves that correctly without asking (podman first,
-   then docker); the actual question is whether a usable runtime exists *at all*, and the
-   key it resolves is `container.enabled`, not `container.runtime`. This is a wording/
-   precision correction, not a scope change — the underlying "only when auto-detection is
-   ambiguous" trigger is exactly what was agreed.
-5. **Existing-config behaviour: show current values, offer to change them — OVERRIDE of the
-   original "never touch existing files" recommendation.** This is the substantial revision
-   in this pass: the agent question is now always asked (not skipped once a project config
-   exists), its default is the effective current value with its source shown, accepting the
-   default writes nothing, and a real change is written via a format-preserving `toml_edit`
-   update rather than a from-scratch overwrite. UC2 and UC3 both changed shape accordingly
-   (see above). No objection to raise here — the override addresses a real gap in the
-   original design (UC2, "adding `am` to a new repo," is exactly the case where "never touch
-   an existing file" made `am setup` a near-alias for `am doctor`). The one tradeoff worth
-   flagging is already called out under Edge Cases (a cosmetic comment-duplication wrinkle
-   on first edit) — it's a known, accepted cost of the format-preserving approach, not a
-   reason to reconsider it.
-6. **Declining the first-session prompt still exits 0.** Accepted as recommended.
-7. **`--yes` does not start a session unattended.** Accepted as recommended — `am setup
-   --yes` remains a pure bootstrap-and-verify (and, with `--agent`, deterministic-change)
-   step, never one that also creates a worktree/branch/container unasked.
+1. **Command name: `am setup`.**
+2. **Prompt crate vs. hand-rolled: hand-rolled**, behind the `Io` trait — chosen for
+   testability against the `Io`/`ScriptedIo` seam, not for MSRV reasons (`am`'s actual floor
+   is 1.88, not the 1.70 the docs claim; that doc staleness is tracked separately in
+   BACKLOG.md).
+3. **Relationship to `am init`: separate command**, calling `init`'s extracted logic
+   (`init_project`) as its first step.
+4. **Global config scope: narrow.** Originally `defaults.agent` (project) and
+   `container.enabled` (global) only. The layout revision adds the three `tmux.*` keys (also
+   global) as the third and last thing in scope. The line is still drawn deliberately: no
+   network mode, container user, devcontainer settings, or `agents.<name>.image` — those
+   remain hand-edit-only, because "layout is undetectable preference" is the specific
+   justification for that addition and does not generalize to "more questions are better."
+5. **Existing-config behaviour: show current values, offer to change them**, via a
+   format-preserving `toml_edit` update rather than a from-scratch overwrite. The layout
+   question follows the identical pattern: current effective value shown with source,
+   accepting it is a no-op, a change is written with per-key granularity.
+6. **Declining the first-session prompt still exits 0.**
+7. **`--yes` does not start a session unattended.**
+8. **Pane layout question — added in a follow-up revision, resolved with the user as
+   follows:**
+   1. **A single preset picker (4 presets + customize), not three granular questions
+      up front.** Keeps the question short in the common case; granular control is one menu
+      choice away, not the default path.
+   2. **Written to the global config**, all three keys (`tmux.agent_pane`, `tmux.split`,
+      `tmux.split_percent`) — layout is a personal habit, not a repo trait, so it belongs
+      where the agent's own answer explicitly does *not* go.
+   3. **The prompt states its write target** (superseded by decision #9 below, which
+      generalized this to all three questions via the shared `write_target_line` helper
+      rather than a layout-specific sentence).
+   4. **Always asked (gated only on there being a global file to write to) — but unlike the
+      agent question, never given a proactive best-guess write under `--yes`.** This
+      asymmetry is deliberate: an unanswered agent is a functional gap (`am doctor` and
+      `--auto` both care), an unanswered layout or `container.enabled` is not — both already
+      fall back to a working compiled default with no consequence, so `--yes` treats them the
+      same way (skip, no write) rather than treating layout like agent.
+   5. **Customize asks direction before pane side**, wording the pane question as
+      left/right for a horizontal split and top/bottom for a vertical one — the only ordering
+      that produces a correctly worded question, since the pane question's wording is a
+      function of the direction already chosen. The underlying config keys stay `left`/`right`
+      regardless of which words the prompt uses; this is presentation only, not a schema
+      change.
+   6. **The "stacked" preset puts the agent on top**, matching `PaneSide::Left`'s existing
+      role as `am`'s compiled default "first" side — agent-on-bottom remains reachable via
+      customize rather than earning a fifth preset.
+   7. **No new CLI flag for layout** (no `--layout`, no per-preset shortcut). Unlike
+      `--agent`, there's no scripted-CI use case this addition is trying to serve — layout is
+      squarely an interactive-only, one-time-per-machine preference, and `--yes` already
+      handles the non-interactive path correctly by skipping it. Revisit only if a real
+      request for a scriptable layout override shows up.
+9. **Write-target legibility applies to all three questions uniformly — approved as a
+   follow-up to #8.3.** Originally raised only for the layout question (the newest, and the
+   one most obviously missing this), then generalized on the user's instruction to the agent
+   and containers questions too, so the rule is "every question says where its answer will be
+   saved," not a special case carved out for whichever question happened to be added most
+   recently. Implemented as one shared `write_target_line` helper rather than three
+   hand-written lines, specifically so the wording can't drift between them as the flow
+   evolves further. The agent question's wording was called out as the one that needs care:
+   it's the only question where the *displayed default's source* and the *write target* can
+   differ (default from global, write always to project), so its prompt has to make both
+   facts legible rather than leaning on the write-target line alone. This changes
+   already-shipped output for `ask_agent` and `ask_container_enabled` — flagged explicitly in
+   [Task breakdown](#task-breakdown) so the resulting test churn is understood as intentional.

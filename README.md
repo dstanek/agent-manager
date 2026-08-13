@@ -35,7 +35,7 @@ a container image with your agent installed, and optionally tmux for split-pane 
 New to `am`? Run the guided setup — it walks you through the questions it can't answer on its own, then verifies the result:
 
 ```sh
-am setup                             # guided: init + a couple of questions + a readiness check
+am setup                             # guided: init + a few questions + a readiness check
 am start feat --agent claude         # new branch, tmux window, container, launches Claude Code
 ```
 

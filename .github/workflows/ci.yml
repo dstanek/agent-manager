@@ -33,6 +33,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # A real run finishes in a couple of minutes; this cap exists only so a hung test (e.g. a
+    # pty-driven cucumber scenario whose child never gets EOF) fails fast with a clear GitHub
+    # Actions timeout instead of silently eating the 360-minute default. The test harness has
+    # its own inner timeout too (see `wait_with_output_timeout` in tests/cucumber.rs) — this is
+    # the second line of defence, not the only one.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 

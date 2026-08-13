@@ -34,7 +34,7 @@ Feature: am setup — guided setup
     And the file ".am/config.toml" contains "# custom note above container"
     And the file ".am/config.toml" contains "# defaults section, deliberately placed below container"
     And the file ".am/config.toml" contains "# picked for the OPENAI project"
-    And the file ".am/config.toml" does not contain "agent = \"codex\""
+    And the file ".am/config.toml" does not contain 'agent = "codex"'
 
   Scenario: --yes on an already-configured, doctor-clean repo is a true no-op
     Given a project config containing "[defaults]\nagent = \"claude\"\n"
@@ -119,3 +119,26 @@ Feature: am setup — guided setup
     Then the command fails
     And the output contains "runs on your host"
     And the output contains "allow_host_commands"
+
+  # --yes and pane layout: the deliberate asymmetry with the agent question — see
+  # "Non-interactive / non-TTY behaviour" in specs/guided-setup.md. The interactive layout
+  # menu itself (presets, customize, write-target lines) is covered by setup_interactive.feature.
+
+  Scenario: --yes never asks about pane layout, so nothing is written to a fresh global config
+    Given claude credentials are present
+    And I am using a mock container runtime
+    When I run "am setup --yes --agent claude"
+    Then the command succeeds
+    And the global config does not set "tmux.agent_pane"
+    And the global config does not set "tmux.split"
+    And the global config does not set "tmux.split_percent"
+    And the output does not contain "Pane layout"
+
+  Scenario: --yes leaves an already-configured pane layout completely untouched
+    Given a global config containing "[tmux]\nagent_pane = \"right\"\nsplit = \"vertical\"\nsplit_percent = 30\n"
+    And claude credentials are present
+    And I am using a mock container runtime
+    And I record the state of the global config file
+    When I run "am setup --yes --agent claude"
+    Then the command succeeds
+    And the global config file is unchanged
