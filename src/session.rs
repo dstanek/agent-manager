@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use crate::color;
 use crate::config;
 use crate::error::AmError;
 
@@ -257,7 +258,8 @@ pub fn migrate_sessions(repo_root: &Path) -> Result<usize> {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
-                "warning: could not read .am/sessions.json for migration: {e} — leaving file in place"
+                "{} could not read .am/sessions.json for migration: {e} — leaving file in place",
+                color::warning_prefix(color::enabled(color::Stream::Stderr))
             );
             return Ok(0);
         }
@@ -267,7 +269,8 @@ pub fn migrate_sessions(repo_root: &Path) -> Result<usize> {
         Ok(f) => f,
         Err(e) => {
             eprintln!(
-                "warning: could not parse .am/sessions.json for migration: {e} — leaving file in place"
+                "{} could not parse .am/sessions.json for migration: {e} — leaving file in place",
+                color::warning_prefix(color::enabled(color::Stream::Stderr))
             );
             return Ok(0);
         }

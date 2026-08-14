@@ -1462,11 +1462,7 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
         {
             eprintln!(
                 "{} the worktree has uncommitted changes that will be lost.",
-                color::paint(
-                    "warning:",
-                    color::Color::Red,
-                    color::enabled(color::Stream::Stderr)
-                )
+                warning_prefix_severe()
             );
         }
         print!("{}", msgs.destroy_confirm(slug));
@@ -1735,32 +1731,29 @@ fn load_config(repo_root: &Path) -> anyhow::Result<config::Config> {
     Ok(cfg)
 }
 
-/// The `error:` prefix, red on a terminal. Color goes on the label alone, never the
-/// message: the words have to survive being piped into a log.
+/// The `error:` prefix, on stderr — this crate's `error:`/`warning:` convention is to report
+/// on the stream the failure itself belongs to. Wording and colour live in [`color`]; this
+/// just pins the stream so the ~20 call sites in this file stay a bare `error_prefix()`.
 fn error_prefix() -> String {
-    color::paint(
-        "error:",
-        color::Color::Red,
-        color::enabled(color::Stream::Stderr),
-    )
+    color::error_prefix(color::enabled(color::Stream::Stderr))
 }
 
-/// The `warning:` prefix, yellow on a terminal.
+/// The `warning:` prefix, on stderr (see [`error_prefix`]).
 fn warning_prefix() -> String {
-    color::paint(
-        "warning:",
-        color::Color::Yellow,
-        color::enabled(color::Stream::Stderr),
-    )
+    color::warning_prefix(color::enabled(color::Stream::Stderr))
 }
 
-/// The `Note:` prefix, yellow on a terminal. Goes to stdout, unlike the other two.
+/// The `Note:` prefix, on stdout, unlike the other two — a note is informational output, not
+/// a failure report.
 fn note_prefix() -> String {
-    color::paint(
-        "Note:",
-        color::Color::Yellow,
-        color::enabled(color::Stream::Stdout),
-    )
+    color::note_prefix(color::enabled(color::Stream::Stdout))
+}
+
+/// The `warning:` prefix, red instead of yellow, on stderr — see
+/// [`color::warning_prefix_severe`] for why `am destroy`'s uncommitted-changes warning is the
+/// one case that breaks this crate's yellow-warning/red-error rule.
+fn warning_prefix_severe() -> String {
+    color::warning_prefix_severe(color::enabled(color::Stream::Stderr))
 }
 
 fn read_git_config(key: &str) -> Option<String> {

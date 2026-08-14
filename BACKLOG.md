@@ -252,6 +252,37 @@ Commands currently emit tmux-specific language (e.g. "kill tmux window") even wh
 - Audit all `println!`, `eprintln!`, and confirmation prompts in command handlers
 - Tests: `am destroy <slug> --force` outside tmux does not mention "window" or "pane"; inside tmux it does
 
+### Severity-prefix call sites with no message-content test
+
+`color.rs`'s `error_prefix`/`warning_prefix`/`note_prefix` moved out of hand-rolled per-site
+`eprintln!` calls and into one shared, unit-tested home. Most call sites picked up test
+coverage for free because they already had a test asserting the printed message — but seven
+did not, and still don't:
+
+- [`container.rs:934`](src/container.rs) — `warning_prefix`
+- [`devcontainer.rs:1005,1011,1017`](src/devcontainer.rs) — `note_prefix`, three sites sharing
+  one `let note = …` binding
+- [`worktree.rs:242`](src/worktree.rs) — `warning_prefix`
+- [`session.rs:262,273`](src/session.rs) — `warning_prefix`, two sites
+
+Each is a bare `eprintln!` with no test seam: nothing captures stderr for these code paths, so
+there's no assertion to have carried the prefix call over during the move. `color.rs`'s own
+unit tests cover the three prefix functions in isolation (uncolored and colored forms), and
+that coverage is real — but it proves the functions behave correctly, not that any particular
+call site still calls them. A change that dropped or misspelled the prefix at any of these
+seven would compile, pass every existing test, and only be caught by someone reading the
+diff.
+
+- [ ] Give these sites a stderr-capture seam — most other `eprintln!`-based messages in the
+      codebase go through a mockable stream or a test double already; extend whichever pattern
+      is closest rather than inventing a new one
+- [ ] Once captured, assert the exact prefixed line (not a substring of the message) at each
+      of the seven sites, the way [`onboarding.rs`](src/onboarding.rs)'s `ask_layout` caveat
+      test does
+- [ ] Cover both the `color = true` and `color = false` paths — several of these sites, like
+      that same `ask_layout` caveat before it was fixed, may only ever be exercised uncolored
+      today
+
 ---
 
 ## Architecture Audit Follow-ups
