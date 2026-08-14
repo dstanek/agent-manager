@@ -330,12 +330,22 @@ impl AmWorld {
     }
 
     /// Run the `am` binary with `args`, capturing stdout + stderr.
+    ///
+    /// `NO_COLOR=1` is set on the child unconditionally, same reason and same fix as
+    /// `run_am_pty`'s own doc comment: `color::enabled` honours a developer's ambient
+    /// `CLICOLOR_FORCE=1` even though stdout here is a pipe, not a terminal, so without this
+    /// a `contains` assertion on a prefixed line (`"Note: ..."`) would pass in a plain
+    /// environment and fail — silently, only for that one developer — the moment they set
+    /// `CLICOLOR_FORCE`. A scenario that genuinely needs to assert colored output can still
+    /// override this afterwards via `extra_env` (applied last, below), which is the opt-in
+    /// this is meant to force.
     fn run_am(&mut self, args: &[&str]) {
         let dir = self.project_path().to_path_buf();
         let mut cmd = Command::new(AM_BIN);
         cmd.args(args)
             .current_dir(&dir)
-            .env("XDG_STATE_HOME", self.state_dir.path());
+            .env("XDG_STATE_HOME", self.state_dir.path())
+            .env("NO_COLOR", "1");
 
         // Isolate HOME (and clear any inherited XDG_CONFIG_HOME) so a scenario that writes
         // ~/.config/am/config.toml — namely `am setup` — never touches the real one.
@@ -412,6 +422,14 @@ impl AmWorld {
     /// line until it sees a newline (or an explicit EOF character), so a redirected file or
     /// pipe that runs out of bytes without one leaves the child blocked forever rather than
     /// reading a short line at EOF the way a plain pipe would.
+    ///
+    /// `NO_COLOR=1` is set on the child unconditionally. Unlike `run_am`/`run_am_with_input`,
+    /// stdout here really is a terminal (that's the whole point of the pty), so
+    /// `color::enabled` would otherwise return `true` and every dim line `am setup` prints
+    /// would carry ANSI escapes into the captured output — invisible to a human reading a
+    /// terminal, but a landmine for a `contains`/`does not contain` assertion that expects
+    /// plain text. The colored path is covered separately, by unit tests in `onboarding.rs`
+    /// and `main.rs` that pass `color: true` directly against the `Io` seam.
     fn run_am_pty(&mut self, args: &[&str], input: &str) {
         let dir = self.project_path().to_path_buf();
         // `script -c` runs its command through `sh -c`, so each arg needs shell quoting —
@@ -429,7 +447,8 @@ impl AmWorld {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("XDG_STATE_HOME", self.state_dir.path());
+            .env("XDG_STATE_HOME", self.state_dir.path())
+            .env("NO_COLOR", "1");
 
         if let Some(ref home) = self.isolated_home {
             cmd.env("HOME", home.path()).env_remove("XDG_CONFIG_HOME");
@@ -476,6 +495,9 @@ impl AmWorld {
     }
 
     /// Like `run_am` but writes `input` to the process's stdin before waiting.
+    ///
+    /// `NO_COLOR=1` is set on the child unconditionally — see `run_am`'s own doc comment for
+    /// why.
     fn run_am_with_input(&mut self, args: &[&str], input: &str) {
         let dir = self.project_path().to_path_buf();
         let mut cmd = Command::new(AM_BIN);
@@ -485,7 +507,8 @@ impl AmWorld {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("XDG_STATE_HOME", self.state_dir.path())
-            .env("AM_CONTAINER_ENABLED", "false");
+            .env("AM_CONTAINER_ENABLED", "false")
+            .env("NO_COLOR", "1");
 
         if let Some(ref home) = self.isolated_home {
             cmd.env("HOME", home.path()).env_remove("XDG_CONFIG_HOME");
@@ -795,6 +818,21 @@ async fn then_output_not_contains(world: &mut AmWorld, text: String) {
     assert!(
         !combined.contains(&text),
         "expected output to NOT contain {text:?}\ngot:\n{combined}",
+    );
+}
+
+/// `{string}` never unescapes its capture (see `given_project_config`'s and `when_run_pty`'s
+/// own manual `.replace("\\n", ...)` calls above) — a literal `\x1b` in a `.feature` file would
+/// be matched as those four characters, not the ESC control byte, so a step written that way
+/// would be silently vacuous against real ANSI output. This checks for the real byte directly,
+/// the only reliable way to assert `run_am_pty`'s `NO_COLOR=1` (see its own doc comment) is
+/// doing its job: the dim lines `am setup` prints render as plain text, not `\x1b[2m...\x1b[0m`.
+#[then("the output contains no color escape codes")]
+async fn then_output_has_no_color(world: &mut AmWorld) {
+    let combined = world.combined_output();
+    assert!(
+        !combined.contains('\u{1b}'),
+        "expected no ANSI escape bytes under NO_COLOR=1:\n{combined}",
     );
 }
 

@@ -25,6 +25,7 @@ make build-copilot       # Build Copilot Docker image
 - Tests mutating env vars use a mutex to serialize execution
 - The `cucumber` crate's `{string}` capture does not unescape `\"`, so a step written as `does not contain "agent = \"codex\""` compares against text containing literal backslashes and is always true — a silently vacuous assertion. Use single-quoted Gherkin strings when the expected text itself contains double quotes: `does not contain 'agent = "codex"'`.
 - The pty-based interactive test harness (`run_am_pty` in `tests/cucumber.rs`) gives `am` a real pty via `script`; a scripted input line missing its trailing `\n` leaves the child blocked forever in canonical-mode `read()` rather than failing fast.
+- `run_am`/`run_am_with_input`/`run_am_pty` all set `NO_COLOR=1` on the child unconditionally, since `color::enabled` honours a developer's ambient `CLICOLOR_FORCE=1` even for a piped stdout. Without it, a `contains`/`does not contain` assertion on a severity-prefixed line (e.g. `Note: ...`) passes in a plain environment but fails the moment a developer has `CLICOLOR_FORCE=1` set — CI stays green, so it looks like *their* change broke something.
 
 **After every code change:** run `cargo test` and `cargo clippy --all-targets -- -D warnings`. Fix any failures before proceeding. `--all-targets` matters — without it clippy skips test code, which is what CI lints.
 

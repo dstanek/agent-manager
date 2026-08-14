@@ -69,14 +69,164 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
 fn cmd_init() -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
-    init_project(&repo_root, None)?;
-    println!("am initialized. Run 'am start <slug>' to create your first session.");
+    let report = init_project(&repo_root, None)?;
+    print!("{}", render_init_report(&report));
     Ok(())
 }
 
-/// Create `.am/` and the `.gitignore` entry, reporting what it did.
+/// Renders `am init`'s full report: a headline stating the outcome, then the detail that
+/// backs it up, in the same headline-plus-detail shape `am start` and `am setup` already use.
+/// Returns the text rather than printing it, same reason as every other renderer in this
+/// section (`print_init_line_plain` and friends) — the caller prints.
 ///
-/// Shared with `am setup`, whose first action is exactly this. Extracted so the two front
+/// The headline is decided by whether anything actually changed (an `InitLine::Status` with
+/// `changed: true` — a "Created ..." line — appears anywhere in the report), not by whether
+/// the report is non-empty: `init_project` always reports on both files, so a re-run with
+/// nothing to do still produces two `Status` lines, just none of them `changed`.
+///
+/// - Nothing changed: the detail would only repeat what "already initialized" already says,
+///   so it is dropped entirely, and the next step is folded onto its own indented line right
+///   under the headline — matches the two-line shape approved for this case.
+/// - Something changed, even alongside something that was already fine (the mixed case):
+///   every `Status` line is printed so the detail makes clear which parts were newly created
+///   and which were already in place, followed by a blank line and the next step, flush left.
+///
+/// Either way, an `Advisory` line — worth reading on its own — is never folded into the
+/// dropped-or-indented `Status` treatment: it keeps its own `Note:` severity and is shown
+/// whenever it applies, exactly as it always has. It is, however, indented into the same
+/// detail block as the `Status` lines (structure vs. content is what decides color and
+/// dimming, per `color.rs`'s own module doc — indentation is a different axis, and an
+/// unindented "Note:" breaking out to column 0 mid-list reads as a rendering bug, not a
+/// deliberate call-out). And rather than interleaving it at the point `init_project`
+/// happened to discover it (between the config-file and `.gitignore` checks), it is grouped
+/// after every `Status` line: a "Note:" popping up mid-list still visually splits the list
+/// even when indented, where one placed after the whole block reads as a single call-out
+/// attached to the list rather than an interruption of it.
+fn render_init_report(report: &[InitLine]) -> String {
+    let changed = report
+        .iter()
+        .any(|line| matches!(line, InitLine::Status { changed: true, .. }));
+
+    let mut out = String::new();
+    if changed {
+        out.push_str("Initialized am in this repo.\n");
+        for line in report {
+            if matches!(line, InitLine::Status { .. }) {
+                out.push_str(&format!("  {}\n", print_init_line_plain(line)));
+            }
+        }
+        for line in report {
+            if matches!(line, InitLine::Advisory(_)) {
+                out.push_str(&format!("  {}\n", print_init_line_plain(line)));
+            }
+        }
+        out.push_str("\nRun 'am start <slug>' to create your first session.\n");
+    } else {
+        out.push_str("am is already initialized in this repo.\n");
+        for line in report {
+            if matches!(line, InitLine::Advisory(_)) {
+                out.push_str(&format!("  {}\n", print_init_line_plain(line)));
+            }
+        }
+        out.push_str("  Run 'am start <slug>' to create your first session.\n");
+    }
+    out
+}
+
+/// One line of `init_project`'s status report, typed rather than pre-formatted so each caller
+/// can style it its own way — see [`print_init_line_plain`] and [`print_init_line_dim`].
+enum InitLine {
+    /// A plain status update ("Created ..." / "... already exists, skipping"): structure, not
+    /// content, so `am setup` dims it. `changed` is `true` only for a line reporting an action
+    /// actually taken this run ("Created ..." / "Added ..."), never for an "already exists" /
+    /// "already in .gitignore" skip — [`print_init_report`] uses it to decide `am init`'s
+    /// headline and whether the skip lines are worth repeating underneath it.
+    Status { text: String, changed: bool },
+    /// The legacy `.am/`-in-`.gitignore` advisory. Always shown at its own "Note:" severity,
+    /// in both callers — worth reading, not structure, so it's never dimmed. It is still
+    /// indented into the same detail block as the `Status` lines around it (indentation is
+    /// structure, independent of the severity color that stays its own) — see
+    /// [`render_init_report`]'s doc comment for why, and why it's grouped after them too.
+    Advisory(String),
+}
+
+/// `am init`'s own rendering: plain, flush left, byte-for-byte what it printed before this
+/// line was extracted into a report instead of printed directly (aside from the indent, which
+/// callers add themselves — see [`render_init_report`] — so a `Status` line and an `Advisory`
+/// line can share one indentation rule without this function needing to know which one it has
+/// been handed). Returns the line rather than printing it, matching every other renderer in
+/// this section (`created_global_config_line` and friends) — the caller prints.
+fn print_init_line_plain(line: &InitLine) -> String {
+    match line {
+        InitLine::Status { text, .. } => text.clone(),
+        InitLine::Advisory(text) => format!("{} {text}", note_prefix()),
+    }
+}
+
+/// `am setup`'s rendering: the structural status lines indented and dim, the advisory
+/// indented the same two spaces but left at its own "Note:" severity — nesting a second color
+/// inside an already-colored line is what this split avoids, rather than something a single
+/// dim-or-not flag has to reason about. Unlike [`print_init_line_plain`], the indent is baked
+/// in here rather than left to the caller, matching how `Status`'s indent already comes from
+/// [`onboarding::dim_line`] rather than from `cmd_setup`. Returns the line rather than
+/// printing it, same reason as [`print_init_line_plain`].
+fn print_init_line_dim(line: &InitLine, color: bool) -> String {
+    match line {
+        InitLine::Status { text, .. } => onboarding::dim_line(text, color),
+        InitLine::Advisory(text) => format!("  {} {text}", note_prefix()),
+    }
+}
+
+// ── `am setup`'s status and confirmation lines ──────────────────────────────────
+//
+// Each of these prints a path `cmd_setup` also renders, shortened, on a write-target line a
+// few lines away — same file, same shortening rule (`onboarding::relative_shorten` for a
+// project path, `onboarding::tilde_shorten` for a global one), so the two lines describe the
+// same location instead of one being the single longest line on screen. Factored out, one
+// function per line, so the shortening is unit-testable without a pty or a live `cmd_setup`
+// run.
+
+/// "Created ..." for a newly-written global config.
+fn created_global_config_line(path: &Path, home_dir: Option<&Path>, color: bool) -> String {
+    let shown = onboarding::tilde_shorten(path, home_dir);
+    onboarding::dim_line(&format!("Created {}", shown.display()), color)
+}
+
+/// "Set defaults.agent = ..." once the agent question is answered and written.
+fn set_project_agent_line(
+    agent: container::KnownAgent,
+    project_config_path: &Path,
+    repo_root: Option<&Path>,
+) -> String {
+    let shown = onboarding::relative_shorten(project_config_path, repo_root);
+    format!("Set defaults.agent = \"{agent}\" in {}", shown.display())
+}
+
+/// "Set container.enabled = ..." once the containers question is answered and written.
+fn set_container_enabled_line(enabled: bool, path: &Path, home_dir: Option<&Path>) -> String {
+    let shown = onboarding::tilde_shorten(path, home_dir);
+    format!("Set container.enabled = {enabled} in {}", shown.display())
+}
+
+/// "Set tmux.<keys> = ..." once the layout question is answered and written.
+fn set_tmux_layout_line(written: &[&str], path: &Path, home_dir: Option<&Path>) -> String {
+    let shown = onboarding::tilde_shorten(path, home_dir);
+    format!("Set tmux.{} in {}", written.join(", tmux."), shown.display())
+}
+
+/// "Found ..." for a detected `devcontainer.json`.
+fn found_devcontainer_line(path: &Path, repo_root: Option<&Path>) -> String {
+    let shown = onboarding::relative_shorten(path, repo_root);
+    format!(
+        "Found {} — sessions will use it automatically (container.mode = \"auto\")",
+        shown.display()
+    )
+}
+
+/// Create `.am/` and the `.gitignore` entry, returning what it did as a report rather than
+/// printing directly — so `am init` and `am setup` can each render it in their own style (see
+/// [`print_init_line_plain`] and [`print_init_line_dim`]) while sharing this one
+/// implementation. Extracted so the two front
 /// doors cannot drift apart — the same reason `am doctor` reuses `cmd_start`'s preflight.
 /// The closing "am initialized" line stays with `cmd_init`: `am setup` has several more
 /// steps to run before it can say anything of the kind.
@@ -86,7 +236,11 @@ fn cmd_init() -> anyhow::Result<()> {
 /// skeleton is rendered with `defaults.agent` already active instead of commented — see
 /// [`onboarding::render_project_config_skeleton_with_agent`]. `am init` always passes `None`,
 /// so its output is unchanged.
-fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) -> anyhow::Result<()> {
+fn init_project(
+    repo_root: &Path,
+    known_agent: Option<container::KnownAgent>,
+) -> anyhow::Result<Vec<InitLine>> {
+    let mut report = Vec::new();
     let am_dir = repo_root.join(".am");
     std::fs::create_dir_all(&am_dir)?;
 
@@ -99,9 +253,15 @@ fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) ->
             )?,
             None => config::write_defaults(&config_path)?,
         }
-        println!("Created .am/config.toml");
+        report.push(InitLine::Status {
+            text: "Created .am/config.toml".to_string(),
+            changed: true,
+        });
     } else {
-        println!(".am/config.toml already exists, skipping");
+        report.push(InitLine::Status {
+            text: ".am/config.toml already exists, skipping".to_string(),
+            changed: false,
+        });
     }
 
     let gitignore_path = repo_root.join(".gitignore");
@@ -111,16 +271,16 @@ fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) ->
         String::new()
     };
 
-    // Check for old-style broad .am/ entry and print advisory.
+    // Check for old-style broad .am/ entry and report the advisory.
     let has_old_am_entry = gitignore_content
         .lines()
         .any(|l| l.trim() == ".am/" || l.trim() == ".am");
     if has_old_am_entry {
-        println!(
-            "{} .am/ is in .gitignore; .am/config.toml is now committable — \
-             you may want to narrow this to .am/worktrees/",
-            note_prefix()
-        );
+        report.push(InitLine::Advisory(
+            ".am/ is in .gitignore; .am/config.toml is now committable — \
+             you may want to narrow this to .am/worktrees/"
+                .to_string(),
+        ));
     }
 
     // Check if .am/worktrees/ is already present.
@@ -128,7 +288,10 @@ fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) ->
         .lines()
         .any(|l| l.trim() == ".am/worktrees/" || l.trim() == ".am/worktrees");
     if worktrees_already_ignored {
-        println!(".am/worktrees/ already in .gitignore, skipping");
+        report.push(InitLine::Status {
+            text: ".am/worktrees/ already in .gitignore, skipping".to_string(),
+            changed: false,
+        });
     } else {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -138,10 +301,13 @@ fn init_project(repo_root: &Path, known_agent: Option<container::KnownAgent>) ->
             file.write_all(b"\n")?;
         }
         file.write_all(b".am/worktrees/\n")?;
-        println!("Added .am/worktrees/ to .gitignore");
+        report.push(InitLine::Status {
+            text: "Added .am/worktrees/ to .gitignore".to_string(),
+            changed: true,
+        });
     }
 
-    Ok(())
+    Ok(report)
 }
 
 // ── am setup ──────────────────────────────────────────────────────────────────
@@ -169,15 +335,23 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // arrived with rather than what this run just made.
     let detected = onboarding::DetectedState::gather(Some((repo_root.as_path(), vcs.clone())))?;
 
+    // Decided once, up front: every dim line this command prints — the init report, each
+    // question's write-target and "currently: ..." lines — shares this one flag, the same
+    // "decide once per stream" rule `color::enabled`'s own doc comment describes.
+    let color_enabled = color::enabled(color::Stream::Stdout);
+
     // One line of context before anything is asked: which repo this is about, and whether
-    // the user is starting fresh or revisiting.
+    // the user is starting fresh or revisiting. Shortened the same way a global write-target
+    // line is, so a repo nested deep under $HOME doesn't wrap this line before the question
+    // that follows it even gets a chance to.
+    let shown_root = onboarding::tilde_shorten(&repo_root, detected.home_dir.as_deref());
     println!(
         "Setting up am for the {} repository at {}{}",
         match detected.vcs {
             Some(config::Vcs::Jj) => "jj",
             _ => "git",
         },
-        repo_root.display(),
+        shown_root.display(),
         if detected.project_config_exists {
             " (existing configuration)"
         } else {
@@ -194,7 +368,7 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // this changes nothing about what gets printed or when. A genuinely interactive answer is
     // still asked below, after the file exists, in its original place in the flow.
     let resolved_agent_answer: Option<Option<container::KnownAgent>> = if flag_agent.is_some() {
-        Some(onboarding::ask_agent(&mut io, &detected, flag_agent)?)
+        Some(onboarding::ask_agent(&mut io, &detected, flag_agent, color_enabled)?)
     } else if yes {
         Some(onboarding::default_agent_answer(&detected))
     } else {
@@ -205,14 +379,37 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // out, so creating them changes nothing about how a session resolves — except when the
     // agent was just resolved above and the project file is new, where the active line is
     // rendered in directly rather than inserted next to its own commented example.
-    init_project(&repo_root, resolved_agent_answer.flatten())?;
+    //
+    // Reported dim and indented, right under the header: this whole block is structure ("what
+    // am checked or created"), not the content a user is here to decide on.
+    //
+    // Printed in two passes — every `Status` line, then any `Advisory` — rather than in
+    // report order, same reason and same fix as `render_init_report`'s own doc comment: the
+    // advisory is discovered mid-scan but grouped after the status detail so it reads as a
+    // call-out attached to the list instead of a "Note:" interrupting it partway through.
+    let init_report = init_project(&repo_root, resolved_agent_answer.flatten())?;
+    for line in init_report
+        .iter()
+        .filter(|line| matches!(line, InitLine::Status { .. }))
+    {
+        println!("{}", print_init_line_dim(line, color_enabled));
+    }
+    for line in init_report
+        .iter()
+        .filter(|line| matches!(line, InitLine::Advisory(_)))
+    {
+        println!("{}", print_init_line_dim(line, color_enabled));
+    }
     match detected.global_config_path.as_deref() {
         Some(path) if !detected.global_config_exists => {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, onboarding::render_global_config_skeleton())?;
-            println!("Created {}", path.display());
+            println!(
+                "{}",
+                created_global_config_line(path, detected.home_dir.as_deref(), color_enabled)
+            );
         }
         Some(_) => {}
         None => eprintln!(
@@ -227,19 +424,19 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // now if the agent question is still unresolved — i.e. it genuinely needs a prompt.
     let agent_answer = match resolved_agent_answer {
         Some(answer) => answer,
-        None => onboarding::ask_agent(&mut io, &detected, flag_agent)?,
+        None => onboarding::ask_agent(&mut io, &detected, flag_agent, color_enabled)?,
     };
     let container_answer = if yes {
         None
     } else {
-        onboarding::ask_container_enabled(&mut io, &detected)?
+        onboarding::ask_container_enabled(&mut io, &detected, color_enabled)?
     };
     // Layout, like containers, is skipped entirely under `--yes` — neither has an "unanswered
     // means broken" stake the way an unset agent does, so `--yes` writes nothing for either.
     let layout_answer = if yes {
         None
     } else {
-        onboarding::ask_layout(&mut io, &detected)?
+        onboarding::ask_layout(&mut io, &detected, color_enabled)?
     };
 
     if let Some(agent) = agent_answer {
@@ -251,8 +448,12 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
             resolved_agent_answer.is_some() && !detected.project_config_exists;
         if written || already_written_at_creation {
             println!(
-                "Set defaults.agent = \"{agent}\" in {}",
-                detected.project_config_path.display()
+                "{}",
+                set_project_agent_line(
+                    agent,
+                    &detected.project_config_path,
+                    detected.repo_root.as_deref()
+                )
             );
         }
         // Only reachable when the answer was genuinely interactive (the flag/`--yes` path
@@ -270,7 +471,10 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     if let Some(enabled) = container_answer {
         if let Some(path) = detected.global_config_path.as_deref() {
             if onboarding::update_global_container_enabled(path, enabled)? {
-                println!("Set container.enabled = {enabled} in {}", path.display());
+                println!(
+                    "{}",
+                    set_container_enabled_line(enabled, path, detected.home_dir.as_deref())
+                );
                 onboarding::strip_global_container_enabled_example(path)?;
             }
         }
@@ -280,7 +484,10 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
             let written =
                 onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
             if !written.is_empty() {
-                println!("Set tmux.{} in {}", written.join(", tmux."), path.display());
+                println!(
+                    "{}",
+                    set_tmux_layout_line(&written, path, detected.home_dir.as_deref())
+                );
                 onboarding::strip_global_tmux_layout_examples(path, &written)?;
             }
         }
@@ -290,8 +497,8 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // already the right answer for a repo that describes its own environment.
     if let Some(path) = &detected.devcontainer {
         println!(
-            "Found {} — sessions will use it automatically (container.mode = \"auto\")",
-            path.display()
+            "{}",
+            found_devcontainer_line(path, Some(repo_root.as_path()))
         );
         if devcontainer::parse_config(path).is_ok_and(|json| json.initialize_command.is_some()) {
             // Never offered as a prompt: silently letting a wizard enable host command
@@ -307,7 +514,7 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // Step 7: the verification is `am doctor`, run for real and rendered identically.
     println!("\nChecking your setup...\n");
     let report = doctor::run(Some((repo_root.as_path(), vcs.clone())), agent_flag);
-    print!("{}", report.render(color::enabled(color::Stream::Stdout)));
+    print!("{}", report.render(color_enabled));
     if report.failures() > 0 {
         println!("Fix the items above, then re-run 'am setup'.");
         std::process::exit(1);
@@ -1457,7 +1664,11 @@ fn find_repo_root() -> anyhow::Result<(PathBuf, config::Vcs)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{init_project, pane_layout};
+    use super::{
+        created_global_config_line, found_devcontainer_line, init_project, note_prefix,
+        pane_layout, print_init_line_dim, print_init_line_plain, render_init_report,
+        set_container_enabled_line, set_project_agent_line, set_tmux_layout_line, InitLine,
+    };
     use crate::command::shell_quote;
     use crate::config::PaneSide;
 
@@ -1495,6 +1706,313 @@ mod tests {
 
         let content = std::fs::read_to_string(am_dir.join("config.toml")).unwrap();
         assert_eq!(content, "[defaults]\nagent = \"gemini\"\n");
+    }
+
+    #[test]
+    fn init_project_reports_a_status_line_for_each_action_it_took() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let report = init_project(tmp.path(), None).unwrap();
+
+        assert!(matches!(&report[0], InitLine::Status { text, changed: true } if text == "Created .am/config.toml"));
+        assert!(matches!(
+            &report[1],
+            InitLine::Status { text, changed: true } if text == "Added .am/worktrees/ to .gitignore"
+        ));
+    }
+
+    #[test]
+    fn init_project_reports_skipping_when_nothing_needed_creating() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_project(tmp.path(), None).unwrap();
+
+        let report = init_project(tmp.path(), None).unwrap();
+
+        assert!(matches!(
+            &report[0],
+            InitLine::Status { text, changed: false } if text == ".am/config.toml already exists, skipping"
+        ));
+        assert!(matches!(
+            &report[1],
+            InitLine::Status { text, changed: false } if text == ".am/worktrees/ already in .gitignore, skipping"
+        ));
+    }
+
+    // ── InitLine rendering ──────────────────────────────────────────────────
+    //
+    // `print_init_line_plain` (`am init`) and `print_init_line_dim` (`am setup`) are the two
+    // callers of `InitLine`'s severity split: a `Status` line is structure, so `am setup`
+    // dims and indents it while `am init` leaves it flush left and plain; an `Advisory` line
+    // is worth reading on its own, so both callers show it at the same "Note:" severity —
+    // never nested inside the dim treatment. It is still indented two spaces in both, the
+    // same as a `Status` line, since indentation is structure independent of severity color
+    // (`color.rs`'s module doc) — `print_init_line_plain` leaves that indent to its caller
+    // (`render_init_report`, exercised below) the same way it already does for `Status`, so
+    // this test pins it unindented; `print_init_line_dim` bakes it in, so that one is pinned
+    // indented directly.
+
+    #[test]
+    fn status_line_is_plain_under_init_and_dimmed_indented_under_setup() {
+        let line = InitLine::Status {
+            text: "Created .am/config.toml".to_string(),
+            changed: true,
+        };
+
+        assert_eq!(print_init_line_plain(&line), "Created .am/config.toml");
+        assert_eq!(print_init_line_dim(&line, false), "  Created .am/config.toml");
+        assert_eq!(
+            print_init_line_dim(&line, true),
+            "\x1b[2m  Created .am/config.toml\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn advisory_line_keeps_its_own_note_severity_under_both_callers() {
+        let line = InitLine::Advisory(
+            ".am/ is in .gitignore; .am/config.toml is now committable".to_string(),
+        );
+        let plain = format!(
+            "{} .am/ is in .gitignore; .am/config.toml is now committable",
+            note_prefix()
+        );
+
+        // `print_init_line_plain` hands the indent to its caller, same as `Status` — see
+        // `render_init_report`'s own tests for the indented form.
+        assert_eq!(print_init_line_plain(&line), plain);
+        // `print_init_line_dim` bakes the indent in directly, same as `Status` gets from
+        // `onboarding::dim_line` — the two spaces are structure, not part of the "Note:"
+        // severity, so they sit outside `note_prefix()`'s own coloring either way.
+        let dim = format!("  {plain}");
+        assert_eq!(print_init_line_dim(&line, false), dim);
+        // `color: true` must not nest a second color inside the advisory's own "Note:"
+        // severity — the whole reason this line has its own renderer branch instead of
+        // running through the same dim-or-not flag `Status` does.
+        assert_eq!(
+            print_init_line_dim(&line, true),
+            dim,
+            "a second color must never be nested inside an already-colored line"
+        );
+    }
+
+    // ── render_init_report ──────────────────────────────────────────────────
+    //
+    // `am init`'s headline-plus-detail rendering — see `render_init_report`'s own doc comment
+    // for the collapse rule. Built from a hand-constructed report rather than a real
+    // `init_project` run, so each case (first run, already-initialized, mixed, and the
+    // advisory in each of those) is examined in isolation.
+
+    fn joined(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn render_init_report_on_a_fresh_run_lists_every_action_under_an_initialized_headline() {
+        let report = vec![
+            InitLine::Status {
+                text: "Created .am/config.toml".to_string(),
+                changed: true,
+            },
+            InitLine::Status {
+                text: "Added .am/worktrees/ to .gitignore".to_string(),
+                changed: true,
+            },
+        ];
+
+        assert_eq!(
+            render_init_report(&report),
+            joined(&[
+                "Initialized am in this repo.",
+                "  Created .am/config.toml",
+                "  Added .am/worktrees/ to .gitignore",
+                "",
+                "Run 'am start <slug>' to create your first session.",
+            ])
+        );
+    }
+
+    #[test]
+    fn render_init_report_on_a_re_run_collapses_to_a_two_line_summary() {
+        let report = vec![
+            InitLine::Status {
+                text: ".am/config.toml already exists, skipping".to_string(),
+                changed: false,
+            },
+            InitLine::Status {
+                text: ".am/worktrees/ already in .gitignore, skipping".to_string(),
+                changed: false,
+            },
+        ];
+
+        // Nothing changed, so the per-file detail — which would only restate "already
+        // initialized" twice — is dropped, and the next step is folded directly underneath.
+        assert_eq!(
+            render_init_report(&report),
+            joined(&[
+                "am is already initialized in this repo.",
+                "  Run 'am start <slug>' to create your first session.",
+            ])
+        );
+    }
+
+    #[test]
+    fn render_init_report_on_a_mixed_run_shows_both_what_changed_and_what_was_already_fine() {
+        let report = vec![
+            InitLine::Status {
+                text: ".am/config.toml already exists, skipping".to_string(),
+                changed: false,
+            },
+            InitLine::Status {
+                text: "Added .am/worktrees/ to .gitignore".to_string(),
+                changed: true,
+            },
+        ];
+
+        // One file needed no action and one did — the headline reflects that *something*
+        // changed, and unlike the pure re-run case, the detail is kept so it's clear which
+        // part was already fine and which one this run actually touched.
+        assert_eq!(
+            render_init_report(&report),
+            joined(&[
+                "Initialized am in this repo.",
+                "  .am/config.toml already exists, skipping",
+                "  Added .am/worktrees/ to .gitignore",
+                "",
+                "Run 'am start <slug>' to create your first session.",
+            ])
+        );
+    }
+
+    #[test]
+    fn render_init_report_indents_the_advisory_and_groups_it_after_changed_detail() {
+        let report = vec![
+            InitLine::Status {
+                text: "Created .am/config.toml".to_string(),
+                changed: true,
+            },
+            // Discovered mid-scan (between the config-file and `.gitignore` checks), same as
+            // a real `init_project` run — the assertion below confirms rendering reorders it
+            // to the end of the block rather than reproducing this position.
+            InitLine::Advisory(
+                ".am/ is in .gitignore; .am/config.toml is now committable — you may want to \
+                 narrow this to .am/worktrees/"
+                    .to_string(),
+            ),
+            InitLine::Status {
+                text: "Added .am/worktrees/ to .gitignore".to_string(),
+                changed: true,
+            },
+        ];
+
+        assert_eq!(
+            render_init_report(&report),
+            joined(&[
+                "Initialized am in this repo.",
+                "  Created .am/config.toml",
+                "  Added .am/worktrees/ to .gitignore",
+                &format!(
+                    "  {} .am/ is in .gitignore; .am/config.toml is now committable — you may \
+                     want to narrow this to .am/worktrees/",
+                    note_prefix()
+                ),
+                "",
+                "Run 'am start <slug>' to create your first session.",
+            ])
+        );
+    }
+
+    #[test]
+    fn render_init_report_still_shows_the_advisory_when_nothing_else_changed() {
+        let report = vec![
+            InitLine::Status {
+                text: ".am/config.toml already exists, skipping".to_string(),
+                changed: false,
+            },
+            InitLine::Advisory(
+                ".am/ is in .gitignore; .am/config.toml is now committable".to_string(),
+            ),
+            InitLine::Status {
+                text: ".am/worktrees/ already in .gitignore, skipping".to_string(),
+                changed: false,
+            },
+        ];
+
+        // The collapse rule drops the *status* detail when nothing changed, but the advisory
+        // is content a user asked for, not structure describing what this run did — it must
+        // survive the collapse every time it applies, re-run or not. It stays indented into
+        // the block it now sits alone in, same as the changed case above.
+        assert_eq!(
+            render_init_report(&report),
+            joined(&[
+                "am is already initialized in this repo.",
+                &format!(
+                    "  {} .am/ is in .gitignore; .am/config.toml is now committable",
+                    note_prefix()
+                ),
+                "  Run 'am start <slug>' to create your first session.",
+            ])
+        );
+    }
+
+    // ── `am setup`'s status/confirmation lines ──────────────────────────────────
+    //
+    // Each renders the same path its own write-target line shows a few lines away —
+    // `onboarding::write_target_line`'s own tests pin that shortening; these pin that these
+    // lines apply it too, rather than the raw absolute path.
+
+    #[test]
+    fn created_global_config_line_shortens_the_path_with_a_tilde() {
+        let path = Path::new("/home/u/.config/am/config.toml");
+        assert_eq!(
+            created_global_config_line(path, Some(Path::new("/home/u")), false),
+            "  Created ~/.config/am/config.toml"
+        );
+    }
+
+    #[test]
+    fn created_global_config_line_falls_back_without_a_known_home() {
+        let path = Path::new("/home/u/.config/am/config.toml");
+        assert_eq!(
+            created_global_config_line(path, None, false),
+            "  Created /home/u/.config/am/config.toml"
+        );
+    }
+
+    #[test]
+    fn set_project_agent_line_shortens_the_path_relative_to_the_repo_root() {
+        let path = Path::new("/repo/.am/config.toml");
+        assert_eq!(
+            set_project_agent_line(KnownAgent::Claude, path, Some(Path::new("/repo"))),
+            "Set defaults.agent = \"claude\" in .am/config.toml"
+        );
+    }
+
+    #[test]
+    fn set_container_enabled_line_shortens_the_path_with_a_tilde() {
+        let path = Path::new("/home/u/.config/am/config.toml");
+        assert_eq!(
+            set_container_enabled_line(true, path, Some(Path::new("/home/u"))),
+            "Set container.enabled = true in ~/.config/am/config.toml"
+        );
+    }
+
+    #[test]
+    fn set_tmux_layout_line_shortens_the_path_with_a_tilde() {
+        let path = Path::new("/home/u/.config/am/config.toml");
+        let written = ["agent_pane", "split"];
+        assert_eq!(
+            set_tmux_layout_line(&written, path, Some(Path::new("/home/u"))),
+            "Set tmux.agent_pane, tmux.split in ~/.config/am/config.toml"
+        );
+    }
+
+    #[test]
+    fn found_devcontainer_line_shortens_the_path_relative_to_the_repo_root() {
+        let path = Path::new("/repo/.devcontainer/devcontainer.json");
+        assert_eq!(
+            found_devcontainer_line(path, Some(Path::new("/repo"))),
+            "Found .devcontainer/devcontainer.json — sessions will use it automatically \
+             (container.mode = \"auto\")"
+        );
     }
 
     #[test]
