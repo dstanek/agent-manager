@@ -131,7 +131,7 @@ Agent
   ✓ agent                  claude
   ✗ credentials            ~/.claude does not exist
       → run 'claude auth login' (or set ANTHROPIC_API_KEY) — see
-        docs/guides/claude-code.md#prerequisites
+        https://dstanek.github.io/agent-manager/guides/claude-code/#prerequisites
 ```
 
 Every agent's credentials hint names that agent's actual sign-in command (`gh auth login` for

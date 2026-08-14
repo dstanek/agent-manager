@@ -115,7 +115,7 @@ If `am setup` finds something that would stop `am start` from working — no con
 
 What to do next:
   - install Podman (https://podman.io/docs/installation) or Docker (https://docs.docker.com/get-docker/), or set container.enabled = false in .am/config.toml
-  - run 'claude auth login' (or set ANTHROPIC_API_KEY) — see docs/guides/claude-code.md#prerequisites
+  - run 'claude auth login' (or set ANTHROPIC_API_KEY) — see https://dstanek.github.io/agent-manager/guides/claude-code/#prerequisites
 
 Then re-run 'am setup'.
 ```
