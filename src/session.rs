@@ -117,6 +117,11 @@ pub struct Session {
     #[serde(flatten)]
     pub tmux: TmuxMetadata,
     pub container: Option<SessionContainer>,
+    /// The agent last launched into this session's agent pane (e.g. "claude"). Used by
+    /// `am attach` to relaunch the agent after a reboot or a killed window. `None` for
+    /// records written before this field existed, or for sessions started with no agent.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -360,6 +365,7 @@ mod tests {
                 original_shell_dir: None,
             },
             container: None,
+            agent: None,
         }
     }
 
@@ -407,6 +413,54 @@ mod tests {
         assert_eq!(c.runtime, "podman");
         assert_eq!(c.container_id.as_deref(), Some("abc123"));
         assert_eq!(c.mode, ContainerMode::Image);
+    }
+
+    #[test]
+    fn agent_roundtrips_json() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+
+        let repo = tmp.path().join("repo");
+        let mut s = make_session_for_repo("feat", &repo);
+        s.agent = Some("claude".to_string());
+        add_session_global(s).unwrap();
+
+        let loaded = load_all_sessions().unwrap();
+        assert_eq!(loaded[0].agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn legacy_record_without_agent_field_loads_as_none() {
+        // Sessions written before Session.agent existed have no "agent" key at all.
+        // #[serde(default)] must make that load as None rather than erroring.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+
+        let sessions_path = tmp.path().join("am").join("sessions.json");
+        std::fs::create_dir_all(sessions_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sessions_path,
+            r#"{"sessions":[{
+                "slug":"legacy",
+                "created_at":"2026-01-01T00:00:00Z",
+                "repo_root":"/repo",
+                "branch":"am/legacy",
+                "worktree_path":".am/worktrees/legacy",
+                "tmux_window":"am-legacy",
+                "agent_pane":"am-legacy.1",
+                "shell_pane":"am-legacy.0",
+                "container":null
+            }]}"#,
+        )
+        .unwrap();
+
+        let loaded = load_all_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].agent, None);
     }
 
     #[test]

@@ -204,6 +204,26 @@ impl Default for DevcontainerConfig {
     }
 }
 
+/// Settings for `am attach`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachConfig {
+    /// Whether `am attach` asks the agent to resume its previous conversation
+    /// when relaunching it, instead of starting fresh. Overridden per-invocation
+    /// by `am attach --fresh`.
+    #[serde(default = "default_true")]
+    pub resume: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AttachConfig {
+    fn default() -> Self {
+        Self { resume: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub agent: Option<String>,
@@ -212,6 +232,8 @@ pub struct Config {
     pub tmux: TmuxConfig,
     pub container: ContainerConfig,
     pub devcontainer: DevcontainerConfig,
+    #[serde(default)]
+    pub attach: AttachConfig,
     /// Keys found in the config files that `am` does not recognise. Not a config value
     /// itself, so it never round-trips through a config file.
     #[serde(skip)]
@@ -256,6 +278,7 @@ impl Default for Config {
             tmux: TmuxConfig::default(),
             container: ContainerConfig::default(),
             devcontainer: DevcontainerConfig::default(),
+            attach: AttachConfig::default(),
             unknown_keys: Vec::new(),
         }
     }
@@ -343,6 +366,13 @@ struct FileDevcontainer {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct FileAttach {
+    resume: Option<bool>,
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
     defaults: FileDefaults,
@@ -354,6 +384,8 @@ struct FileConfig {
     container: FileContainer,
     #[serde(default)]
     devcontainer: FileDevcontainer,
+    #[serde(default)]
+    attach: FileAttach,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -393,6 +425,7 @@ fn collect_unknown(file: &FileConfig, path: &Path) -> Vec<UnknownKey> {
             .keys()
             .map(|k| format!("devcontainer.{k}")),
     );
+    keys.extend(file.attach.unknown.keys().map(|k| format!("attach.{k}")));
     for (name, settings) in &file.agents {
         keys.extend(
             settings
@@ -490,6 +523,8 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     if let Some(features) = file.devcontainer.extra_features {
         base.devcontainer.extra_features.extend(features);
     }
+
+    apply_opt(&mut base.attach.resume, file.attach.resume);
 }
 
 fn parse_config_file(path: &Path) -> Result<FileConfig> {
@@ -568,6 +603,10 @@ pub fn render_project_config_skeleton() -> &'static str {
 # agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
 # allow_host_commands = false # let initializeCommand run on the HOST — off by default
 # skip_lifecycle = false     # skip postCreateCommand and friends
+
+[attach]
+# resume = true    # `am attach` asks the agent to resume its previous conversation by
+                   # default when relaunching it; override per-invocation with --fresh
 "#
 }
 
@@ -656,6 +695,10 @@ skip_lifecycle = false         # skip postCreateCommand and the other in-contain
 # Extra Features to inject at build time, as id -> options JSON:
 # [devcontainer.extra_features]
 # "ghcr.io/devcontainers/features/node:1" = "{}"
+
+[attach]
+resume = true          # am attach asks the agent to resume its previous conversation by
+                       # default when relaunching it; override per-invocation with --fresh
 "#
 }
 
@@ -1318,6 +1361,63 @@ image = "myorg/am-claude:project"
                 .and_then(|a| a.image.as_deref()),
             Some("ghcr.io/dstanek/am-copilot-minimal:latest")
         );
+    }
+
+    // ── [attach] ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn attach_resume_defaults_to_true() {
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("global.toml");
+        let config = load_with_global(Some(&nonexistent), None).unwrap();
+        assert!(config.attach.resume);
+    }
+
+    #[test]
+    fn attach_resume_can_be_disabled_in_project_config() {
+        let tmp = TempDir::new().unwrap();
+        let project = write_toml(tmp.path(), "project.toml", "[attach]\nresume = false\n");
+
+        let config = load_with_global(None, Some(&project)).unwrap();
+        assert!(!config.attach.resume);
+    }
+
+    #[test]
+    fn attach_section_missing_from_a_pre_existing_config_still_defaults_resume_true() {
+        // A config file written before [attach] existed has no such section at all.
+        let tmp = TempDir::new().unwrap();
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[defaults]\nagent = \"claude\"\n",
+        );
+
+        let config = load_with_global(None, Some(&project)).unwrap();
+        assert!(config.attach.resume);
+    }
+
+    #[test]
+    fn unknown_attach_key_is_collected_not_rejected() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+        let project = write_toml(tmp.path(), "project.toml", "[attach]\nresuem = true\n");
+
+        let config = load_with_global(None, Some(&project)).unwrap();
+        let keys: Vec<&str> = config
+            .unknown_keys
+            .iter()
+            .map(|u| u.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["attach.resuem"]);
+    }
+
+    #[test]
+    fn global_config_template_documents_attach_section() {
+        let template = global_config_template();
+        assert!(template.contains("[attach]"));
+        assert!(template.contains("resume = true"));
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rebuild,
         } => cmd_start(&slug, agent.as_deref(), no_container, auto, rebuild),
         Commands::List { all } => cmd_list(all),
-        Commands::Attach { slug } => cmd_attach(&slug),
+        Commands::Attach { slug, fresh } => cmd_attach(&slug, fresh),
         Commands::Run { slug, agent } => cmd_run(&slug, &agent),
         Commands::Destroy { slug, force } => cmd_destroy(&slug, force, &msgs),
         Commands::Doctor => cmd_doctor(None),
@@ -700,13 +700,11 @@ fn cmd_start(
     //    does, so its half of preflight happens below.
     let use_container = cfg.container.enabled && !no_container;
     let runtime = if use_container {
-        let runtime = container::detect_runtime(cfg.container.runtime.clone())?;
-        if let Some(agent) = effective_known_agent {
-            container::validate_agent_credentials(agent)?;
-        }
-        // Pre-emptively remove any leftover container from a previous run
-        container::remove_if_exists(&runtime, &container_name);
-        Some(runtime)
+        Some(plan_container_runtime(
+            &cfg,
+            effective_known_agent,
+            &container_name,
+        )?)
     } else {
         None
     };
@@ -733,6 +731,8 @@ fn cmd_start(
                 auto,
                 rebuild,
                 container_name: &container_name,
+                // A freshly started session never resumes anything.
+                resume: false,
             })?;
             (Some(plan.cmd), Some(plan.session))
         }
@@ -808,6 +808,7 @@ fn cmd_start(
             original_shell_dir: None,
         },
         container: session_container,
+        agent: effective_agent.clone(),
     };
 
     let color_enabled = color::enabled(color::Stream::Stdout);
@@ -934,11 +935,35 @@ struct ContainerPlanInput<'a> {
     auto: bool,
     rebuild: bool,
     container_name: &'a str,
+    /// Append the agent's resume flags (OQ-3/OQ-4), if it has any. `cmd_start` always
+    /// passes `false` — a fresh session has nothing to resume; `am attach`'s container
+    /// recreate path (OQ-2) passes through its own resolved resume decision.
+    resume: bool,
 }
 
 struct ContainerPlan {
     cmd: Vec<String>,
     session: session::SessionContainer,
+}
+
+/// Container runtime detection, agent credential preflight, and leftover-container
+/// cleanup — the fixed prefix of container planning, run before there is anything else to
+/// plan. Shared by `cmd_start` (fresh session) and `cmd_attach`'s container recreate path
+/// (OQ-2), extracted out of `cmd_start`'s own inline block so both run the identical
+/// preflight in the identical order; `cmd_start`'s behavior here is unchanged by the
+/// extraction.
+fn plan_container_runtime(
+    cfg: &config::Config,
+    agent: Option<container::KnownAgent>,
+    container_name: &str,
+) -> anyhow::Result<container::ContainerRuntime> {
+    let runtime = container::detect_runtime(cfg.container.runtime.clone())?;
+    if let Some(agent) = agent {
+        container::validate_agent_credentials(agent)?;
+    }
+    // Pre-emptively remove any leftover container from a previous run.
+    container::remove_if_exists(&runtime, container_name);
+    Ok(runtime)
 }
 
 /// Decide whether this session runs from an `am`-resolved image or the repo's own
@@ -956,6 +981,7 @@ fn plan_container(input: ContainerPlanInput) -> anyhow::Result<ContainerPlan> {
         auto,
         rebuild,
         container_name,
+        resume,
     } = input;
 
     // Discovery is relative to the worktree: the config is a checked-in, branch-specific
@@ -981,10 +1007,10 @@ fn plan_container(input: ContainerPlanInput) -> anyhow::Result<ContainerPlan> {
     match config_path {
         Some(path) => plan_devcontainer(
             slug, repo_root, worktree, vcs, cfg, runtime, agent, agent_name, auto, rebuild, &path,
-            container_name,
+            container_name, resume,
         ),
         None => plan_image(slug, repo_root, vcs, cfg, runtime, agent, agent_name, auto,
-            container_name),
+            container_name, resume),
     }
 }
 
@@ -1000,6 +1026,7 @@ fn plan_image(
     agent_name: Option<&str>,
     auto: bool,
     container_name: &str,
+    resume: bool,
 ) -> anyhow::Result<ContainerPlan> {
     let image = config::resolve_image(agent_name, cfg)
         .ok_or(error::AmError::ContainerImageNotConfigured)?;
@@ -1029,7 +1056,7 @@ fn plan_image(
         container_name,
         &container::DevcontainerRuntime::image_mode(),
     );
-    cmd.extend(agent_command(agent, auto));
+    cmd.extend(agent_command(agent_name, agent, auto, resume));
     Ok(ContainerPlan {
         cmd,
         session: session::SessionContainer::image_mode(
@@ -1055,6 +1082,7 @@ fn plan_devcontainer(
     rebuild: bool,
     config_path: &std::path::Path,
     container_name: &str,
+    resume: bool,
 ) -> anyhow::Result<ContainerPlan> {
     let json = devcontainer::parse_config(config_path)?;
     devcontainer::check_supported(&json)?;
@@ -1135,7 +1163,7 @@ fn plan_devcontainer(
     chain.extend(hooks);
     cmd.extend(container::compose_entrypoint_command(
         &chain,
-        &agent_command(agent, auto),
+        &agent_command(agent_name, agent, auto, resume),
     ));
 
     Ok(ContainerPlan {
@@ -1154,14 +1182,44 @@ fn plan_devcontainer(
     })
 }
 
-/// The agent invocation appended as the container command, if there is one.
-fn agent_command(agent: Option<container::KnownAgent>, auto: bool) -> Vec<String> {
-    let Some(agent) = agent else {
+/// The agent invocation appended as the container command, if there is one — or, for a
+/// host-side relaunch (`am attach`, `cmd_run`), the command line sent into the agent pane.
+///
+/// `agent_name` is the raw string to launch (`cfg.agent`, `--agent`, or a recorded
+/// `Session.agent`) and `known` is that same value already parsed to a `KnownAgent`, kept
+/// separate so an unrecognized name still launches as a bare command rather than vanishing.
+/// This is not a defensive fallback for something that "shouldn't happen": `cmd_start`
+/// validates `--agent` via `KnownAgent::parse` before any session exists, so a
+/// `cmd_start`-originated `Session.agent` is always parseable, but `cmd_run`'s `agent`
+/// argument (`src/cli.rs`) has no such validator and is persisted onto `Session.agent`
+/// verbatim on success — so `am run <slug> some-typo` is an ordinary, everyday way to reach
+/// `known: None` here, later, via `am attach`.
+fn agent_command(
+    agent_name: Option<&str>,
+    known: Option<container::KnownAgent>,
+    auto: bool,
+    resume: bool,
+) -> Vec<String> {
+    let Some(name) = agent_name else {
         return Vec::new();
     };
-    let mut cmd = vec![agent.to_string()];
-    if auto {
-        cmd.extend(container::agent_auto_flags(agent));
+    let mut cmd = vec![name.to_string()];
+    if let Some(agent) = known {
+        // Auto flags are appended before resume flags. Latent ordering constraint: if an
+        // agent ever has both a non-empty `agent_auto_flags` *and* a subcommand-shaped
+        // resume form (like Codex's `resume --last`, which must be the very first token
+        // after the binary name, not just present anywhere), appending auto flags first
+        // would produce an invalid invocation. Harmless today only because
+        // `agent_auto_flags(Codex)` is empty — revisit this ordering if that changes, or if
+        // `auto` and `resume` are ever combined for an agent with a subcommand-shaped resume.
+        if auto {
+            cmd.extend(container::agent_auto_flags(agent));
+        }
+        if resume {
+            if let Some(flags) = container::agent_resume_flags(agent) {
+                cmd.extend(flags);
+            }
+        }
     }
     cmd
 }
@@ -1359,7 +1417,367 @@ fn cmd_list_all() -> anyhow::Result<()> {
 
 // ── am attach ────────────────────────────────────────────────────────────────
 
-fn cmd_attach(slug: &str) -> anyhow::Result<()> {
+/// Whether an agent pane is confidently idle (safe to relaunch into), confidently running an
+/// agent/container, or ambiguous. See `agent_pane_status`'s doc for the safety bias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneStatus {
+    Running,
+    Idle,
+    Ambiguous,
+}
+
+/// Common shell process names a pane sitting at an interactive prompt reports as its
+/// foreground command. Used only to recognize "idle" — anything else is either the agent
+/// itself or unrecognized, and both are treated the same way by `agent_pane_status`.
+const SHELL_PROCESS_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"];
+
+/// `true` for a pane sitting at a bare interactive shell prompt.
+///
+/// A login shell's reported command sometimes keeps a leading `-` (e.g. `-bash`); stripped
+/// before comparing so both forms match the same table.
+fn is_shell_process(name: &str) -> bool {
+    SHELL_PROCESS_NAMES.contains(&name.trim_start_matches('-'))
+}
+
+/// OQ-6: decide whether `am attach`'s fast path (window already exists) should leave a
+/// session alone or relaunch into it.
+///
+/// Biased hard toward `Ambiguous`/`Running` over `Idle`: an unrecognized foreground process
+/// name, a failed tmux query, or a gone pane target are all treated the same as "still
+/// running" — a missed relaunch costs the user an `am run`, but relaunching over a live agent
+/// can interrupt real work or lose in-flight state. Only a foreground process that is
+/// recognizably a bare shell counts as confidently idle.
+///
+/// - Container sessions compare against the recorded runtime binary name
+///   (`SessionContainer.runtime`, e.g. `"podman"`) rather than the agent: while the
+///   container is up, that is the pane's foreground process regardless of what is running
+///   inside it, and the container is the container's PID 1 — if the process inside it exits,
+///   so does the container, and the pane reverts to a shell.
+/// - Host sessions compare against the recorded agent name directly. No table of interpreter
+///   shims is attempted here — an agent running under `node`/`python`/etc. simply reads as
+///   `Ambiguous`, which is the safe outcome anyway.
+fn agent_pane_status(s: &session::Session) -> PaneStatus {
+    let current = match tmux::pane_current_command(&s.tmux.agent_pane) {
+        Ok(name) => name,
+        Err(_) => return PaneStatus::Ambiguous,
+    };
+    let expected_running = match &s.container {
+        Some(container) => Some(container.runtime.as_str()),
+        None => s.agent.as_deref(),
+    };
+    match expected_running {
+        Some(expected) if current == expected => PaneStatus::Running,
+        _ if is_shell_process(&current) => PaneStatus::Idle,
+        _ => PaneStatus::Ambiguous,
+    }
+}
+
+/// Whether `resume` actually contributes a flag for `known_agent` — used only to decide the
+/// "(resuming)" wording in `am attach`'s output; the same test `agent_command` itself applies
+/// via `agent_resume_flags`.
+fn resume_will_apply(known_agent: Option<container::KnownAgent>, resume: bool) -> bool {
+    resume && known_agent.is_some_and(|a| container::agent_resume_flags(a).is_some())
+}
+
+/// What `am attach` actually launched, for building its output line — a host agent, a
+/// recreated container, or nothing (no agent could be determined; OQ-1/UC-5).
+enum AttachLaunch {
+    Agent { name: String, resumed: bool },
+    Container,
+    NoAgentKnown,
+}
+
+/// `am attach`'s output line after opening a brand-new window (UC-1/UC-2/UC-5).
+fn attach_recreate_message(slug: &str, launch: &AttachLaunch) -> String {
+    match launch {
+        AttachLaunch::NoAgentKnown => format!("Opened new window for session '{slug}'."),
+        AttachLaunch::Agent { name, resumed } => {
+            let suffix = if *resumed { " (resuming)" } else { "" };
+            format!("Opened new window for session '{slug}' and relaunched '{name}'{suffix}.")
+        }
+        AttachLaunch::Container => {
+            format!("Opened new window for session '{slug}' and restarted the container.")
+        }
+    }
+}
+
+/// `am attach`'s output line after relaunching into an already-open window whose agent pane
+/// was found idle (UC-4).
+fn attach_relaunch_message(slug: &str, launch: &AttachLaunch) -> String {
+    match launch {
+        AttachLaunch::NoAgentKnown => format!("Attached to session '{slug}'."),
+        AttachLaunch::Agent { name, resumed } => {
+            let suffix = if *resumed { " (resuming)" } else { "" };
+            format!(
+                "Attached to session '{slug}'; agent had exited — relaunched '{name}'{suffix}."
+            )
+        }
+        AttachLaunch::Container => {
+            format!("Attached to session '{slug}'; container had exited — restarted it.")
+        }
+    }
+}
+
+/// Rebuild a containerized session's run command from its persisted record plus a freshly
+/// loaded config (OQ-2) — the same preflight `cmd_start` runs, just fed from a `Session`
+/// instead of fresh CLI input. Also replaces `s.container` with the freshly resolved
+/// `SessionContainer` (mode/hash/etc. may have changed, e.g. a devcontainer image rebuilt
+/// since this session was started).
+fn attach_recreate_container_cmd(
+    repo_root: &Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    slug: &str,
+    s: &mut session::Session,
+    known_agent: Option<container::KnownAgent>,
+    resume: bool,
+) -> anyhow::Result<Vec<String>> {
+    let recreate_name = s
+        .container
+        .as_ref()
+        .and_then(|c| c.container_name.clone())
+        .unwrap_or_else(|| container_name(repo_root, slug));
+
+    let runtime = plan_container_runtime(cfg, known_agent, &recreate_name)?;
+
+    let plan = plan_container(ContainerPlanInput {
+        slug,
+        repo_root,
+        worktree: &s.vcs.worktree_path,
+        vcs,
+        cfg,
+        runtime: &runtime,
+        agent: known_agent,
+        agent_name: s.agent.as_deref(),
+        auto: s.auto,
+        rebuild: false,
+        container_name: &recreate_name,
+        resume,
+    })?;
+
+    let mut session_container = plan.session;
+    session_container.container_name = Some(recreate_name);
+    s.container = Some(session_container);
+
+    Ok(plan.cmd)
+}
+
+/// UC-1/UC-2/UC-5: the session's tmux window (and, for a container session, the container
+/// itself) is gone. Recreate the window and split unconditionally first, record the new pane
+/// targets, and only then attempt to launch anything into the fresh agent pane — a launch
+/// failure must never leave the session record pointing at panes that don't exist (see below).
+///
+/// Not wrapped in a rollback guard (A3): if the container recreate fails, the window and split
+/// this function already created are left open rather than torn down — a tmux window is cheap
+/// to redo and carries no data, unlike the worktree `cmd_start` guards.
+///
+/// Split first, launch second — deliberately, not `cmd_start`'s "exec the container as the
+/// split's own command" ordering: this function cannot know the container run command until
+/// *after* running preflight (runtime detection, credential validation, image build-or-reuse),
+/// which can fail. If it split with that command as `cmd_start` does and preflight failed
+/// first, there would be no split at all — the session record would still claim pane targets
+/// that were never created, `am attach`'s window-exists fast path would then find a *missing*
+/// pane, OQ-6 would (correctly) read that as `Ambiguous`, and the user would be stuck in a
+/// silent no-op loop with no way to make progress short of `am destroy`. Splitting first with
+/// no command, persisting those pane targets, and then `send_keys`-ing the launch command in
+/// (exactly like the already-open-window path in `relaunch_into_existing_window`) means a
+/// launch failure leaves a real, addressable window+split behind, and the record already
+/// matches it.
+fn recreate_attach_window(
+    repo_root: &Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    slug: &str,
+    s: &mut session::Session,
+    known_agent: Option<container::KnownAgent>,
+    resume: bool,
+) -> anyhow::Result<()> {
+    let window_id = tmux::create_window(&s.tmux.tmux_window, &s.vcs.worktree_path)
+        .map_err(|e| anyhow::anyhow!(
+            "{e}\nHint: a window named '{}' may already exist — run 'am destroy {slug}' first",
+            s.tmux.tmux_window
+        ))?;
+    let (agent_pane_idx, shell_pane_idx, split_before) = pane_layout(&cfg.tmux.agent_pane);
+    tmux::split_window(
+        &window_id,
+        &s.vcs.worktree_path,
+        &cfg.tmux.split,
+        cfg.tmux.split_percent,
+        split_before,
+        None,
+    )?;
+
+    s.tmux.tmux_window_id = Some(window_id.clone());
+    s.tmux.agent_pane = tmux::get_pane_id(&window_id, agent_pane_idx);
+    s.tmux.shell_pane = tmux::get_pane_id(&window_id, shell_pane_idx);
+    // Persist now, before attempting any launch: the window and split above already exist,
+    // so the record must reflect that even if what follows fails.
+    session::update_session_global(s.clone())?;
+
+    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+    // Persist again: a container recreate replaces s.container with a freshly resolved plan
+    // (mode/hash may have changed). A host launch or the no-agent case changes nothing further,
+    // so this second write is a harmless no-op for those, kept for a single code path rather
+    // than a conditional one.
+    session::update_session_global(s.clone())?;
+
+    tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
+    tmux::select_window(&window_id)?;
+
+    println!("{}", attach_recreate_message(slug, &launch));
+    print_no_agent_known_note(slug, s.agent.is_none());
+    Ok(())
+}
+
+/// UC-4: the window is still open, but `agent_pane_status` found the agent pane confidently
+/// idle. Relaunch by typing into the existing pane (`send_keys`) rather than recreating any
+/// tmux structure. For a container session an idle pane means the container itself already
+/// exited (it is the container's PID 1), so this degenerates into the same OQ-2 recreate
+/// `recreate_attach_window`'s container branch performs — just delivered via `send_keys`
+/// into the pane that is already there instead of exec'd at split time.
+fn relaunch_into_existing_window(
+    repo_root: &Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    slug: &str,
+    s: &mut session::Session,
+    known_agent: Option<container::KnownAgent>,
+    resume: bool,
+) -> anyhow::Result<()> {
+    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+    // A container recreate replaces s.container with a freshly resolved plan; a host
+    // relaunch or the no-agent case changes nothing further, so this is a harmless no-op
+    // write for those — kept unconditional for the same reason as
+    // `recreate_attach_window`'s second persist.
+    session::update_session_global(s.clone())?;
+
+    println!("{}", attach_relaunch_message(slug, &launch));
+    print_no_agent_known_note(slug, s.agent.is_none());
+    Ok(())
+}
+
+/// Build the launch command for this session's agent pane — a container recreate
+/// (`attach_recreate_container_cmd`) or a host agent relaunch (`agent_command`), whichever
+/// this session calls for — and `send_keys` it into `s.tmux.agent_pane`.
+///
+/// Shared by both `am attach` launch sites: a freshly split pane in `recreate_attach_window`
+/// (which persists the pane targets before calling this, so a failure here still leaves a
+/// usable, correctly-recorded window+split) and an already-open, confidently-idle pane in
+/// `relaunch_into_existing_window`. Factored out so host/container handling can't drift
+/// between the two call sites the way it did before this was one function.
+fn launch_into_agent_pane(
+    repo_root: &Path,
+    vcs: &config::Vcs,
+    cfg: &config::Config,
+    slug: &str,
+    s: &mut session::Session,
+    known_agent: Option<container::KnownAgent>,
+    resume: bool,
+) -> anyhow::Result<AttachLaunch> {
+    if s.container.is_some() {
+        let cmd = attach_recreate_container_cmd(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+        let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
+        tmux::send_keys(&s.tmux.agent_pane, &keys)?;
+        return Ok(AttachLaunch::Container);
+    }
+    match s.agent.clone() {
+        Some(name) => {
+            let cmd = agent_command(Some(&name), known_agent, false, resume);
+            let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
+            tmux::send_keys(&s.tmux.agent_pane, &keys)?;
+            Ok(AttachLaunch::Agent {
+                resumed: resume_will_apply(known_agent, resume),
+                name,
+            })
+        }
+        // No agent recorded and no `cfg.agent` to fall back to (UC-5). Reachable from both
+        // call sites — `recreate_attach_window`'s window-missing path, and
+        // `relaunch_into_existing_window`'s idle-pane path, since `agent_pane_status` reports
+        // `Idle` for a bare shell whether or not an agent is recorded (see
+        // `host_session_with_no_recorded_agent_at_a_shell_reads_as_idle_but_relaunches_nothing`).
+        None => Ok(AttachLaunch::NoAgentKnown),
+    }
+}
+
+/// The `Note:` printed after either attach path when no agent could be determined at all
+/// (UC-5) — indented as a detail line under the headline it follows, same as `am start`'s own
+/// detail lines and the old container-recreate note this replaces.
+fn print_no_agent_known_note(slug: &str, no_agent_known: bool) {
+    if no_agent_known {
+        println!(
+            "  {} am attach does not know which agent to launch — run 'am run {slug} <agent>'",
+            note_prefix()
+        );
+    }
+}
+
+fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
+    let (repo_root, vcs) = find_repo_root()?;
+    if let Err(e) = session::migrate_sessions(&repo_root) {
+        eprintln!("{} session migration failed: {e}", warning_prefix());
+    }
+    let sessions = session::load_sessions_for_repo(&repo_root)?;
+
+    let mut s = session::find_session(&sessions, slug)
+        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?
+        .clone();
+
+    if !tmux::is_in_tmux() {
+        return Err(error::AmError::NotInTmux.into());
+    }
+
+    let cfg = load_config(&repo_root)?;
+
+    // OQ-1: a record written before `Session.agent` existed falls back to `cfg.agent`,
+    // mirroring cmd_start's own `--agent` > `cfg.agent` precedence minus the flag (attach has
+    // none — A5). Persisted immediately — independent of whatever happens below — so a later
+    // attach doesn't re-derive it from config, which may have changed since.
+    if s.agent.is_none() {
+        if let Some(cfg_agent) = cfg.agent.clone() {
+            s.agent = Some(cfg_agent);
+            session::update_session_global(s.clone())?;
+        }
+    }
+    // `cmd_start` validates `--agent` via `KnownAgent::parse` before writing a session, but
+    // `cmd_run`'s `agent` argument has no such validator (see `agent_command`'s doc comment)
+    // and is persisted verbatim — so a parse failure here is an expected, reachable case
+    // (e.g. `am run <slug> some-typo`), not a "should not happen" one. Handled the same way
+    // either way: not propagated as an error, `agent_command` still launches the bare
+    // string, just without resume/auto flags.
+    let known_agent = s
+        .agent
+        .as_deref()
+        .and_then(|name| container::KnownAgent::parse(name).ok());
+    let resume = !fresh && cfg.attach.resume;
+
+    let window_target = s
+        .tmux
+        .tmux_window_id
+        .clone()
+        .unwrap_or_else(|| s.tmux.tmux_window.clone());
+
+    if tmux::select_window(&window_target).is_err() {
+        // Persists its own changes internally — see its doc comment for why that can't wait
+        // until this function returns.
+        recreate_attach_window(&repo_root, &vcs, &cfg, slug, &mut s, known_agent, resume)?;
+    } else {
+        match agent_pane_status(&s) {
+            PaneStatus::Idle => {
+                // Also persists its own changes internally.
+                relaunch_into_existing_window(&repo_root, &vcs, &cfg, slug, &mut s, known_agent, resume)?;
+            }
+            PaneStatus::Running | PaneStatus::Ambiguous => {
+                println!("Attached to session '{slug}'.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── am run ────────────────────────────────────────────────────────────────────
+
+fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
     let (repo_root, _) = find_repo_root()?;
     if let Err(e) = session::migrate_sessions(&repo_root) {
         eprintln!("{} session migration failed: {e}", warning_prefix());
@@ -1374,71 +1792,14 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
         return Err(error::AmError::NotInTmux.into());
     }
 
-    let window_name = &s.tmux.tmux_window;
-    let window_target = s.tmux.tmux_window_id.as_deref().unwrap_or(window_name);
-
-    // Try to switch to an existing window; if it's not there, create it.
-    if tmux::select_window(window_target).is_err() {
-        let cfg = load_config(&repo_root)?;
-        let window_id = tmux::create_window(window_name, &s.vcs.worktree_path)
-            .map_err(|e| anyhow::anyhow!(
-                "{e}\nHint: a window named '{window_name}' may already exist — run 'am destroy {slug}' first"
-            ))?;
-        let (agent_pane_idx, shell_pane_idx, split_before) = pane_layout(&cfg.tmux.agent_pane);
-        tmux::split_window(
-            &window_id,
-            &s.vcs.worktree_path,
-            &cfg.tmux.split,
-            cfg.tmux.split_percent,
-            split_before,
-            None,
-        )?;
-        tmux::select_pane(&tmux::get_pane_id(&window_id, shell_pane_idx))?;
-        tmux::select_window(&window_id)?;
-        s.tmux.tmux_window_id = Some(window_id.clone());
-        s.tmux.agent_pane = tmux::get_pane_id(&window_id, agent_pane_idx);
-        s.tmux.shell_pane = tmux::get_pane_id(&window_id, shell_pane_idx);
-        session::update_session_global(s.clone())?;
-        println!("Opened new window for session '{slug}'.");
-        if s.container.is_some() {
-            let color_enabled = color::enabled(color::Stream::Stdout);
-            // `note_prefix()` already carries its own color; dimming this line too would
-            // nest a second color inside it, the same case `render_init_report`'s own
-            // `.gitignore` advisory line handles by keeping the prefix at its own severity
-            // and leaving only the rest of the line plain.
-            println!("  {} the container was stopped when the window closed.", note_prefix());
-            println!(
-                "{}",
-                onboarding::dim_line(
-                    &format!("To restart cleanly: am destroy --force {slug} && am start {slug}"),
-                    color_enabled
-                )
-            );
-        }
-    } else {
-        println!("Attached to session '{slug}'.");
-    }
-    Ok(())
-}
-
-// ── am run ────────────────────────────────────────────────────────────────────
-
-fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
-    let (repo_root, _) = find_repo_root()?;
-    if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("{} session migration failed: {e}", warning_prefix());
-    }
-    let sessions = session::load_sessions_for_repo(&repo_root)?;
-
-    let s = session::find_session(&sessions, slug)
-        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?;
-
-    if !tmux::is_in_tmux() {
-        return Err(error::AmError::NotInTmux.into());
-    }
-
     tmux::send_keys(&s.tmux.agent_pane, agent)?;
     tmux::select_window(s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window))?;
+
+    // Record what was actually run so a later `am attach` relaunches this, not whatever
+    // `cmd_start` originally recorded (or nothing, for a legacy record).
+    s.agent = Some(agent.to_string());
+    session::update_session_global(s)?;
+
     println!("Launched '{agent}' in session '{slug}'.");
     Ok(())
 }
@@ -2413,15 +2774,309 @@ mod tests {
 
     #[test]
     fn agent_command_is_empty_without_an_agent() {
-        assert!(agent_command(None, false).is_empty());
+        assert!(agent_command(None, None, false, false).is_empty());
     }
 
     #[test]
     fn agent_command_adds_auto_flags_only_in_auto_mode() {
-        assert_eq!(agent_command(Some(KnownAgent::Claude), false), vec!["claude"]);
         assert_eq!(
-            agent_command(Some(KnownAgent::Claude), true),
+            agent_command(Some("claude"), Some(KnownAgent::Claude), false, false),
+            vec!["claude"]
+        );
+        assert_eq!(
+            agent_command(Some("claude"), Some(KnownAgent::Claude), true, false),
             vec!["claude", "--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn agent_command_adds_resume_flags_only_when_requested() {
+        assert_eq!(
+            agent_command(Some("claude"), Some(KnownAgent::Claude), false, false),
+            vec!["claude"]
+        );
+        assert_eq!(
+            agent_command(Some("claude"), Some(KnownAgent::Claude), false, true),
+            vec!["claude", "--continue"]
+        );
+    }
+
+    #[test]
+    fn agent_command_combines_auto_and_resume_flags() {
+        assert_eq!(
+            agent_command(Some("claude"), Some(KnownAgent::Claude), true, true),
+            vec!["claude", "--dangerously-skip-permissions", "--continue"]
+        );
+    }
+
+    #[test]
+    fn agent_command_degrades_to_a_bare_command_for_an_unrecognized_name() {
+        // Defensive path (see cmd_attach's OQ-1 handling): a raw agent name that fails
+        // KnownAgent::parse still launches, just with no auto/resume flags — never a
+        // silent no-op.
+        assert_eq!(
+            agent_command(Some("some-custom-agent"), None, true, true),
+            vec!["some-custom-agent"]
+        );
+    }
+
+    // ── cmd_attach: OQ-6 pane status ────────────────────────────────────────────
+
+    use super::{agent_pane_status, is_shell_process, PaneStatus};
+    use crate::session::{Session, SessionContainer, TmuxMetadata, VcsMetadata};
+    use std::sync::Mutex;
+
+    // Mutex to serialise all tests that set AM_TMUX_BIN / MOCK_TMUX_PANE_CMD — RUST_TEST_
+    // THREADS=1 already serialises the whole binary (see CLAUDE.md's exec-mock note), but the
+    // mutex documents the real constraint independent of that global setting.
+    static PANE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn attach_test_session(slug: &str) -> Session {
+        Session {
+            slug: slug.to_string(),
+            created_at: chrono::Utc::now(),
+            auto: false,
+            repo_root: std::path::PathBuf::new(),
+            vcs: VcsMetadata {
+                branch: format!("am/{slug}"),
+                worktree_path: std::path::PathBuf::from(format!(".am/worktrees/{slug}")),
+            },
+            tmux: TmuxMetadata {
+                tmux_window: format!("am-{slug}"),
+                tmux_window_id: None,
+                agent_pane: format!("am-{slug}.1"),
+                shell_pane: format!("am-{slug}.0"),
+                original_window_name: None,
+                original_shell_dir: None,
+            },
+            container: None,
+            agent: None,
+        }
+    }
+
+    /// Point `AM_TMUX_BIN` at a script that answers `display-message` with
+    /// `$MOCK_TMUX_PANE_CMD`, mirroring `tmux.rs`'s own test mock (`pane_current_command`'s
+    /// unit tests live there; this only needs the same protocol, not the whole harness).
+    struct MockPaneCmd {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl MockPaneCmd {
+        fn set(current: &str) -> Self {
+            let guard = PANE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let script = tmp.path().join("mock_tmux");
+            std::fs::write(&script, "#!/bin/sh\necho \"$MOCK_TMUX_PANE_CMD\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+            std::env::set_var("AM_TMUX_BIN", &script);
+            std::env::set_var("MOCK_TMUX_PANE_CMD", current);
+            Self {
+                _guard: guard,
+                _tmp: tmp,
+            }
+        }
+
+        fn failing() -> Self {
+            let guard = PANE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let script = tmp.path().join("mock_tmux_fail");
+            std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+            std::env::set_var("AM_TMUX_BIN", &script);
+            Self {
+                _guard: guard,
+                _tmp: tmp,
+            }
+        }
+    }
+
+    impl Drop for MockPaneCmd {
+        fn drop(&mut self) {
+            std::env::remove_var("AM_TMUX_BIN");
+            std::env::remove_var("MOCK_TMUX_PANE_CMD");
+        }
+    }
+
+    #[test]
+    fn is_shell_process_recognizes_common_shells() {
+        for name in ["bash", "zsh", "sh", "dash", "fish", "ksh", "tcsh", "csh"] {
+            assert!(is_shell_process(name), "{name} should read as a shell");
+        }
+    }
+
+    #[test]
+    fn is_shell_process_strips_the_login_shell_dash() {
+        assert!(is_shell_process("-bash"));
+    }
+
+    #[test]
+    fn is_shell_process_rejects_an_agent_name() {
+        assert!(!is_shell_process("claude"));
+        assert!(!is_shell_process("podman"));
+    }
+
+    #[test]
+    fn host_session_running_agent_reads_as_running() {
+        let _mock = MockPaneCmd::set("claude");
+        let mut s = attach_test_session("feat");
+        s.agent = Some("claude".to_string());
+        assert_eq!(agent_pane_status(&s), PaneStatus::Running);
+    }
+
+    #[test]
+    fn host_session_bare_shell_reads_as_idle() {
+        let _mock = MockPaneCmd::set("bash");
+        let mut s = attach_test_session("feat");
+        s.agent = Some("claude".to_string());
+        assert_eq!(agent_pane_status(&s), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn host_session_unrecognized_process_reads_as_ambiguous() {
+        // A shim interpreter (node/python/...) rather than the agent's own name (OQ-6) —
+        // must bias toward "leave it alone", not "idle".
+        let _mock = MockPaneCmd::set("node");
+        let mut s = attach_test_session("feat");
+        s.agent = Some("claude".to_string());
+        assert_eq!(agent_pane_status(&s), PaneStatus::Ambiguous);
+    }
+
+    #[test]
+    fn host_session_with_no_recorded_agent_at_a_shell_reads_as_idle_but_relaunches_nothing() {
+        // Nothing is recorded to compare against, so this can never read as `Running`; a
+        // bare shell still reads as `Idle` (it is, after all, confidently a shell) — but
+        // `relaunch_into_existing_window` has nothing to launch either way when `s.agent`
+        // is `None`, so the net effect is the same no-op as `Ambiguous` would produce.
+        let _mock = MockPaneCmd::set("bash");
+        let s = attach_test_session("feat");
+        assert_eq!(agent_pane_status(&s), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn host_session_with_no_recorded_agent_and_unrecognized_process_is_ambiguous() {
+        let _mock = MockPaneCmd::set("node");
+        let s = attach_test_session("feat");
+        assert_eq!(agent_pane_status(&s), PaneStatus::Ambiguous);
+    }
+
+    #[test]
+    fn container_session_running_reads_as_running() {
+        let _mock = MockPaneCmd::set("podman");
+        let mut s = attach_test_session("feat");
+        s.container = Some(SessionContainer::image_mode(
+            "podman".to_string(),
+            "img:latest".to_string(),
+        ));
+        assert_eq!(agent_pane_status(&s), PaneStatus::Running);
+    }
+
+    #[test]
+    fn container_session_bare_shell_reads_as_idle() {
+        // The container is PID 1 for its own runtime process; once that exits, the pane
+        // reverts to a shell — no agent-specific comparison needed for this case.
+        let _mock = MockPaneCmd::set("bash");
+        let mut s = attach_test_session("feat");
+        s.container = Some(SessionContainer::image_mode(
+            "podman".to_string(),
+            "img:latest".to_string(),
+        ));
+        assert_eq!(agent_pane_status(&s), PaneStatus::Idle);
+    }
+
+    #[test]
+    fn container_session_unrecognized_process_reads_as_ambiguous() {
+        let _mock = MockPaneCmd::set("weird-process");
+        let mut s = attach_test_session("feat");
+        s.container = Some(SessionContainer::image_mode(
+            "podman".to_string(),
+            "img:latest".to_string(),
+        ));
+        assert_eq!(agent_pane_status(&s), PaneStatus::Ambiguous);
+    }
+
+    #[test]
+    fn a_failed_tmux_query_is_ambiguous_not_idle() {
+        let _mock = MockPaneCmd::failing();
+        let mut s = attach_test_session("feat");
+        s.agent = Some("claude".to_string());
+        assert_eq!(agent_pane_status(&s), PaneStatus::Ambiguous);
+    }
+
+    // ── cmd_attach: resume wording and output messages ─────────────────────────
+
+    use super::{
+        attach_recreate_message, attach_relaunch_message, resume_will_apply, AttachLaunch,
+    };
+
+    #[test]
+    fn resume_will_apply_is_false_when_resume_not_requested() {
+        assert!(!resume_will_apply(Some(KnownAgent::Claude), false));
+    }
+
+    #[test]
+    fn resume_will_apply_is_false_without_a_known_agent() {
+        assert!(!resume_will_apply(None, true));
+    }
+
+    #[test]
+    fn resume_will_apply_is_true_for_a_known_agent_when_requested() {
+        assert!(resume_will_apply(Some(KnownAgent::Claude), true));
+    }
+
+    #[test]
+    fn attach_recreate_message_variants() {
+        assert_eq!(
+            attach_recreate_message("feat", &AttachLaunch::NoAgentKnown),
+            "Opened new window for session 'feat'."
+        );
+        assert_eq!(
+            attach_recreate_message(
+                "feat",
+                &AttachLaunch::Agent {
+                    name: "claude".to_string(),
+                    resumed: false
+                }
+            ),
+            "Opened new window for session 'feat' and relaunched 'claude'."
+        );
+        assert_eq!(
+            attach_recreate_message(
+                "feat",
+                &AttachLaunch::Agent {
+                    name: "claude".to_string(),
+                    resumed: true
+                }
+            ),
+            "Opened new window for session 'feat' and relaunched 'claude' (resuming)."
+        );
+        assert_eq!(
+            attach_recreate_message("feat", &AttachLaunch::Container),
+            "Opened new window for session 'feat' and restarted the container."
+        );
+    }
+
+    #[test]
+    fn attach_relaunch_message_variants() {
+        assert_eq!(
+            attach_relaunch_message(
+                "feat",
+                &AttachLaunch::Agent {
+                    name: "claude".to_string(),
+                    resumed: true
+                }
+            ),
+            "Attached to session 'feat'; agent had exited — relaunched 'claude' (resuming)."
+        );
+        assert_eq!(
+            attach_relaunch_message("feat", &AttachLaunch::Container),
+            "Attached to session 'feat'; container had exited — restarted it."
         );
     }
 

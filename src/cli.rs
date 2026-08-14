@@ -77,10 +77,13 @@ pub enum Commands {
         all: bool,
     },
 
-    /// Attach tmux focus to an existing session
+    /// Attach tmux focus to an existing session, restoring the agent if it isn't running
     Attach {
         #[arg(value_parser = validate_slug)]
         slug: String,
+        /// Skip resuming the previous conversation; launch/relaunch fresh
+        #[arg(long)]
+        fresh: bool,
     },
 
     /// Launch an agent in an existing session's agent pane
@@ -241,5 +244,26 @@ mod tests {
     #[test]
     fn init_still_parses_with_no_arguments() {
         assert!(matches!(parse(&["am", "init"]), Commands::Init));
+    }
+
+    // ── am attach ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn attach_defaults_to_no_fresh() {
+        match parse(&["am", "attach", "feat"]) {
+            Commands::Attach { slug, fresh } => {
+                assert_eq!(slug, "feat");
+                assert!(!fresh);
+            }
+            _ => panic!("expected Attach"),
+        }
+    }
+
+    #[test]
+    fn attach_accepts_fresh_flag() {
+        match parse(&["am", "attach", "feat", "--fresh"]) {
+            Commands::Attach { fresh, .. } => assert!(fresh),
+            _ => panic!("expected Attach"),
+        }
     }
 }

@@ -402,29 +402,93 @@ bugfix  —          —     /home/user/proj/.am/worktrees/bugfix am-bugfix 2026
 
 ## `am attach <slug>`
 
-Attach to an existing session's tmux window.
+Switch to an existing session's tmux window, restoring the agent — and, for a containerized
+session, the container itself — if either isn't running anymore.
 
 **Usage**
 
 ```sh
-am attach <slug>
+am attach <slug> [--fresh]
 ```
 
-Switches the current tmux client to the `am-<slug>` window. If the window does not exist (for example, after a system restart), `am attach` creates a new window and split for the session — it does not error.
+**Options**
+
+| Option | Description |
+|---|---|
+| `--fresh` | Skip resuming the previous conversation for this invocation only; relaunch with a fresh conversation regardless of `[attach].resume`. |
+
+The motivating case is a machine reboot: the git worktree (or jj workspace) and the session
+record both survive, but tmux and the agent process do not. `am attach` now fixes that in one
+command instead of leaving you with an empty window.
+
+**What it does**
+
+`am attach` checks the state the session is actually in and does the least work needed to fix it:
+
+1. **Window open, agent still running** (the common case) — switches to the window. No relaunch, no container work, just one tmux query to confirm the agent pane's foreground process is what it should be. Prints `Attached to session '<slug>'.`
+2. **Window open, but the agent pane went idle** (the agent crashed, was killed, or exited) — relaunches the recorded agent (or restarts the container, for a container session) directly into the existing pane via `send-keys`; the window and split are untouched. Prints `Attached to session '<slug>'; agent had exited — relaunched '<agent>' (resuming).` (containerized: `; container had exited — restarted it.`)
+3. **Window is gone entirely** — recreates the window and split, then relaunches the agent into the fresh agent pane; for a containerized session, recreates the container first and hands the run command to the split. Prints `Opened new window for session '<slug>' and relaunched '<agent>' (resuming).` (containerized: `and restarted the container.`)
+
+Deciding a pane is idle is deliberately conservative: if the foreground process can't be
+confidently matched to either the recorded agent/container or a bare shell — an unrecognized
+process name, a failed tmux query, a pane target that's gone — `am attach` treats it as still
+running and does nothing. A missed relaunch just costs you an `am run`; relaunching on top of a
+live agent could interrupt real work.
+
+**Which agent gets relaunched.** Whatever `am start --agent <agent>` or the most recently run
+`am run <slug> <agent>` launched into the session — `am run` updates the recorded agent on
+success, so attach always relaunches what actually ran last. Session records written before
+this feature existed have no agent on file; `am attach` falls back to the current `agent` from
+config and remembers that choice for next time. If there's no configured agent either, it opens
+the window/pane with nothing launched and adds:
+
+```
+Note: am attach does not know which agent to launch — run 'am run <slug> <agent>'
+```
+
+**Resuming the previous conversation.** By default, a relaunch asks the agent to resume its
+previous conversation instead of starting cold — `--continue` for Claude and Copilot,
+`--resume latest` for Gemini, `resume --last` for Codex. Skip it for one invocation with
+`am attach <slug> --fresh`, or by default with `resume = false` under `[attach]` in config (see
+[Configuration](configuration.md#attach)). Whether resume actually finds a conversation to pick
+up is entirely up to the agent CLI — `am` only forwards the flag.
+
+**Recreating a container.** Because the container is genuinely gone, recreating it re-runs the
+same preflight `am start` does — runtime detection, credential validation, and, in devcontainer
+mode, an image rebuild if the previously built image no longer exists. That means this path can
+be as slow as `am start`, and can fail the same ways: a container runtime that isn't running
+(common right after a reboot, before the podman/docker service comes up), a missing credential
+directory, a devcontainer config that no longer builds. The window and split are created first,
+so a preflight failure leaves you with a real, addressable window rather than a dead end — the
+error is reported, and re-running `am attach` after fixing the underlying problem picks up where
+it left off. This is a deliberate trade for actually fixing the reboot case; the already-running
+fast path (state 1 above) is unaffected and stays instant.
+
+!!! warning "An expired credential is not caught by preflight"
+    Credential preflight only checks that the agent's credential *path* exists — `~/.claude`
+    (or `$CLAUDE_CONFIG_DIR`), `~/.config/gh`, `~/.gemini`, `~/.codex/auth.json` or a non-empty
+    `OPENAI_API_KEY`. An expired or revoked token leaves that path in place, so preflight
+    passes, `am attach` reports `... and restarted the container.`, and the authentication
+    failure appears only as agent output inside the pane — `am` still exits `0`. If you script
+    `am attach`, do not read its exit status as "the agent is working."
+
+!!! note "Which pane has focus after a failed container preflight"
+    A preflight failure returns before `am` selects the shell pane, so you land on the agent
+    pane rather than the shell pane. The new window itself is focused either way.
 
 **Example output**
 
-When the window is recreated for a session that has a container, a `Note:` call-out follows,
-with a dimmed line underneath it showing how to restart cleanly:
-
 ```
-Opened new window for session 'demo'.
-  Note: the container was stopped when the window closed.
-  To restart cleanly: am destroy --force demo && am start demo
+Opened new window for session 'demo' and relaunched 'claude' (resuming).
 ```
 
-The `Note:` line uses the same yellow severity as every other note in `am`. If the window already
-exists, `am attach` just switches to it and prints `Attached to session '<slug>'.` with no detail.
+```
+Attached to session 'demo'; agent had exited — relaunched 'claude' (resuming).
+```
+
+```
+Opened new window for session 'demo' and restarted the container.
+```
 
 !!! warning "Requires tmux"
     `am attach` must be run from inside a tmux session. If `$TMUX` is not set, the command exits with an error. To get a terminal inside an existing session without tmux, navigate directly to `.am/worktrees/<slug>`.
@@ -442,6 +506,8 @@ am run <slug> <agent>
 ```
 
 Uses `tmux send-keys` to send the specified agent command to the agent pane of the `am-<slug>` window, followed by Enter. This is useful for (re)starting an agent in a session that was started without one, or after the agent process has exited.
+
+On success, `am run` also records `<agent>` as the session's agent, so a later [`am attach`](#am-attach-slug) relaunches whatever was actually run last rather than whatever `am start` originally recorded.
 
 **Example**
 
