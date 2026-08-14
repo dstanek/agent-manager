@@ -837,7 +837,7 @@ const LAYOUT_PRESET_LABELS: [&str; 4] = [
 /// level `tmux.*` override outranks the global file for this repo specifically, so an answer
 /// here would otherwise look like it silently did nothing the next time a session starts in
 /// this repo.
-const PROJECT_LAYOUT_OVERRIDE_NOTE: &str = "Note: this project's config already sets its own \
+const PROJECT_LAYOUT_OVERRIDE_NOTE: &str = "this project's config already sets its own \
     pane layout — your answer here is saved globally and won't change sessions in this repo \
     until that override is removed.";
 
@@ -978,7 +978,10 @@ pub fn ask_layout(
             color,
         ));
         if layout_has_project_override(detected) {
-            io.println(PROJECT_LAYOUT_OVERRIDE_NOTE);
+            io.println(&format!(
+                "{} {PROJECT_LAYOUT_OVERRIDE_NOTE}",
+                color::note_prefix(color)
+            ));
         }
         io.println("");
         for (index, (side, split, percent)) in LAYOUT_PRESETS.iter().enumerate() {
@@ -3370,14 +3373,36 @@ custom_key = "left alone"
         );
 
         state.effective_tmux_split_percent.source = Source::Project;
+
+        // Uncolored: the caveat line is exactly the prefix + a space + the message, not just
+        // a substring of the message — a dropped `note_prefix()` call must fail this.
         let mut io = ScriptedIo::new(&[""]);
         ask_layout(&mut io, &state, false).unwrap();
+        let expected_line = format!(
+            "{} {PROJECT_LAYOUT_OVERRIDE_NOTE}",
+            color::note_prefix(false)
+        );
         assert!(
-            io.output
-                .contains("this project's config already sets its own pane layout"),
-            "{}",
+            io.output.contains(&expected_line),
+            "expected line {expected_line:?} in {}",
             io.output
         );
+
+        // Colored: the escape codes wrap the "Note:" label alone, and the message that
+        // follows is untouched plain text — same shape `note_prefix`'s own unit tests pin,
+        // asserted here at the call site so this path isn't left unexercised.
+        let mut io = ScriptedIo::new(&[""]);
+        ask_layout(&mut io, &state, true).unwrap();
+        let expected_colored_line = format!(
+            "{} {PROJECT_LAYOUT_OVERRIDE_NOTE}",
+            color::note_prefix(true)
+        );
+        assert!(
+            io.output.contains(&expected_colored_line),
+            "expected line {expected_colored_line:?} in {}",
+            io.output
+        );
+        assert!(io.output.contains("\x1b[33mNote:\x1b[0m"), "{}", io.output);
     }
 
     // ── render_layout ─────────────────────────────────────────────────────────

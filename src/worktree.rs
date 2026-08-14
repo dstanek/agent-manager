@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::color;
 use crate::command::{run_built_command, run_built_command_output, run_command};
 use crate::error::AmError;
 
@@ -236,8 +237,9 @@ impl Drop for WorktreeGuard<'_> {
         // a panic here would replace the real failure with a less useful one.
         if let Err(e) = result {
             eprintln!(
-                "warning: could not roll back worktree {}: {e}\n\
+                "{} could not roll back worktree {}: {e}\n\
                  Remove it manually before retrying 'am start {}'.",
+                color::warning_prefix(color::enabled(color::Stream::Stderr)),
                 self.path.display(),
                 self.slug
             );

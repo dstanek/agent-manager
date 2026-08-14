@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::color;
 use crate::command::shell_quote;
 use crate::config::{NetworkMode, RuntimePreference, Vcs};
 use crate::error::AmError;
@@ -557,22 +558,29 @@ pub fn validate_agent_credentials(agent: KnownAgent) -> Result<()> {
 /// same guarantee `validate_agent_credentials` itself makes; never prints or implies
 /// anything about whether the credentials found are still *valid*, only how to obtain some.
 /// Used exclusively as `doctor::check_agent`'s `Status::Fail` hint.
+///
+/// Points at the published docs site rather than a repo-relative path — most users run an
+/// installed binary and never cloned the repo, so `docs/guides/codex.md#prerequisites` is
+/// meaningless to them. `mkdocs.yml` sets `site_url` and leaves `use_directory_urls` at its
+/// default of `true`, so `docs/guides/<name>.md#<anchor>` publishes as
+/// `<site_url>/guides/<name>/#<anchor>` — verified against a local `mkdocs build`.
 pub fn credentials_hint(agent: KnownAgent) -> &'static str {
     match agent {
         KnownAgent::Claude => {
             "run 'claude auth login' (or set ANTHROPIC_API_KEY) — see \
-             docs/guides/claude-code.md#prerequisites"
+             https://dstanek.github.io/agent-manager/guides/claude-code/#prerequisites"
         }
         KnownAgent::Copilot => {
-            "run 'gh auth login' — see docs/guides/github-copilot.md#prerequisites"
+            "run 'gh auth login' — see \
+             https://dstanek.github.io/agent-manager/guides/github-copilot/#prerequisites"
         }
         KnownAgent::Gemini => {
             "authenticate with the Gemini CLI on this host — see \
-             docs/guides/gemini.md#prerequisites"
+             https://dstanek.github.io/agent-manager/guides/gemini/#prerequisites"
         }
         KnownAgent::Codex => {
             "run 'codex' once to sign in (or set OPENAI_API_KEY) — see \
-             docs/guides/codex.md#prerequisites"
+             https://dstanek.github.io/agent-manager/guides/codex/#prerequisites"
         }
     }
 }
@@ -922,7 +930,8 @@ pub fn remove_if_exists(runtime: &ContainerRuntime, container_name: &str) {
     if exists {
         let _ = run_container_cmd(runtime, &["rm", "-f", container_name]);
         eprintln!(
-            "warning: removed existing container '{container_name}' from a previous unclean run"
+            "{} removed existing container '{container_name}' from a previous unclean run",
+            color::warning_prefix(color::enabled(color::Stream::Stderr))
         );
     }
 }
@@ -2303,17 +2312,22 @@ mod tests {
     fn credentials_hint_names_a_concrete_command_per_agent() {
         assert!(credentials_hint(KnownAgent::Claude).contains("claude auth login"));
         assert!(credentials_hint(KnownAgent::Claude).contains("ANTHROPIC_API_KEY"));
-        assert!(credentials_hint(KnownAgent::Claude).contains("docs/guides/claude-code.md#prerequisites"));
+        assert!(credentials_hint(KnownAgent::Claude)
+            .contains("https://dstanek.github.io/agent-manager/guides/claude-code/#prerequisites"));
 
         assert!(credentials_hint(KnownAgent::Copilot).contains("gh auth login"));
-        assert!(credentials_hint(KnownAgent::Copilot).contains("docs/guides/github-copilot.md#prerequisites"));
+        assert!(credentials_hint(KnownAgent::Copilot).contains(
+            "https://dstanek.github.io/agent-manager/guides/github-copilot/#prerequisites"
+        ));
 
         assert!(credentials_hint(KnownAgent::Gemini).contains("Gemini CLI"));
-        assert!(credentials_hint(KnownAgent::Gemini).contains("docs/guides/gemini.md#prerequisites"));
+        assert!(credentials_hint(KnownAgent::Gemini)
+            .contains("https://dstanek.github.io/agent-manager/guides/gemini/#prerequisites"));
 
         assert!(credentials_hint(KnownAgent::Codex).contains("codex"));
         assert!(credentials_hint(KnownAgent::Codex).contains("OPENAI_API_KEY"));
-        assert!(credentials_hint(KnownAgent::Codex).contains("docs/guides/codex.md#prerequisites"));
+        assert!(credentials_hint(KnownAgent::Codex)
+            .contains("https://dstanek.github.io/agent-manager/guides/codex/#prerequisites"));
     }
 
     #[test]

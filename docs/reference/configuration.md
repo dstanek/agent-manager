@@ -133,7 +133,7 @@ Output that is meant to become a file is never colored — `am generate-config` 
 | `NO_COLOR` | Set to any non-empty value to disable color. Wins over everything else. |
 | `CLICOLOR_FORCE` | Set to any non-empty value other than `0` to force color on, even when output is piped — useful for `less -R` or a CI log viewer that renders ANSI. |
 
-Each stream is decided independently, so `am doctor > report.txt` still colors the warnings that go to stderr. Piped output is plain by default.
+Each stream is decided independently, so `am start > report.txt` still colors a warning like "removed existing container from a previous unclean run" that goes to stderr, even while stdout is redirected to a file. Piped output is plain by default.
 
 ### Binary path overrides
 

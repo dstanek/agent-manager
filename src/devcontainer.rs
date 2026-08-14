@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::color;
+
 use crate::error::AmError;
 
 // Path handling strategy: keep Path/PathBuf internally, convert at argv boundaries.
@@ -997,21 +999,22 @@ pub fn apply_trust(
         runtime.cap_add = resolved.cap_add.clone();
         runtime.run_args = resolved.run_args.clone();
     } else {
+        let note = color::note_prefix(color::enabled(color::Stream::Stderr));
         if resolved.privileged {
             eprintln!(
-                "note: this devcontainer asks for --privileged; am is not granting it. \
+                "{note} this devcontainer asks for --privileged; am is not granting it. \
                  Set devcontainer.allow_host_commands = true to allow it."
             );
         }
         if !resolved.cap_add.is_empty() {
             eprintln!(
-                "note: not granting capabilities requested by this devcontainer: {}",
+                "{note} not granting capabilities requested by this devcontainer: {}",
                 resolved.cap_add.join(", ")
             );
         }
         if !resolved.run_args.is_empty() {
             eprintln!(
-                "note: ignoring runArgs from this devcontainer: {}",
+                "{note} ignoring runArgs from this devcontainer: {}",
                 resolved.run_args.join(" ")
             );
         }
