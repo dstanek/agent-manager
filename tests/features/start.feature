@@ -26,3 +26,17 @@ Feature: am start — create an isolated agent session
     When I run "am start my-feature --auto --no-container"
     Then the command fails
     And the output contains "--no-container"
+
+  Scenario: start shortens the worktree path relative to the repo root
+    When I run "am start my-feature"
+    Then the command succeeds
+    And the output contains "worktree:  .am/worktrees/my-feature"
+    And the output does not contain the project's absolute path
+
+  Scenario: start's headline stays plain while its detail lines are dimmed
+    Given I have set env "NO_COLOR" to ""
+    And I have set env "CLICOLOR_FORCE" to "1"
+    When I run "am start my-feature"
+    Then the command succeeds
+    And the output contains the plain line "Started session 'my-feature'"
+    And the output contains the dimmed line "worktree:  .am/worktrees/my-feature"

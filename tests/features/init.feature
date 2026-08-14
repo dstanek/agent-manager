@@ -18,7 +18,20 @@ Feature: am init — initialize am in a repo
     # The headline itself stays flush left and plain — only the detail underneath it is
     # indented, and `am init` never dims (that's `am setup`'s treatment of the same report).
     And the output does not contain "  Initialized am in this repo."
-    And the output does not contain "\x1b[2m"
+
+  Scenario: init's report never dims, even when color is forced on
+    Given a git repository
+    # The check above (`does not contain "  Initialized am in this repo."`) runs under the
+    # harness's default `NO_COLOR=1`, where `am setup`'s dim treatment would render as plain
+    # text anyway — it can't tell "never dims" from "dims, but suppressed". Forcing color on
+    # is what actually exercises `render_init_report` calling `print_init_line_plain` (never
+    # `print_init_line_dim`) for `am init`'s own report.
+    And I have set env "NO_COLOR" to ""
+    And I have set env "CLICOLOR_FORCE" to "1"
+    When I run "am init"
+    Then the command succeeds
+    And the output contains the plain line "Initialized am in this repo."
+    And the output contains no color escape codes
 
   Scenario: init appends correctly when .gitignore lacks a trailing newline
     Given a git repository

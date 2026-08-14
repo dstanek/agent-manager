@@ -293,6 +293,22 @@ removed rather than left behind for you to clean up by hand.
 
 If `am start` is run outside of tmux, it creates the worktree and then launches the container directly (replacing the current shell process via `exec()`). No tmux window is created.
 
+**Example output**
+
+A headline states the outcome, followed by the indented detail behind it. The detail lines are
+dimmed, and the worktree path is shown relative to the repo root rather than as an absolute path:
+
+```
+Started session 'demo'
+  worktree:  .am/worktrees/demo
+  branch:    am/demo
+  container: am-demo-7a2305
+```
+
+In devcontainer mode, an `image:` line follows `container:`. Outside of tmux — the `exec()` path
+above — `branch:` and `image:` are omitted; that path only ever reports `worktree:` and
+`container:`.
+
 ---
 
 ## `am list`
@@ -354,6 +370,20 @@ am attach <slug>
 ```
 
 Switches the current tmux client to the `am-<slug>` window. If the window does not exist (for example, after a system restart), `am attach` creates a new window and split for the session — it does not error.
+
+**Example output**
+
+When the window is recreated for a session that has a container, a `Note:` call-out follows,
+with a dimmed line underneath it showing how to restart cleanly:
+
+```
+Opened new window for session 'demo'.
+  Note: the container was stopped when the window closed.
+  To restart cleanly: am destroy --force demo && am start demo
+```
+
+The `Note:` line uses the same yellow severity as every other note in `am`. If the window already
+exists, `am attach` just switches to it and prints `Attached to session '<slug>'.` with no detail.
 
 !!! warning "Requires tmux"
     `am attach` must be run from inside a tmux session. If `$TMUX` is not set, the command exits with an error. To get a terminal inside an existing session without tmux, navigate directly to `.am/worktrees/<slug>`.
