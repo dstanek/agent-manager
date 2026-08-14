@@ -44,15 +44,14 @@ Feature: am start and am attach with tmux
     And the mock tmux log contains "kill-window"
     And the mock tmux log contains "am-my-feature"
 
-  Scenario: attach to a container session with missing window suggests a clean restart
+  Scenario: attach to a container session with a missing window recreates the container
     Given am init has been run
     And I am using a mock container runtime
     And a session "my-feature" has been started
     And the tmux window no longer exists
     When I run "am attach my-feature"
     Then the command succeeds
-    And the output contains "  Note: the container was stopped when the window closed."
-    And the output contains "To restart cleanly: am destroy --force my-feature && am start my-feature"
+    And the output contains "Opened new window for session 'my-feature' and restarted the container."
 
   Scenario: attach's headline stays plain when its window is recreated
     Given a session "my-feature" has been started
@@ -63,7 +62,7 @@ Feature: am start and am attach with tmux
     Then the command succeeds
     And the output contains the plain line "Opened new window for session 'my-feature'."
 
-  Scenario: attach's restart note is colored like every other Note, and stays outside the dimmed hint under it
+  Scenario: attach's no-agent-known note is colored like every other Note
     Given am init has been run
     And I am using a mock container runtime
     And a session "my-feature" has been started
@@ -72,5 +71,5 @@ Feature: am start and am attach with tmux
     And I have set env "CLICOLOR_FORCE" to "1"
     When I run "am attach my-feature"
     Then the command succeeds
-    And the output contains the note line "the container was stopped when the window closed."
-    And the output contains the dimmed line "To restart cleanly: am destroy --force my-feature && am start my-feature"
+    And the output contains the plain line "Opened new window for session 'my-feature' and restarted the container."
+    And the output contains the note line "am attach does not know which agent to launch — run 'am run my-feature <agent>'"

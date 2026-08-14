@@ -4,6 +4,110 @@ Outstanding work for `am`. Items are grouped by theme and roughly ordered by pri
 
 ---
 
+## Session Recovery
+
+### Restore the Agent on `am attach`
+> Spec: [`specs/attach-restore-agent.md`](specs/attach-restore-agent.md)
+
+**Done.** Before this, `am attach` only ever restored the tmux *window* — a reboot survives at
+the worktree and session-record level, but tmux and the agent process do not, and `am attach`
+recreated an empty window (or, for a container session, printed a `Note:` telling you to run
+`am destroy --force <slug> && am start <slug>` by hand instead of fixing it).
+
+`Session.agent` is now recorded by `am start` and kept current by `am run`, so `am attach` knows
+what to relaunch. `am attach` checks the pane's actual state (`tmux::pane_current_command`,
+biased hard toward "still running" on any ambiguity — a missed relaunch costs an `am run`, an
+unwanted one can interrupt live work) and does the least work needed to fix it: an already-live
+session is an unchanged, instant no-op; a live window with an idle agent pane gets a
+`send-keys` relaunch in place; a fully gone window gets recreated (window, split, and — for a
+containerized session — the container itself, via a container-planning helper shared with `am
+start` so the two can't drift apart) before the agent is relaunched into it. Resume is on by
+default (`--continue` for Claude/Copilot, `--resume latest` for Gemini, `resume --last` for
+Codex, each verified against the CLI's own `--help`), with `am attach --fresh` and
+`[attach].resume = false` as opt-outs. A legacy record with no agent falls back to `cfg.agent`
+and persists the resolved value; if neither is available, `am` says so and points at `am run`.
+
+Two accepted trade-offs: recreating a container re-runs `am start`'s own preflight (credential
+validation, an image rebuild if pruned), so attach can now be as slow as, and fail the same ways
+as, `am start` — only when the container is genuinely gone. And if that preflight fails, the
+early return skips the shell-pane selection, so you land on the agent pane rather than the shell
+pane; the window and split are created first, so a retry has something real to act on.
+
+`cargo test` (528 unit tests + 120 cucumber scenarios) and
+`cargo clippy --all-targets -- -D warnings` both clean.
+
+Deferred code-review suggestions, not dropped:
+
+- [ ] The host relaunch path writes the session record twice
+      (`session::update_session_global`) where once would do — a redundant file write and lock
+      acquisition in the common case, harmless but avoidable.
+- [ ] A failed container-recreate preflight leaves focus on the agent pane instead of the shell
+      pane (see above) — the early return skips `select_pane`. Cosmetic; a retry corrects it.
+- [ ] `agent_command` appends auto flags before resume flags; harmless today because no agent
+      combines a non-empty `agent_auto_flags` with a subcommand-shaped resume form (like
+      Codex's `resume --last`, which must be the first token), but latent breakage for a future
+      agent that has both. Already flagged with an in-code comment at the call site.
+
+### Credential preflight checks presence, not validity
+
+**Open.** `container::validate_agent_credentials` only checks that an agent's credential *path*
+exists. An expired, revoked, or logged-out credential leaves that path in place, so preflight
+passes and `am` reports success while the agent fails to authenticate inside the pane. Per agent,
+the entire check is:
+
+| Agent | What is checked |
+|---|---|
+| Claude | `$CLAUDE_CONFIG_DIR`, else `~/.claude`, exists |
+| Copilot | `~/.config/gh` exists |
+| Gemini | `~/.gemini` exists |
+| Codex | `~/.codex/auth.json` exists, **or** `OPENAI_API_KEY` is set and non-empty |
+
+This is pre-existing behaviour inherited from `am start` — `am attach`'s container recreate
+reuses the same preflight via `plan_container_runtime`. What is new is that `am attach` now
+reaches this path at all, and that its success line actively asserts a recovery that may not have
+happened.
+
+**How to reach the broken state.** With a containerized session (`container.enabled = true`):
+
+1. `am start feat --agent claude`. The record gets `agent = "claude"` and a `SessionContainer`.
+2. Let the credential expire or revoke it — sign out on another machine, or simply wait out the
+   token lifetime. **Do not delete `~/.claude`**; sign-out and expiry both leave the directory
+   behind, and that is the entire point of the bug.
+3. Reboot, or otherwise kill tmux and the container. The worktree and `sessions.json` survive.
+4. `am attach feat`.
+
+Observed: `select_window` fails, so `recreate_attach_window` creates the window and split,
+persists the pane targets, and calls `attach_recreate_container_cmd` →
+`plan_container_runtime` → `validate_agent_credentials(Claude)` →
+`ensure_required_paths(&[~/.claude])`. The path exists, so the check passes. The run command is
+built and `send_keys`'d into the pane, and `am` prints
+
+```
+Opened new window for session 'feat' and restarted the container.
+```
+
+and exits `0`. The container starts, `claude --continue` runs inside it, and the authentication
+failure surfaces only as agent output in the pane — never as an `am` error, and never in the exit
+status. Anything scripting `am attach` sees a clean success.
+
+Contrast with the cases preflight *does* catch, which fail loudly and are recoverable: a
+container runtime that is not up yet (the common post-reboot case, caught by `detect_runtime`)
+or a credential directory that is genuinely absent. Both error after the window and split exist,
+and a retry after fixing the cause goes through `relaunch_into_existing_window` — the pane reads
+as a bare shell, so `agent_pane_status` returns `Idle` — and completes normally.
+
+Possible directions, none obviously right:
+
+- [ ] Have `am doctor` check credential *validity* rather than presence, and point `am attach` at
+      it on failure. Requires a per-agent liveness probe, which is agent-CLI-specific and may
+      require a network round-trip.
+- [ ] Do not claim recovery in the success line when `am` cannot confirm the agent came up —
+      soften `... and restarted the container.` to describe what was actually done.
+- [ ] Accept and document only. The failure is visible in the pane the user is looking at; the
+      real exposure is scripted/unattended use.
+
+---
+
 ## Agent Integrations
 
 ### Feature 7: Codex Integration
@@ -417,6 +521,10 @@ Follow-ups phase 1 left behind:
 - [ ] `postAttachCommand` is never run — `am attach` moves tmux focus rather than attaching
       to the container, so there is no attach event to hang it off. Needs a real
       "exec into the running container" attach path.
+      ([Restore the Agent on `am attach`](#restore-the-agent-on-am-attach) makes `am attach`
+      recreate a container that is genuinely gone — rerunning its create-time lifecycle hooks
+      via the same `lifecycle_done` bookkeeping `am start` uses — but that is not the same as
+      attaching to one that is already running; this gap is still open.)
 - [ ] Create-time lifecycle hooks re-run on every `am start` because containers are `--rm`.
       Correct given ephemeral containers, but a persistent-container mode would make the
       spec's once-per-container semantics achievable; `lifecycle_done` already records what

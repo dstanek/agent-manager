@@ -153,6 +153,11 @@ impl AmWorld {
     }
 
     /// Install a mock tmux binary that logs every invocation to a file.
+    ///
+    /// `display-message` (used by `tmux::pane_current_command`, OQ-6) echoes
+    /// `$MOCK_TMUX_PANE_CMD`, defaulting to `bash`, so a scenario can simulate whatever the
+    /// agent pane's foreground process is — see `given_pane_reports` — without a real tmux
+    /// server. The same protocol as the private mock in `src/tmux.rs`'s own unit tests.
     fn setup_mock_tmux(&mut self) {
         let bin = self.project_dir.path().join("mock_tmux");
         let log = self.project_dir.path().join("mock_tmux.log");
@@ -164,6 +169,9 @@ impl AmWorld {
              fi\n\
              if [ \"$1\" = \"new-window\" ]; then\n\
                  echo \"@1\"\n\
+             fi\n\
+             if [ \"$1\" = \"display-message\" ]; then\n\
+                 echo \"${MOCK_TMUX_PANE_CMD:-bash}\"\n\
              fi\n\
              exit 0\n",
         )
@@ -177,6 +185,11 @@ impl AmWorld {
     /// Install a mock tmux that fails the **first** `select-window` call and
     /// succeeds on all subsequent calls. Used to exercise the window
     /// re-creation path in `am attach`.
+    ///
+    /// Also answers `display-message` (see `setup_mock_tmux`'s doc) — used by scenarios that
+    /// combine "window gone" with a specific recorded `Session.agent`/container runtime,
+    /// even though the OQ-6 fast path is never reached once the window has to be recreated;
+    /// kept consistent so every scenario can rely on the same mock protocol.
     fn setup_mock_tmux_failing_select_window(&mut self) {
         let bin = self.project_dir.path().join("mock_tmux");
         let log = self.project_dir.path().join("mock_tmux.log");
@@ -197,11 +210,78 @@ impl AmWorld {
                  if [ \"$1\" = \"new-window\" ]; then\n\
                      echo \"@1\"\n\
                  fi\n\
+                 if [ \"$1\" = \"display-message\" ]; then\n\
+                     echo \"${{MOCK_TMUX_PANE_CMD:-bash}}\"\n\
+                 fi\n\
                  if [ \"$1\" = \"select-window\" ] && [ ! -f \"{flag_str}\" ]; then\n\
                      touch \"{flag_str}\"\n\
                      exit 1\n\
                  fi\n\
                  exit 0\n"
+            ),
+        )
+        .expect("write mock_tmux");
+        #[cfg(unix)]
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod mock_tmux");
+        self.mock_tmux_bin = Some(bin);
+        self.mock_tmux_log = Some(log);
+    }
+
+    /// Install a mock tmux where the *original* window (`@1`, the first `new-window` call in
+    /// any scenario using this mock — deterministic, since every scenario starts a fresh mock
+    /// with its own counter at 0) is permanently gone, simulating a reboot precisely: unlike
+    /// `setup_mock_tmux_failing_select_window`'s "fail the first `select-window` call, then
+    /// always succeed" approximation — which can't tell a genuinely-reused window apart from a
+    /// stale target that coincidentally works again — this mock tracks every window actually
+    /// created via `new-window` and only lets `select-window` succeed against one of those,
+    /// with `@1` permanently excluded. So a retry against a *stale, unpersisted* window target
+    /// still fails, while a retry against a freshly created and properly persisted one
+    /// succeeds — the exact distinction "a preflight failure must leave the session record
+    /// pointing at real panes" needs to prove anything.
+    fn setup_mock_tmux_original_window_gone_forever(&mut self) {
+        let bin = self.project_dir.path().join("mock_tmux");
+        let log = self.project_dir.path().join("mock_tmux.log");
+        let counter = self.project_dir.path().join("mock_tmux_window_counter");
+        let created = self.project_dir.path().join("mock_tmux_created_windows");
+        // Seeded at 1, not 0: this mock replaces whichever plain mock created the session's
+        // *original* window (during the "a session ... has been started" setup step, before
+        // this step runs) — that call already claimed `@1`. Starting this counter at 0 would
+        // hand the very next `new-window` call (the recreate this scenario exists to test)
+        // that same `@1`, silently colliding with the id this mock hardcodes as permanently
+        // gone and making every retry fail regardless of whether `am attach` persisted the
+        // right target.
+        fs::write(&counter, "1").expect("seed mock_tmux window counter");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"$MOCK_TMUX_LOG\" ]; then\n\
+                     echo \"$@\" >> \"$MOCK_TMUX_LOG\"\n\
+                 fi\n\
+                 if [ \"$1\" = \"new-window\" ]; then\n\
+                     n=$(( $(cat \"{counter}\" 2>/dev/null || echo 0) + 1 ))\n\
+                     echo \"$n\" > \"{counter}\"\n\
+                     echo \"@$n\" >> \"{created}\"\n\
+                     echo \"@$n\"\n\
+                     exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = \"display-message\" ]; then\n\
+                     echo \"${{MOCK_TMUX_PANE_CMD:-bash}}\"\n\
+                     exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = \"select-window\" ]; then\n\
+                     target=\"$3\"\n\
+                     if [ \"$target\" = \"@1\" ]; then\n\
+                         exit 1\n\
+                     fi\n\
+                     if [ -f \"{created}\" ] && grep -qxF \"$target\" \"{created}\"; then\n\
+                         exit 0\n\
+                     fi\n\
+                     exit 1\n\
+                 fi\n\
+                 exit 0\n",
+                counter = counter.to_string_lossy(),
+                created = created.to_string_lossy(),
             ),
         )
         .expect("write mock_tmux");
@@ -613,6 +693,21 @@ async fn given_session_started(world: &mut AmWorld, slug: String) {
     );
 }
 
+/// Like "a session {string} has been started", but records `Session.agent` at start time —
+/// the precondition most `am attach` relaunch scenarios need (a reboot recovers *something*
+/// only if something was recorded to recover).
+#[given(expr = "a session {string} has been started with agent {string}")]
+async fn given_session_started_with_agent(world: &mut AmWorld, slug: String, agent: String) {
+    world.run_am(&["start", &slug, "--agent", &agent]);
+    let output = world.last_output();
+    assert!(
+        output.status.success(),
+        "setup step 'am start {slug} --agent {agent}' failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[given("I am inside a tmux session")]
 async fn given_in_tmux(world: &mut AmWorld) {
     world.setup_mock_tmux();
@@ -621,6 +716,59 @@ async fn given_in_tmux(world: &mut AmWorld) {
 #[given("the tmux window no longer exists")]
 async fn given_tmux_window_gone(world: &mut AmWorld) {
     world.setup_mock_tmux_failing_select_window();
+}
+
+#[given("the original tmux window is gone forever")]
+async fn given_tmux_original_window_gone_forever(world: &mut AmWorld) {
+    world.setup_mock_tmux_original_window_gone_forever();
+}
+
+/// Truncates the mock tmux log. Several `am attach` scenarios assert the *absence* of a
+/// command (no `new-window`, no `send-keys`) to prove the fast/no-op path took no tmux
+/// action — but the log accumulates across every `am` invocation in the scenario, including
+/// a setup step's own "a session ... has been started", which already logged its own
+/// `new-window`/`send-keys` calls. Without clearing first, that setup noise is what an
+/// absence check would actually be looking at, making it pass or fail for the wrong reason
+/// regardless of what the command under test did.
+#[given("I clear the mock tmux log")]
+async fn given_clear_tmux_log(world: &mut AmWorld) {
+    let log = world
+        .mock_tmux_log
+        .as_ref()
+        .expect("mock tmux was not set up for this scenario");
+    fs::write(log, "").expect("truncate mock tmux log");
+}
+
+/// Drives OQ-6's `pane_current_command` query (`agent_pane_status`) by making the mock
+/// tmux's `display-message` responder echo a specific value instead of its `bash` default —
+/// simulates the agent pane's foreground process being the recorded agent/container runtime
+/// (UC-3, "running"), a bare shell (UC-4, "idle"), or anything else (ambiguous).
+#[given(expr = "the agent pane reports {string} as its current command")]
+async fn given_pane_reports(world: &mut AmWorld, cmd: String) {
+    world.extra_env.push(("MOCK_TMUX_PANE_CMD".to_string(), cmd));
+}
+
+/// Simulates a session record written before `Session.agent` existed: strips the `agent` key
+/// out of the persisted JSON entirely (not merely setting it to `null`), the same shape a
+/// pre-feature `sessions.json` has on disk. `#[serde(default)]` is what is supposed to make
+/// loading this still work — this step exists so a scenario can prove that against the real
+/// file, not just via the unit test alongside `legacy_records_without_repo_root_migrate_
+/// correctly`.
+#[given("the session file has no recorded agent")]
+async fn given_session_file_no_agent(world: &mut AmWorld) {
+    let path = world.global_sessions_path();
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("sessions.json not found at {path:?}"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).expect("sessions.json should be valid JSON");
+    if let Some(sessions) = value.get_mut("sessions").and_then(|v| v.as_array_mut()) {
+        for session in sessions {
+            if let Some(obj) = session.as_object_mut() {
+                obj.remove("agent");
+            }
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).expect("rewrite sessions.json");
 }
 
 #[given("I am using a mock container runtime")]

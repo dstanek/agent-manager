@@ -163,6 +163,26 @@ pub fn get_pane_id(window_target: &str, index: usize) -> String {
     format!("{window_target}.{index}")
 }
 
+/// The name of the foreground process currently running in `pane_target`
+/// (`tmux display-message -p -t <target> '#{pane_current_command}'`).
+///
+/// Used by `am attach` to tell whether an agent (or, for a container session, the
+/// container runtime) is still running in a pane before deciding whether to relaunch
+/// anything into it — see the module doc on `cmd_attach` for the safety bias this feeds.
+pub fn pane_current_command(pane_target: &str) -> Result<String> {
+    let bin = tmux_bin()?;
+    run_tmux_output(
+        &bin,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            pane_target,
+            "#{pane_current_command}",
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,9 +194,35 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Write a mock tmux script that appends its args to `$MOCK_TMUX_LOG`.
+    ///
+    /// `new-window` returns a fixed window ID, matching real tmux's `-P -F '#{window_id}'`
+    /// output. `display-message` (used by `pane_current_command`) echoes `$MOCK_TMUX_PANE_CMD`,
+    /// defaulting to `bash`, so tests can simulate whatever the pane's foreground process is
+    /// without a real tmux server.
     fn make_mock_tmux(dir: &Path) -> std::path::PathBuf {
         let script = dir.join("mock_tmux");
-        std::fs::write(&script, "#!/bin/sh\necho \"$*\" >> \"$MOCK_TMUX_LOG\"\nif [ \"$1\" = \"new-window\" ]; then echo '@1'; fi\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo \"$*\" >> \"$MOCK_TMUX_LOG\"\n\
+             if [ \"$1\" = \"new-window\" ]; then echo '@1'; fi\n\
+             if [ \"$1\" = \"display-message\" ]; then echo \"${MOCK_TMUX_PANE_CMD:-bash}\"; fi\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    /// Write a mock tmux script that always fails, to exercise error paths.
+    fn make_failing_mock_tmux(dir: &Path) -> std::path::PathBuf {
+        let script = dir.join("mock_tmux_fail");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"tmux: no such pane\" >&2\nexit 1\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
@@ -432,5 +478,48 @@ mod tests {
         assert!(out.contains("-t"));
         assert!(out.contains("am-feat"));
         assert!(out.contains("old-name"));
+    }
+
+    // ── pane_current_command ─────────────────────────────────────────────────
+
+    #[test]
+    fn pane_current_command_sends_correct_command() {
+        let mock = MockTmux::new();
+        pane_current_command("am-feat.1").unwrap();
+        let out = mock.captured();
+        assert!(out.contains("display-message"));
+        assert!(out.contains("-p"));
+        assert!(out.contains("-t"));
+        assert!(out.contains("am-feat.1"));
+        assert!(out.contains("#{pane_current_command}"));
+    }
+
+    #[test]
+    fn pane_current_command_returns_the_process_name() {
+        let _mock = MockTmux::new();
+        std::env::set_var("MOCK_TMUX_PANE_CMD", "claude");
+        let result = pane_current_command("am-feat.1").unwrap();
+        std::env::remove_var("MOCK_TMUX_PANE_CMD");
+        assert_eq!(result, "claude");
+    }
+
+    #[test]
+    fn pane_current_command_defaults_to_a_shell_in_the_mock() {
+        let _mock = MockTmux::new();
+        let result = pane_current_command("am-feat.1").unwrap();
+        assert_eq!(result, "bash");
+    }
+
+    #[test]
+    fn pane_current_command_propagates_tmux_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let bin = make_failing_mock_tmux(tmp.path());
+        std::env::set_var("AM_TMUX_BIN", &bin);
+
+        let err = pane_current_command("am-gone.1").unwrap_err();
+        std::env::remove_var("AM_TMUX_BIN");
+
+        assert!(err.to_string().contains("no such pane"));
     }
 }

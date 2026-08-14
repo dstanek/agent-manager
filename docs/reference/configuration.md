@@ -161,6 +161,12 @@ The `am start` command accepts flags that act as the highest-precedence override
 | `--agent <AGENT>` | Override the agent command for this session only. Must be a known agent integration: `claude`, `copilot`, `gemini`, `codex`. |
 | `--no-container` | Disable container isolation for this session. The agent runs directly in the tmux pane. |
 
+`am attach` accepts one flag of its own, overriding `[attach].resume` for a single invocation:
+
+| Flag | Description |
+|---|---|
+| `--fresh` | Skip resuming the previous conversation; relaunch the agent fresh regardless of `[attach].resume`. |
+
 ---
 
 ## Settings reference
@@ -295,10 +301,22 @@ an image, and an unchanged config skips the build entirely.
 
 **Lifecycle hooks.** `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, and
 `postStartCommand` run inside the container before the agent starts. Because `am` runs
-containers with `--rm`, every `am start` creates a fresh container and the create-time hooks
-run each time — the previous container's filesystem is gone, so anything they installed must
-be reinstalled. `postAttachCommand` is not run: `am attach` moves tmux focus, it does not
-attach to the container.
+containers with `--rm`, every fresh container creation runs the create-time hooks again — the
+previous container's filesystem is gone, so anything they installed must be reinstalled. This
+applies both to `am start` and to `am attach` recreating a container that was gone (see
+[`am attach`](commands.md#am-attach-slug)); attaching to a container that is already running
+does not re-run them. `postAttachCommand` is still not run in either case — `am` has no
+"exec into a live container" attach path yet, only "switch tmux focus" or "recreate the
+container from scratch."
 
 **Not yet supported.** Configs using `dockerComposeFile` are rejected with a pointer to
 `container.mode = "image"`. `userEnvProbe` and `forwardPorts` are parsed but not applied.
+
+### `[attach]`
+
+Controls whether [`am attach`](commands.md#am-attach-slug) asks a relaunched agent to resume
+its previous conversation.
+
+| Key | Type | Default | Description | Valid Values |
+|---|---|---|---|---|
+| `resume` | boolean | `true` | Whether `am attach` asks the agent to resume its previous conversation when relaunching it, instead of starting fresh. Overridden per-invocation by `am attach --fresh` | `true`, `false` |

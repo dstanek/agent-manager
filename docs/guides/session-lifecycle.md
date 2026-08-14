@@ -60,24 +60,43 @@ container launch — the worktree may be left behind without a session record. U
 `am attach` is a tmux-only command. For sessions started without tmux (the first and third
 rows of the table for each VCS), it exits with an error.
 
-For sessions that have a tmux window, `am attach` handles three situations:
+For sessions that have a tmux window, `am attach` handles four situations:
 
-1. **Navigation** — the window exists; `am attach` switches your tmux focus to it.
-2. **Window recovery** — the window was closed; `am attach` creates a new split window and
-   shell pane for the session.
-3. **Deferred open** — you ran `am start` outside of tmux and later want a split window;
-   `am attach` from inside tmux creates it.
+1. **Navigation** — the window exists and the agent (or, for a container session, the
+   container) is confidently still running; `am attach` just switches your tmux focus to it.
+2. **In-place relaunch** — the window exists but the agent pane is confidently idle (the agent
+   exited, or the container's foreground process died, which also ends the container); `am
+   attach` relaunches the recorded agent — or recreates the container — directly into the
+   existing pane.
+3. **Window recovery** — the window is gone entirely, most commonly because the machine
+   rebooted; `am attach` recreates the window and split, then relaunches the agent (recreating
+   the container first, for a containerized session) into the fresh agent pane.
+4. **Deferred open** — you ran `am start` outside of tmux and later want a split window; `am
+   attach` from inside tmux creates it the same way window recovery does.
+
+By default, a relaunch also asks the agent to resume its previous conversation (`--continue`
+for Claude/Copilot, `--resume latest` for Gemini, `resume --last` for Codex). Pass `--fresh`,
+or set `resume = false` under `[attach]` in config, to start cold instead.
 
 **Container sessions and window recovery:** containers run with `--rm -it`, so when a tmux
 pane closes (killing the container process), the container stops and is automatically removed.
-If you run `am attach` after the window has been closed, it creates a fresh empty agent pane
-but the container is gone. `am attach` prints a hint in this case:
+`am attach` detects this and recreates the container — re-running the same preflight `am start`
+does (runtime detection, credential validation, and, in devcontainer mode, an image rebuild if
+the previous image was pruned) — before handing the rebuilt run command to the fresh agent pane:
 
 ```
-Opened new window for session 'feat'.
-  Note: the container was stopped when the window closed.
-  To restart cleanly: am destroy --force feat && am start feat
+Opened new window for session 'feat' and restarted the container.
 ```
+
+Because that preflight is real work, it can fail the same way `am start`'s can — a container
+runtime that isn't running yet, a missing credential directory. If it does, the window and split
+from step 3 above are still left in place (so you have something to retry against) and reported
+as an error; fix the underlying problem and re-run `am attach` to pick up where it left off.
+
+Note that preflight only checks that a credential *path* exists, not that the credential is
+still valid — an expired token passes preflight, and `am attach` reports success while the agent
+fails to authenticate inside the pane. See
+[`am attach`](../reference/commands.md#am-attach-slug) for the full set of output messages.
 
 ### `am destroy`
 
@@ -111,7 +130,9 @@ Run `am destroy <slug>` from your host shell to remove the worktree and clean up
 record. If the exec itself failed, the session was already recorded — use
 `am destroy --force <slug>` to remove it without touching the (non-existent) worktree.
 
-`am attach` is not available for sessions started this way, since there is no tmux window.
+No tmux window was ever recorded for a session started this way, but `am attach <slug>` from
+inside a tmux session still works — same as "Deferred open" above, it creates the window (and,
+for a container session, relaunches the agent into a recreated container) on the spot.
 
 ---
 

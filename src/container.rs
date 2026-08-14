@@ -398,6 +398,34 @@ pub fn agent_auto_flags(agent: KnownAgent) -> Vec<String> {
     }
 }
 
+/// The flags needed to ask an agent CLI to resume its previous conversation, or `None` for
+/// an agent confirmed not to support that. `am attach` appends these (OQ-3/OQ-4) instead of
+/// launching a fresh conversation, unless `--fresh` or `[attach].resume = false` says
+/// otherwise. `None` must never be treated as an error — it just means a fresh launch, same
+/// as today's behavior.
+///
+/// Every entry here was checked against the CLI's own `--help` output (not assumed) as of
+/// this writing:
+/// - `claude --help`: `-c, --continue` — "Continue the most recent conversation in the
+///   current directory" (run locally; the Claude Code CLI is present in this environment).
+/// - `npx @github/copilot --help`: `--continue` — "Resume the most recent session".
+/// - `npx @google/gemini-cli --help`: `-r, --resume <value>` — "Resume a previous session.
+///   Use \"latest\" for most recent or index number".
+/// - `npx @openai/codex resume --help`: `resume` is a subcommand, not a flag on the base
+///   invocation; `--last` — "Continue the most recent session without showing the picker" —
+///   and that selection is itself scoped to the current working directory by default (its
+///   sibling `--all` flag is documented as "disables cwd filtering").
+pub fn agent_resume_flags(agent: KnownAgent) -> Option<Vec<String>> {
+    match agent {
+        KnownAgent::Claude => Some(vec!["--continue".to_string()]),
+        KnownAgent::Copilot => Some(vec!["--continue".to_string()]),
+        KnownAgent::Gemini => Some(vec!["--resume".to_string(), "latest".to_string()]),
+        // A subcommand, not a flag — `agent_command` puts this right after the binary
+        // name, giving `codex resume --last`.
+        KnownAgent::Codex => Some(vec!["resume".to_string(), "--last".to_string()]),
+    }
+}
+
 /// Runs `gh auth token` and returns the token string.
 fn get_gh_token() -> Result<String> {
     let gh = find_bin("gh", "AM_GH_BIN").ok_or_else(|| {
@@ -960,6 +988,54 @@ mod tests {
         assert!(agent_auto_flags(KnownAgent::Codex).is_empty());
         assert!(agent_auto_flags(KnownAgent::Copilot).is_empty());
         assert!(agent_auto_flags(KnownAgent::Gemini).is_empty());
+    }
+
+    // ── agent_resume_flags (OQ-3) ─────────────────────────────────────────────
+
+    #[test]
+    fn agent_resume_flags_claude_uses_continue() {
+        assert_eq!(
+            agent_resume_flags(KnownAgent::Claude),
+            Some(vec!["--continue".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_resume_flags_copilot_uses_continue() {
+        assert_eq!(
+            agent_resume_flags(KnownAgent::Copilot),
+            Some(vec!["--continue".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_resume_flags_gemini_uses_resume_latest() {
+        assert_eq!(
+            agent_resume_flags(KnownAgent::Gemini),
+            Some(vec!["--resume".to_string(), "latest".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_resume_flags_codex_uses_resume_subcommand() {
+        assert_eq!(
+            agent_resume_flags(KnownAgent::Codex),
+            Some(vec!["resume".to_string(), "--last".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_resume_flags_never_returns_none_by_accident() {
+        // Every known agent was verified to support resuming (see agent_resume_flags's
+        // doc comment); pin that none of them silently regress to "unsupported".
+        for agent in [
+            KnownAgent::Claude,
+            KnownAgent::Copilot,
+            KnownAgent::Gemini,
+            KnownAgent::Codex,
+        ] {
+            assert!(agent_resume_flags(agent).is_some(), "{agent} should support resume");
+        }
     }
 
     fn fake_runtime(kind: RuntimeKind, dir: &Path) -> ContainerRuntime {
