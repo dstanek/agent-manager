@@ -17,7 +17,7 @@ them.
 ## Background
 
 Today the on-ramp is `am init`: it creates `.am/config.toml` (fully commented out),
-appends `.am/worktrees/` to `.gitignore`, and prints one line. It asks nothing and assumes
+appends `.am/worktrees/` to `.gitignore`, and prints a short status report. It asks nothing and assumes
 the user already knows what `agent`, `container.runtime`, and `[agents.<name>].image` mean.
 `am doctor` fills the *diagnostic* half of the gap — it tells you precisely what's missing —
 but it changes nothing and a first-time user still has to translate "no container runtime
@@ -292,35 +292,42 @@ impl WriteScope {
 /// `WriteScope::Project`, `detected.home_dir` for `WriteScope::Global` — so a 80+ character
 /// absolute project path doesn't wrap and defeat the point of an at-a-glance line. `None`
 /// (no known base, or `path` isn't actually under it) falls back to the absolute path.
-fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
+fn write_target_line(scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
     let shown = shorten_for_display(scope, path, base);
-    format!("{label} — {}; saved to {}.", scope.phrase(), shown.display())
+    format!("{}; saved to {}.", scope.phrase(), shown.display())
 }
 ```
 
-Concrete output for each question:
+Concrete output for each question (dimmed and indented two spaces — a later readability pass
+moved the label out of this line and into the question's own header, and put both this line
+and the "currently: ..." line below it in the color-muted "structure, not content" treatment
+[`color.rs`](../src/color.rs)'s module doc describes):
 
 ```
-Agent — just this repo; saved to .am/config.toml.
+  just this repo; saved to .am/config.toml.
 ```
 ```
-Containers — every repo on this machine; saved to ~/.config/am/config.toml.
-```
-```
-Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
+  every repo on this machine; saved to ~/.config/am/config.toml.
 ```
 
-Each is printed as the first line of the question, before the menu/prompt body, and before
-the existing "currently: ..." line. For the agent question in particular, the two lines
-together answer both of the user's questions in the order they'd ask them: "where would my
-answer go?" (this line) then "where's the current default coming from?" (the existing
-`Source`-labeled line, which may name a *different* file — see UC2).
+Each question now reads header first, write-target line second: the question's own line
+("Which agent do you use?", "Which layout do you want?", ...) leads, this dim line comes
+right under it, then a blank line, then the menu/prompt body, then a blank line, then the
+dim "currently: ..." line, then a blank line before the prompt itself. The write-target
+line and the "currently:" line answer the user's two questions in the order they'd ask
+them: "where would my answer go?" (this line) then "where's the current default coming
+from?" (the `Source`-labeled line below the menu, which may name a *different* file — see
+UC2) — that pairing is unchanged, only the header/body ordering around them moved.
 
 **This changes already-shipped output.** `ask_agent` and `ask_container_enabled` did not
-print this line before this revision; adding it is an intentional behavior change, not a
-regression, so existing assertions that pinned their exact prompt text move with it — called
-out explicitly in [Testing strategy](#testing-strategy) and
-[Task breakdown](#task-breakdown) so it isn't mistaken for a broken test during review.
+print this line before the revision that introduced it; adding it was an intentional
+behavior change, not a regression, so existing assertions that pinned their exact prompt
+text moved with it — called out explicitly in [Testing strategy](#testing-strategy) and
+[Task breakdown](#task-breakdown) so it isn't mistaken for a broken test during review. A
+later, presentation-only pass (headline-leads ordering, dimming, blank-line phase
+separators, and shortening `[1] claude  (already authenticated on this host)` to
+`[1] claude    authenticated`) changed the exact bytes again without changing anything this
+document's use cases, question flow, or write behavior describe.
 
 ### The pane layout question, in detail
 
@@ -360,8 +367,10 @@ label line, not inline with it. Illustrative shape (exact spacing is an implemen
 not load-bearing):
 
 ```
-Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
+
 Which layout do you want?
+  every repo on this machine; saved to ~/.config/am/config.toml.
+
   [1] agent left, 50/50
       [  agent   |  shell   ]
   [2] agent right, 50/50
@@ -372,14 +381,21 @@ Which layout do you want?
       [       agent        ]
       [       shell        ]
   [5] customize…
+
   currently: agent_pane=left, split=horizontal, split_percent=50 (am's default)
+
 Layout [1-5] (Enter to keep current):
 ```
 
+(the leading blank line is the phase separator every question opens with, printed before its
+own header — see the readability-pass note above; the write-target and "currently:" lines are
+dimmed.)
+
 Enter accepts the currently effective triple, not a hardcoded preset — the same "Enter means keep what's already in effect" idiom `ask_agent`'s and `ask_container_enabled`'s own defaults follow. On a first-time run with nothing configured, the effective triple happens to equal preset 1, but the prompt's wording does not assume that.
 
-The opening line is `write_target_line`'s output, described above — the same helper the
-agent and containers questions now use, not a one-off sentence specific to layout.
+The write-target line is `write_target_line`'s output, described above — the same helper the
+agent and containers questions now use, printed directly under this question's own header
+("Which layout do you want?"), not a one-off sentence specific to layout.
 
 **Customize sub-flow — direction first, then a direction-aware pane question, then
 percent.** This ordering is the only one that produces correctly worded questions: the pane
@@ -409,8 +425,8 @@ cannot be asked second. Concretely:
                  re-entering it is not a real cost
 ```
 
-The write-target line is shown once, at the top of the outer question (before "Which layout
-do you want?"); the sub-questions don't repeat it — they're all still answering the one
+The write-target line is shown once, directly under the outer question's own header ("Which
+layout do you want?"); the sub-questions don't repeat it — they're all still answering the one
 question the header already scoped.
 
 **Write target and per-key granularity.** All three keys are a per-user preference and are
@@ -549,7 +565,9 @@ No new flag for layout — see [Resolved Decisions](#resolved-decisions) #8.6.
 ### `src/onboarding.rs`
 
 Already shipped, agent/container question logic unchanged except that `ask_agent` and
-`ask_container_enabled` now each print `write_target_line(...)` as their first line:
+`ask_container_enabled` now each print `write_target_line(...)`, dimmed and indented, directly
+under their own question header (a later readability pass moved it from the first line of the
+question to this position and added the dimming — see the note above):
 
 ```rust
 pub enum Source { Project, Global, CompiledDefault }
@@ -610,7 +628,8 @@ enum WriteScope { Project, Global }
 impl WriteScope {
     fn phrase(self) -> &'static str { /* "just this repo" | "every repo on this machine" */ }
 }
-fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String;
+fn write_target_line(scope: WriteScope, path: &Path, base: Option<&Path>) -> String;
+fn dim_line(text: &str, color: bool) -> String; // indents 2 and dims when `color`
 
 // Pane layout.
 const LAYOUT_PRESETS: [(config::PaneSide, config::SplitDirection, u8); 4] = [
@@ -677,6 +696,11 @@ let layout_answer = if yes { None } else { onboarding::ask_layout(&mut io, &dete
 if let Some((agent_pane, split, split_percent)) = layout_answer {
     if let Some(path) = detected.global_config_path.as_deref() {
         let written = onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
+        // The later readability pass added a `color: bool` parameter to `ask_agent`/
+        // `ask_container_enabled`/`ask_layout` (elided above — pseudocode, not load-bearing)
+        // and replaced this `println!` with `set_tmux_layout_line(...)`, one of several small
+        // formatter functions `main.rs` gained so `am init`'s and `am setup`'s two renderings
+        // of the same line stay in one place each.
         if !written.is_empty() {
             println!("Set tmux.{} in {}", written.join(", tmux."), path.display());
         }

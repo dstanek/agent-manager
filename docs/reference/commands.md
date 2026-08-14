@@ -28,6 +28,52 @@ Running `am init` in a directory that is not a git or jj repository is an error.
 !!! note
     `am init` must be run from inside a git or jj repository. `am` detects `.jj/` first; if not found it checks for `.git/`. If neither is present, the command exits with an error.
 
+**Example output**
+
+A headline states the outcome, followed by the detail behind it. On a fresh repo:
+
+```
+Initialized am in this repo.
+  Created .am/config.toml
+  Added .am/worktrees/ to .gitignore
+
+Run 'am start <slug>' to create your first session.
+```
+
+Re-running it once everything already exists drops the detail — it would only repeat what
+the headline already says — and folds the next step onto its own indented line:
+
+```
+am is already initialized in this repo.
+  Run 'am start <slug>' to create your first session.
+```
+
+A mixed run (say, `.am/config.toml` already existed but the `.gitignore` entry didn't) keeps
+every detail line, since some of it is genuinely new and some isn't:
+
+```
+Initialized am in this repo.
+  .am/config.toml already exists, skipping
+  Added .am/worktrees/ to .gitignore
+
+Run 'am start <slug>' to create your first session.
+```
+
+The `.gitignore`-advisory case groups the `Note:` line after the detail rather than
+interleaving it where it was discovered, so it reads as one call-out attached to the list
+rather than an interruption partway through it:
+
+```
+Initialized am in this repo.
+  Created .am/config.toml
+  Added .am/worktrees/ to .gitignore
+  Note: .am/ is in .gitignore; .am/config.toml is now committable — you may want to narrow this to .am/worktrees/
+
+Run 'am start <slug>' to create your first session.
+```
+
+Exit code and file behavior are unaffected either way — only the rendering changed.
+
 ---
 
 ## `am doctor`
@@ -106,13 +152,14 @@ am setup --yes --agent claude
 
 1. Requires an interactive terminal unless `--yes` is passed. With no TTY and no `--yes`, it fails immediately with "am setup requires an interactive terminal" — no file is touched.
 2. Runs the same directory and `.gitignore` setup as `am init` (creates `.am/config.toml` if missing, adds `.am/worktrees/` to `.gitignore`), and creates `~/.config/am/config.toml` if it doesn't exist yet — both fully commented skeletons, same as `am init`'s output.
-3. Asks which agent to use, unless `--agent` was given. Every question below starts with one line naming where the answer is saved — scope first, then the file path, e.g. `Agent — just this repo; saved to .am/config.toml.` The prompt's default is the effective current value — project config, then global config, then (if nothing is configured anywhere) the first agent with credentials already detected on this host, falling back to `claude` — labeled with its source, e.g. `currently: claude (from your global config)`. Note this can name a *different* file than the write-target line just above it: the default may come from the global config, but a change is always written to the project file. Pressing Enter accepts the default; if that default is already what's configured, nothing is written.
+3. Asks which agent to use, unless `--agent` was given. Every question below opens with its own header line naming what's being asked, then a dimmed, indented line naming where the answer is saved — scope first, then the file path, e.g. `  just this repo; saved to .am/config.toml.` The prompt's default is the effective current value — project config, then global config, then (if nothing is configured anywhere) the first agent with credentials already detected on this host, falling back to `claude` — labeled with its source on its own dimmed line below the menu, e.g. `  currently: claude (from your global config)`. Note this can name a *different* file than the write-target line above the menu: the default may come from the global config, but a change is always written to the project file. Pressing Enter accepts the default; if that default is already what's configured, nothing is written. An agent already authenticated on this host is marked `authenticated` in its own aligned column, e.g. `[1] claude    authenticated`.
 4. Asks whether to proceed with containers disabled, but only when neither Podman nor Docker is on `PATH` *and* there is a global config file to write the answer to. Which runtime to use is never asked — `container.runtime = "auto"` already resolves that on its own.
 5. Asks for a pane layout, unless `--yes` was passed or there is no global config file to write to. Unlike the agent and containers questions, this one is always asked — pane layout is a genuine preference no amount of host detection can answer, so it isn't gated behind a failure condition. A single menu offers four presets plus a customize option, each shown with a small ASCII preview:
 
    ```
-   Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
    Which layout do you want?
+     every repo on this machine; saved to ~/.config/am/config.toml.
+
      [1] agent left, 50/50
          [  agent   |  shell   ]
      [2] agent right, 50/50
@@ -123,7 +170,9 @@ am setup --yes --agent claude
          [       agent        ]
          [       shell        ]
      [5] customize…
+
      currently: agent_pane=left, split=horizontal, split_percent=50 (am's default)
+
    Layout [1-5] (Enter to keep current): 
    ```
 
@@ -154,20 +203,25 @@ An existing file is edited in place with `toml_edit`, preserving comments, table
 
 ```
 Setting up am for the git repository at /home/user/project
+  Created .am/config.toml
+  Added .am/worktrees/ to .gitignore
+  Created ~/.config/am/config.toml
 
-Created .am/config.toml
-Added .am/worktrees/ to .gitignore
-Created /home/user/.config/am/config.toml
-Agent — just this repo; saved to .am/config.toml.
 Which agent do you use?
-  [1] claude  (already authenticated on this host)
+  just this repo; saved to .am/config.toml.
+
+  [1] claude    authenticated
   [2] copilot
   [3] gemini
   [4] codex
+
   currently: none configured
+
 Agent [1-4] (Enter for claude): 
-Pane layout — every repo on this machine; saved to ~/.config/am/config.toml.
+
 Which layout do you want?
+  every repo on this machine; saved to ~/.config/am/config.toml.
+
   [1] agent left, 50/50
       [  agent   |  shell   ]
   [2] agent right, 50/50
@@ -178,9 +232,11 @@ Which layout do you want?
       [       agent        ]
       [       shell        ]
   [5] customize…
+
   currently: agent_pane=left, split=horizontal, split_percent=50 (am's default)
+
 Layout [1-5] (Enter to keep current): 
-Set defaults.agent = "claude" in /home/user/project/.am/config.toml
+Set defaults.agent = "claude" in .am/config.toml
 
 Checking your setup...
 

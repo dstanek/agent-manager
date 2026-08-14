@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
+use crate::color::{self, Color};
 use crate::config::RuntimePreference;
 use crate::{config, container, devcontainer, tmux};
 
@@ -29,6 +30,12 @@ const MENU: [container::KnownAgent; 4] = [
     container::KnownAgent::Gemini,
     container::KnownAgent::Codex,
 ];
+
+/// The gap between the longest agent name and its "authenticated" note, so every note lines
+/// up in a column regardless of which names have one. The gap itself is a fixed 3 spaces;
+/// it's the column *width* it's added to that's computed from `MENU` at the call site, so a
+/// longer agent name added later doesn't silently misalign the menu.
+const MENU_NOTE_GAP: usize = 3;
 
 // ── Effective values, and where they come from ────────────────────────────────
 
@@ -93,17 +100,18 @@ impl WriteScope {
 
 /// One line, shared by `ask_agent`, `ask_container_enabled`, and `ask_layout` — a single
 /// implementation so the wording cannot drift between them, and so it's pinned by one set of
-/// tests instead of three copies that could disagree. Always the first line printed by the
-/// question it belongs to, before the "currently: ..." line.
+/// tests instead of three copies that could disagree. Printed dim and indented, directly under
+/// the question's own header line: the question already says *what* is being asked, so this
+/// line only has to answer "where does the answer go" — no label of its own needed.
 ///
 /// `base` is what `path` gets shortened against for display — `detected.repo_root` for
 /// `WriteScope::Project`, `detected.home_dir` for `WriteScope::Global` — never the raw
 /// absolute path: an un-shortened project path routinely runs to 80+ characters and wraps,
 /// defeating the whole point of a line that exists for at-a-glance clarity. `None` (no known
 /// base, or `path` isn't actually under it) falls back to the absolute path.
-fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
+fn write_target_line(scope: WriteScope, path: &Path, base: Option<&Path>) -> String {
     let shown = shorten_for_display(scope, path, base);
-    format!("{label} — {}; saved to {}.", scope.phrase(), shown.display())
+    format!("{}; saved to {}.", scope.phrase(), shown.display())
 }
 
 /// The one shortening rule both scopes share: relative to `base` when `path` is under it,
@@ -111,13 +119,44 @@ fn write_target_line(label: &str, scope: WriteScope, path: &Path, base: Option<&
 /// clearly without a marker of its own — `.am/config.toml` — while a home-relative one needs
 /// the `~` to say so, the same convention a shell prompt uses).
 fn shorten_for_display(scope: WriteScope, path: &Path, base: Option<&Path>) -> PathBuf {
-    let Some(relative) = base.and_then(|base| path.strip_prefix(base).ok()) else {
-        return path.to_path_buf();
-    };
     match scope {
-        WriteScope::Project => relative.to_path_buf(),
-        WriteScope::Global => Path::new("~").join(relative),
+        WriteScope::Project => relative_shorten(path, base),
+        WriteScope::Global => tilde_shorten(path, base),
     }
+}
+
+/// The relative-path half of [`shorten_for_display`]'s `WriteScope::Project` case, exposed on
+/// its own for `cmd_setup`'s own status/confirmation lines that print a project path outside a
+/// write-target line — it should abbreviate exactly the same way a project write-target does,
+/// not grow a second convention. Mirrors [`tilde_shorten`], the same exposure for the global
+/// scope.
+pub fn relative_shorten(path: &Path, base: Option<&Path>) -> PathBuf {
+    base.and_then(|base| path.strip_prefix(base).ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// The `~`-substitution half of [`shorten_for_display`]'s `WriteScope::Global` case, exposed
+/// on its own for `cmd_setup`'s header line ("Setting up am for the ... repository at ...") —
+/// the one place outside a write-target line that shortens a path for display, and it should
+/// abbreviate exactly the same way a global write-target does, not grow a second convention.
+pub fn tilde_shorten(path: &Path, home: Option<&Path>) -> PathBuf {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(relative) => Path::new("~").join(relative),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Indent and dim one line — the treatment every secondary line in the interactive flow
+/// shares: a write-target line, and a "currently: ..." line. Also `pub(crate)` for
+/// `main.rs`'s own status lines (the init report under `am setup`, and the "Created ..."
+/// line for a freshly written global config) — the same duplication `relative_shorten`/
+/// `tilde_shorten` were made `pub` to avoid, now closed for the dim treatment too. `color`
+/// is taken as an argument rather than probed here, the same reason `color::paint` itself
+/// does: rendering stays pure, so both the colored and the `NO_COLOR` form are directly
+/// testable.
+pub(crate) fn dim_line(text: &str, color: bool) -> String {
+    color::paint(&format!("  {text}"), Color::Dim, color)
 }
 
 /// `PaneSide` and `SplitDirection` have no `Display` impl (matching the rest of the codebase,
@@ -546,39 +585,57 @@ pub fn default_agent_answer(detected: &DetectedState) -> Option<container::Known
 ///
 /// `agent_flag` is not a prompt default: a flag supplies an answer, so it is evaluated
 /// without asking anything, identically with and without `--yes`.
+///
+/// `color` governs only the dim secondary lines (the write-target line, the "currently: ..."
+/// line) — never the menu itself, which is the actual content being chosen from.
 pub fn ask_agent(
     io: &mut dyn Io,
     detected: &DetectedState,
     agent_flag: Option<container::KnownAgent>,
+    color: bool,
 ) -> Result<Option<container::KnownAgent>> {
     if let Some(agent) = agent_flag {
         return Ok(agent_write(detected, agent));
     }
 
     let default = detected.default_agent();
-    io.println(&write_target_line(
-        "Agent",
-        WriteScope::Project,
-        &detected.project_config_path,
-        detected.repo_root.as_deref(),
-    ));
+    // Leading blank line: the phase separator between whatever came before (the init report,
+    // or a previous question) and this one. Printed only once IO actually starts, so a flag or
+    // `--yes` answering this question above without a prompt never leaves a stray blank line.
+    io.println("");
     io.println("Which agent do you use?");
+    io.println(&dim_line(
+        &write_target_line(
+            WriteScope::Project,
+            &detected.project_config_path,
+            detected.repo_root.as_deref(),
+        ),
+        color,
+    ));
+    io.println("");
+    let width = MENU.iter().map(|a| a.to_string().len()).max().unwrap_or(0) + MENU_NOTE_GAP;
     for (index, agent) in MENU.iter().enumerate() {
         // Presence of credentials, never their contents.
-        let note = if detected.has_credentials(*agent) {
-            "  (already authenticated on this host)"
+        if detected.has_credentials(*agent) {
+            // `KnownAgent`'s `Display` impl writes its name with a plain `write!`, which does
+            // not honor a width/alignment request from the caller (that requires `f.pad`,
+            // which it doesn't use) — going through an owned `String` first sidesteps that,
+            // since `str`'s own `Display` impl does.
+            let name = agent.to_string();
+            io.println(&format!("  [{}] {name:<width$}authenticated", index + 1));
         } else {
-            ""
-        };
-        io.println(&format!("  [{}] {agent}{note}", index + 1));
+            io.println(&format!("  [{}] {agent}", index + 1));
+        }
     }
-    io.println(&match detected.effective_agent.value {
-        Some(agent) => format!(
-            "  currently: {agent} ({})",
-            detected.effective_agent.source.label()
-        ),
-        None => "  currently: none configured".to_string(),
-    });
+    io.println("");
+    io.println(&dim_line(
+        &match detected.effective_agent.value {
+            Some(agent) => format!("currently: {agent} ({})", detected.effective_agent.source.label()),
+            None => "currently: none configured".to_string(),
+        },
+        color,
+    ));
+    io.println("");
 
     loop {
         let Some(answer) = io.prompt_line(&format!("Agent [1-{}] (Enter for {default}): ", MENU.len()))
@@ -621,7 +678,7 @@ fn parse_agent_answer(answer: &str) -> Option<container::KnownAgent> {
 /// what detected state can't answer" cuts both ways, and a question whose answer cannot be
 /// acted on is worse than not asking it. `cmd_setup` has already told the user about the
 /// missing environment once, at the point it skips creating the global file itself.
-pub fn ask_container_enabled(io: &mut dyn Io, detected: &DetectedState) -> Result<Option<bool>> {
+pub fn ask_container_enabled(io: &mut dyn Io, detected: &DetectedState, color: bool) -> Result<Option<bool>> {
     if !detected.runtimes_found.is_empty() {
         return Ok(None);
     }
@@ -630,17 +687,21 @@ pub fn ask_container_enabled(io: &mut dyn Io, detected: &DetectedState) -> Resul
     };
 
     let currently_enabled = detected.effective_container_enabled.value;
-    io.println(&write_target_line(
-        "Containers",
-        WriteScope::Global,
-        path,
-        detected.home_dir.as_deref(),
-    ));
+    io.println("");
     io.println("No container runtime found on this machine (neither podman nor docker).");
-    io.println(&format!(
-        "  currently: container.enabled = {currently_enabled} ({})",
-        detected.effective_container_enabled.source.label()
+    io.println(&dim_line(
+        &write_target_line(WriteScope::Global, path, detected.home_dir.as_deref()),
+        color,
     ));
+    io.println("");
+    io.println(&dim_line(
+        &format!(
+            "currently: container.enabled = {currently_enabled} ({})",
+            detected.effective_container_enabled.source.label()
+        ),
+        color,
+    ));
+    io.println("");
     let question = if currently_enabled {
         "Proceed with containers disabled for now? [y/N] "
     } else {
@@ -726,7 +787,7 @@ fn current_layout_line(detected: &DetectedState) -> String {
         detected.effective_tmux_split_percent.source,
     ]);
     format!(
-        "  currently: agent_pane={}, split={}, split_percent={} ({})",
+        "currently: agent_pane={}, split={}, split_percent={} ({})",
         pane_side_str(&detected.effective_tmux_agent_pane.value),
         split_str(&detected.effective_tmux_split.value),
         detected.effective_tmux_split_percent.value,
@@ -818,6 +879,7 @@ fn layout_write(
 pub fn ask_layout(
     io: &mut dyn Io,
     detected: &DetectedState,
+    color: bool,
 ) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>> {
     let Some(path) = detected.global_config_path.as_deref() else {
         return Ok(None);
@@ -833,16 +895,19 @@ pub fn ask_layout(
     );
 
     loop {
-        io.println(&write_target_line(
-            "Pane layout",
-            WriteScope::Global,
-            path,
-            detected.home_dir.as_deref(),
+        // Leading blank line: same phase-separator role as `ask_agent`'s and
+        // `ask_container_enabled`'s own leading blank — re-printed here too, since declining
+        // the customize preview loops back to the top of this same block.
+        io.println("");
+        io.println("Which layout do you want?");
+        io.println(&dim_line(
+            &write_target_line(WriteScope::Global, path, detected.home_dir.as_deref()),
+            color,
         ));
         if layout_has_project_override(detected) {
             io.println(PROJECT_LAYOUT_OVERRIDE_NOTE);
         }
-        io.println("Which layout do you want?");
+        io.println("");
         for (index, (side, split, percent)) in LAYOUT_PRESETS.iter().enumerate() {
             io.println(&format!("  [{}] {}", index + 1, LAYOUT_PRESET_LABELS[index]));
             for line in render_layout(side, split, *percent) {
@@ -850,7 +915,9 @@ pub fn ask_layout(
             }
         }
         io.println("  [5] customize…");
-        io.println(&current_layout_line(detected));
+        io.println("");
+        io.println(&dim_line(&current_layout_line(detected), color));
+        io.println("");
 
         let preset = loop {
             let Some(answer) = io.prompt_line("Layout [1-5] (Enter to keep current): ") else {
@@ -873,7 +940,7 @@ pub fn ask_layout(
             Some(triple) => triple,
             // `None` here means the customize preview was declined, not EOF (which returns
             // early above) — back to the top of this loop, which re-shows the menu.
-            None => match ask_layout_custom(io, detected)? {
+            None => match ask_layout_custom(io, detected, color)? {
                 Some(triple) => triple,
                 None => continue,
             },
@@ -891,18 +958,27 @@ pub fn ask_layout(
 fn ask_layout_custom(
     io: &mut dyn Io,
     detected: &DetectedState,
+    color: bool,
 ) -> Result<Option<(config::PaneSide, config::SplitDirection, u8)>> {
     // 6a: direction first — the pane-side question's wording (6b) depends on it, so it can't
-    // be asked second.
+    // be asked second. Each sub-question gets its own leading blank line, the same
+    // phase-separator rhythm the three top-level questions use.
     let default_split = &detected.effective_tmux_split.value;
+    io.println("");
     io.println("Side by side, or stacked?");
+    io.println("");
     io.println("  [1] side by side (horizontal)");
     io.println("  [2] stacked (vertical)");
-    io.println(&format!(
-        "  currently: split={} ({})",
-        split_str(default_split),
-        detected.effective_tmux_split.source.label()
+    io.println("");
+    io.println(&dim_line(
+        &format!(
+            "currently: split={} ({})",
+            split_str(default_split),
+            detected.effective_tmux_split.source.label()
+        ),
+        color,
     ));
+    io.println("");
     let default_split_choice: u8 = match default_split {
         config::SplitDirection::Horizontal => 1,
         config::SplitDirection::Vertical => 2,
@@ -939,14 +1015,21 @@ fn ask_layout_custom(
         ),
     };
     let default_side = &detected.effective_tmux_agent_pane.value;
+    io.println("");
     io.println(question);
+    io.println("");
     io.println(&format!("  [1] {option_1}"));
     io.println(&format!("  [2] {option_2}"));
-    io.println(&format!(
-        "  currently: agent_pane={} ({})",
-        pane_side_str(default_side),
-        detected.effective_tmux_agent_pane.source.label()
+    io.println("");
+    io.println(&dim_line(
+        &format!(
+            "currently: agent_pane={} ({})",
+            pane_side_str(default_side),
+            detected.effective_tmux_agent_pane.source.label()
+        ),
+        color,
     ));
+    io.println("");
     let default_side_choice: u8 = match default_side {
         config::PaneSide::Left => 1,
         config::PaneSide::Right => 2,
@@ -971,11 +1054,17 @@ fn ask_layout_custom(
     // 6c: percent — reuses `config::validate_split_percent`'s 1-99 constraint rather than
     // reimplementing it.
     let default_percent = detected.effective_tmux_split_percent.value;
+    io.println("");
     io.println("What percentage of the window should the agent pane get?");
-    io.println(&format!(
-        "  currently: split_percent={default_percent} ({})",
-        detected.effective_tmux_split_percent.source.label()
+    io.println("");
+    io.println(&dim_line(
+        &format!(
+            "currently: split_percent={default_percent} ({})",
+            detected.effective_tmux_split_percent.source.label()
+        ),
+        color,
     ));
+    io.println("");
     let split_percent = loop {
         let Some(answer) = io.prompt_line(&format!("[1-99] (Enter for {default_percent}): "))
         else {
@@ -990,7 +1079,10 @@ fn ask_layout_custom(
         }
     };
 
-    // 6d: preview and confirm.
+    // 6d: preview and confirm. The preview and the proportion line stay tight against the
+    // statement introducing them — they're a figure and its caption, not separate phases —
+    // with one blank line before the final yes/no prompt.
+    io.println("");
     io.println("Here's what that looks like:");
     for line in render_layout(&agent_pane, &split, split_percent) {
         io.println(&format!("  {line}"));
@@ -999,6 +1091,7 @@ fn ask_layout_custom(
     // split — see `layout_proportion_line` — so the confirm prompt is never based on the
     // picture alone.
     io.println(&layout_proportion_line(&agent_pane, &split, split_percent));
+    io.println("");
     let Some(answer) = io.prompt_line("Use this layout? [Y/n] ") else {
         return Err(eof_aborted());
     };
@@ -1443,7 +1536,7 @@ mod tests {
         let state = configured(Some(KnownAgent::Claude), Source::Global);
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_agent(&mut io, &state, None).unwrap(), None);
+        assert_eq!(ask_agent(&mut io, &state, None, false).unwrap(), None);
     }
 
     #[test]
@@ -1451,7 +1544,7 @@ mod tests {
         let state = configured(Some(KnownAgent::Claude), Source::Global);
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None).unwrap();
+        ask_agent(&mut io, &state, None, false).unwrap();
 
         assert!(
             io.output.contains("claude (from your global config)"),
@@ -1480,7 +1573,7 @@ mod tests {
 
         // Accepting it is a change, because the effective value was "none".
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Gemini)
         );
         assert!(io.output.contains("Enter for gemini"), "{}", io.output);
@@ -1492,7 +1585,7 @@ mod tests {
         let mut io = ScriptedIo::new(&[""]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Claude)
         );
     }
@@ -1505,7 +1598,7 @@ mod tests {
         let mut io = ScriptedIo::new(&["4"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Codex)
         );
     }
@@ -1516,7 +1609,7 @@ mod tests {
         let mut io = ScriptedIo::new(&["copilot"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Copilot)
         );
     }
@@ -1527,7 +1620,7 @@ mod tests {
         let mut io = ScriptedIo::new(&["9", "nope", "2"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Copilot)
         );
         assert_eq!(io.output.matches("is not one of").count(), 2, "{}", io.output);
@@ -1539,7 +1632,7 @@ mod tests {
         let mut io = ScriptedIo::new(&["0", "1"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None).unwrap(),
+            ask_agent(&mut io, &state, None, false).unwrap(),
             None,
             "1 is claude, which is already the effective value"
         );
@@ -1550,7 +1643,7 @@ mod tests {
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
-        let err = ask_agent(&mut io, &state, None).unwrap_err();
+        let err = ask_agent(&mut io, &state, None, false).unwrap_err();
 
         assert!(err.to_string().contains("--yes"), "{err}");
     }
@@ -1585,7 +1678,7 @@ mod tests {
         let mut io = ScriptedIo::new(&[]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, Some(KnownAgent::Claude)).unwrap(),
+            ask_agent(&mut io, &state, Some(KnownAgent::Claude), false).unwrap(),
             Some(KnownAgent::Claude)
         );
         assert!(io.output.is_empty(), "flag should not prompt: {}", io.output);
@@ -1597,7 +1690,7 @@ mod tests {
         let mut io = ScriptedIo::new(&[]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, Some(KnownAgent::Codex)).unwrap(),
+            ask_agent(&mut io, &state, Some(KnownAgent::Codex), false).unwrap(),
             None
         );
     }
@@ -1618,10 +1711,10 @@ mod tests {
         );
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None).unwrap();
+        ask_agent(&mut io, &state, None, false).unwrap();
 
-        assert!(io.output.contains("claude  (already authenticated on this host)"));
-        assert!(!io.output.contains("copilot  (already"));
+        assert!(io.output.contains("claude    authenticated"), "{}", io.output);
+        assert!(!io.output.contains("copilot   authenticated"), "{}", io.output);
     }
 
     // ── The containers question ───────────────────────────────────────────────
@@ -1646,7 +1739,7 @@ mod tests {
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), None);
         assert!(io.output.is_empty(), "{}", io.output);
     }
 
@@ -1659,7 +1752,7 @@ mod tests {
         state.global_config_path = None;
         let mut io = ScriptedIo::new(&[]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), None);
         assert!(io.output.is_empty(), "{}", io.output);
     }
 
@@ -1668,8 +1761,28 @@ mod tests {
         let state = no_runtime(true, Source::CompiledDefault);
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), None);
         assert!(io.output.contains("[y/N]"), "{}", io.output);
+    }
+
+    #[test]
+    fn ask_container_enabled_states_where_the_answer_will_be_saved() {
+        // Since `write_target_line` dropped its question-name label, the containers and layout
+        // questions render the exact same "every repo on this machine; saved to ..." text —
+        // nothing in the E2E scenario can tell whose write-target line it saw, only that one of
+        // them printed it. This is what actually pins that `ask_container_enabled` prints its
+        // own, now that its wording can no longer prove it by itself.
+        let state = no_runtime(true, Source::CompiledDefault);
+        let mut io = ScriptedIo::new(&[""]);
+
+        ask_container_enabled(&mut io, &state, false).unwrap();
+
+        let target_line = write_target_line(
+            WriteScope::Global,
+            state.global_config_path.as_deref().unwrap(),
+            state.home_dir.as_deref(),
+        );
+        assert!(io.output.contains(&target_line), "{}", io.output);
     }
 
     #[test]
@@ -1677,7 +1790,7 @@ mod tests {
         let state = no_runtime(true, Source::CompiledDefault);
         let mut io = ScriptedIo::new(&["y"]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), Some(false));
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), Some(false));
     }
 
     #[test]
@@ -1685,7 +1798,7 @@ mod tests {
         let state = no_runtime(false, Source::Global);
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), None);
         assert!(io.output.contains("[Y/n]"), "{}", io.output);
         assert!(io.output.contains("(from your global config)"), "{}", io.output);
     }
@@ -1695,7 +1808,7 @@ mod tests {
         let state = no_runtime(false, Source::Global);
         let mut io = ScriptedIo::new(&["n"]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), Some(true));
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), Some(true));
     }
 
     #[test]
@@ -1703,7 +1816,7 @@ mod tests {
         let state = no_runtime(true, Source::CompiledDefault);
         let mut io = ScriptedIo::new(&["maybe", "y"]);
 
-        assert_eq!(ask_container_enabled(&mut io, &state).unwrap(), Some(false));
+        assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), Some(false));
         assert!(io.output.contains("Answer y or n"), "{}", io.output);
     }
 
@@ -1712,7 +1825,7 @@ mod tests {
         let state = no_runtime(true, Source::CompiledDefault);
         let mut io = ScriptedIo::new(&[]);
 
-        assert!(ask_container_enabled(&mut io, &state).is_err());
+        assert!(ask_container_enabled(&mut io, &state, false).is_err());
     }
 
     // ── The first-session question ────────────────────────────────────────────
@@ -2515,13 +2628,8 @@ custom_key = "left alone"
     fn write_target_line_shortens_a_project_path_relative_to_the_repo_root() {
         let project = Path::new("/repo/.am/config.toml");
         assert_eq!(
-            write_target_line(
-                "Agent",
-                WriteScope::Project,
-                project,
-                Some(Path::new("/repo"))
-            ),
-            "Agent — just this repo; saved to .am/config.toml."
+            write_target_line(WriteScope::Project, project, Some(Path::new("/repo"))),
+            "just this repo; saved to .am/config.toml."
         );
     }
 
@@ -2529,13 +2637,8 @@ custom_key = "left alone"
     fn write_target_line_shortens_a_global_path_to_a_tilde() {
         let global = Path::new("/home/u/.config/am/config.toml");
         assert_eq!(
-            write_target_line(
-                "Containers",
-                WriteScope::Global,
-                global,
-                Some(Path::new("/home/u"))
-            ),
-            "Containers — every repo on this machine; saved to ~/.config/am/config.toml."
+            write_target_line(WriteScope::Global, global, Some(Path::new("/home/u"))),
+            "every repo on this machine; saved to ~/.config/am/config.toml."
         );
     }
 
@@ -2543,14 +2646,14 @@ custom_key = "left alone"
     fn write_target_line_falls_back_to_the_absolute_path_without_a_known_base() {
         let project = Path::new("/repo/.am/config.toml");
         assert_eq!(
-            write_target_line("Agent", WriteScope::Project, project, None),
-            "Agent — just this repo; saved to /repo/.am/config.toml."
+            write_target_line(WriteScope::Project, project, None),
+            "just this repo; saved to /repo/.am/config.toml."
         );
 
         let global = Path::new("/home/u/.config/am/config.toml");
         assert_eq!(
-            write_target_line("Pane layout", WriteScope::Global, global, None),
-            "Pane layout — every repo on this machine; saved to /home/u/.config/am/config.toml."
+            write_target_line(WriteScope::Global, global, None),
+            "every repo on this machine; saved to /home/u/.config/am/config.toml."
         );
     }
 
@@ -2560,14 +2663,60 @@ custom_key = "left alone"
         // outside $HOME) must not be silently mis-shortened.
         let global = Path::new("/mnt/config/am/config.toml");
         assert_eq!(
-            write_target_line(
-                "Containers",
-                WriteScope::Global,
-                global,
-                Some(Path::new("/home/u"))
-            ),
-            "Containers — every repo on this machine; saved to /mnt/config/am/config.toml."
+            write_target_line(WriteScope::Global, global, Some(Path::new("/home/u"))),
+            "every repo on this machine; saved to /mnt/config/am/config.toml."
         );
+    }
+
+    #[test]
+    fn tilde_shorten_matches_a_global_write_target_lines_own_abbreviation() {
+        // `cmd_setup`'s header line uses this directly so the repo path it names is
+        // abbreviated exactly the same way a global write-target line's path is — one
+        // convention, not two.
+        let path = Path::new("/home/u/src/agent-manager");
+        assert_eq!(
+            tilde_shorten(path, Some(Path::new("/home/u"))),
+            Path::new("~/src/agent-manager")
+        );
+        assert_eq!(tilde_shorten(path, None), path);
+        assert_eq!(
+            tilde_shorten(path, Some(Path::new("/mnt/other"))),
+            path,
+            "a path outside the given home must not be mis-shortened"
+        );
+    }
+
+    // ── Dim rendering ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn dim_line_indents_always_and_paints_only_when_color_is_enabled() {
+        // The pty/color hazard this covers: a real pty makes `color::enabled` true for `am
+        // setup`'s cucumber scenarios, so this has to be checked without one — see the
+        // hazard note on `AmWorld::run_am_pty` in `tests/cucumber.rs`. Covers both `am
+        // setup`'s own secondary lines and, since `dim_line` is shared with `main.rs`, the
+        // init report's `Status` lines and the "Created ..." global-config line too.
+        assert_eq!(dim_line("hello", false), "  hello");
+        assert_eq!(dim_line("hello", true), "\x1b[2m  hello\x1b[0m");
+    }
+
+    #[test]
+    fn colored_rendering_dims_the_write_target_and_currently_lines() {
+        // The pty/color hazard this covers: `ScriptedIo`-based tests never see ANSI codes
+        // unless `color: true` is passed explicitly, the same way the interactive cucumber
+        // scenarios only see them because a real pty makes `color::enabled` true there too.
+        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&[""]);
+
+        ask_agent(&mut io, &state, None, true).unwrap();
+
+        assert!(
+            io.output.contains("\x1b[2m  just this repo; saved to"),
+            "{}",
+            io.output
+        );
+        assert!(io.output.contains("\x1b[2m  currently:"), "{}", io.output);
+        // The menu itself is content, not structure — it must never be dimmed.
+        assert!(!io.output.contains("\x1b[2m  [1]"), "{}", io.output);
     }
 
     // ── The pane layout question ──────────────────────────────────────────────
@@ -2599,7 +2748,7 @@ custom_key = "left alone"
         state.global_config_path = None;
         let mut io = ScriptedIo::new(&[]);
 
-        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_layout(&mut io, &state, false).unwrap(), None);
         assert!(io.output.is_empty(), "{}", io.output);
     }
 
@@ -2615,7 +2764,7 @@ custom_key = "left alone"
         // state's effective triple.
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_layout(&mut io, &state, false).unwrap(), None);
     }
 
     #[test]
@@ -2632,7 +2781,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["1"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some(LAYOUT_PRESETS[0].clone())
         );
     }
@@ -2653,7 +2802,7 @@ custom_key = "left alone"
         );
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_layout(&mut io, &state).unwrap(), None);
+        assert_eq!(ask_layout(&mut io, &state, false).unwrap(), None);
     }
 
     #[test]
@@ -2670,7 +2819,7 @@ custom_key = "left alone"
             let mut io = ScriptedIo::new(&[answer.as_str()]);
 
             assert_eq!(
-                ask_layout(&mut io, &state).unwrap(),
+                ask_layout(&mut io, &state, false).unwrap(),
                 Some(preset.clone()),
                 "preset {}",
                 index + 1
@@ -2689,7 +2838,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["9", "nope", "1"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some(LAYOUT_PRESETS[0].clone())
         );
         assert_eq!(io.output.matches("is not one of 1-5").count(), 2, "{}", io.output);
@@ -2706,7 +2855,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["5", "1", "2", "60", "y"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some((
                 config::PaneSide::Right,
                 config::SplitDirection::Horizontal,
@@ -2738,7 +2887,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["5", "2", "1", "40", "y"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some((
                 config::PaneSide::Left,
                 config::SplitDirection::Vertical,
@@ -2773,7 +2922,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["5", "2", "1", "95", "y"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some((
                 config::PaneSide::Left,
                 config::SplitDirection::Vertical,
@@ -2801,7 +2950,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["5", "1", "2", "60", "y"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some((
                 config::PaneSide::Right,
                 config::SplitDirection::Horizontal,
@@ -2828,7 +2977,7 @@ custom_key = "left alone"
         let mut io = ScriptedIo::new(&["5", "", "", "", "n", "2"]);
 
         assert_eq!(
-            ask_layout(&mut io, &state).unwrap(),
+            ask_layout(&mut io, &state, false).unwrap(),
             Some((
                 config::PaneSide::Right,
                 config::SplitDirection::Horizontal,
@@ -2842,7 +2991,6 @@ custom_key = "left alone"
             io.output
         );
         let target_line = write_target_line(
-            "Pane layout",
             WriteScope::Global,
             state.global_config_path.as_deref().unwrap(),
             state.home_dir.as_deref(),
@@ -2855,12 +3003,86 @@ custom_key = "left alone"
         );
     }
 
+    // ── Blank-line rhythm ─────────────────────────────────────────────────────
+    //
+    // A pty scenario cannot reliably pin this: a `script`-driven capture (see the hazard note
+    // on `AmWorld::run_am_pty` in `tests/cucumber.rs`) has been observed to drop a blank line
+    // that immediately follows a prompt's echoed answer, non-deterministically, depending on
+    // which prompt in the run happens to be first — a `script`/pty-relay timing artifact, not
+    // a defect in what the program actually writes. `ScriptedIo` captures the literal bytes
+    // `am` produces, with no terminal in the loop to race against, which is what makes it the
+    // trustworthy guard here.
+
+    #[test]
+    fn every_top_level_question_opens_with_a_blank_line() {
+        let agent_state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut io = ScriptedIo::new(&[""]);
+        ask_agent(&mut io, &agent_state, None, false).unwrap();
+        assert!(
+            io.output.starts_with("\nWhich agent do you use?\n"),
+            "{}",
+            io.output
+        );
+
+        let container_state = no_runtime(true, Source::CompiledDefault);
+        let mut io = ScriptedIo::new(&[""]);
+        ask_container_enabled(&mut io, &container_state, false).unwrap();
+        assert!(
+            io.output.starts_with("\nNo container runtime found"),
+            "{}",
+            io.output
+        );
+
+        let the_layout_state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::Global,
+        );
+        let mut io = ScriptedIo::new(&[""]);
+        ask_layout(&mut io, &the_layout_state, false).unwrap();
+        assert!(
+            io.output.starts_with("\nWhich layout do you want?\n"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn every_customize_sub_question_opens_with_a_blank_line() {
+        let state = layout_state(
+            config::PaneSide::Left,
+            config::SplitDirection::Horizontal,
+            50,
+            Source::CompiledDefault,
+        );
+        let mut io = ScriptedIo::new(&["5", "1", "2", "60", "y"]);
+
+        ask_layout(&mut io, &state, false).unwrap();
+
+        // Each sub-question's own header is immediately preceded by a blank line — asserted as
+        // an ordered "\n\n<header>" substring rather than a fixed offset, since the preset menu
+        // printed above them isn't a fixed size.
+        for header in [
+            "\nSide by side, or stacked?\n",
+            "\nWhich side should the agent be on?\n",
+            "\nWhat percentage of the window should the agent pane get?\n",
+            "\nHere's what that looks like:\n",
+        ] {
+            assert!(
+                io.output.contains(header),
+                "missing {header:?} in {}",
+                io.output
+            );
+        }
+    }
+
     #[test]
     fn invalid_customize_direction_re_asks() {
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&["5", "9", "1", "", "", "y"]);
 
-        ask_layout(&mut io, &state).unwrap();
+        ask_layout(&mut io, &state, false).unwrap();
 
         assert!(io.output.contains("'9' is not 1 or 2."), "{}", io.output);
     }
@@ -2870,7 +3092,7 @@ custom_key = "left alone"
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&["5", "", "", "150", "50", "y"]);
 
-        ask_layout(&mut io, &state).unwrap();
+        ask_layout(&mut io, &state, false).unwrap();
 
         assert!(
             io.output.contains("must be a number between 1 and 99"),
@@ -2884,7 +3106,7 @@ custom_key = "left alone"
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
-        assert!(ask_layout(&mut io, &state).is_err());
+        assert!(ask_layout(&mut io, &state, false).is_err());
     }
 
     #[test]
@@ -2892,7 +3114,7 @@ custom_key = "left alone"
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&["5"]);
 
-        assert!(ask_layout(&mut io, &state).is_err());
+        assert!(ask_layout(&mut io, &state, false).is_err());
     }
 
     #[test]
@@ -2900,7 +3122,7 @@ custom_key = "left alone"
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&["5", ""]);
 
-        assert!(ask_layout(&mut io, &state).is_err());
+        assert!(ask_layout(&mut io, &state, false).is_err());
     }
 
     #[test]
@@ -2908,7 +3130,7 @@ custom_key = "left alone"
         let state = configured(Some(KnownAgent::Claude), Source::Project);
         let mut io = ScriptedIo::new(&["5", "", ""]);
 
-        assert!(ask_layout(&mut io, &state).is_err());
+        assert!(ask_layout(&mut io, &state, false).is_err());
     }
 
     #[test]
@@ -2920,7 +3142,7 @@ custom_key = "left alone"
             Source::Global,
         );
         let mut io = ScriptedIo::new(&[""]);
-        ask_layout(&mut io, &state).unwrap();
+        ask_layout(&mut io, &state, false).unwrap();
         assert!(
             !io.output.contains("already sets its own"),
             "no project override, no caveat: {}",
@@ -2929,7 +3151,7 @@ custom_key = "left alone"
 
         state.effective_tmux_split_percent.source = Source::Project;
         let mut io = ScriptedIo::new(&[""]);
-        ask_layout(&mut io, &state).unwrap();
+        ask_layout(&mut io, &state, false).unwrap();
         assert!(
             io.output
                 .contains("this project's config already sets its own pane layout"),

@@ -106,6 +106,11 @@ Feature: am setup — guided setup
     When I run "am setup --yes"
     Then the command succeeds
     And the output contains "sessions will use it automatically"
+    # Pins `found_devcontainer_line`'s wiring in `cmd_setup` — the last of the five
+    # shortened-path call sites (see the coverage note in setup_interactive.feature's
+    # "every question states where its answer will be saved" scenario); previously only
+    # unit-tested against a synthetic repo root, never against a real one end to end.
+    And the output contains "Found .devcontainer/devcontainer.json"
 
   # Verification (doctor::run) independently refuses initializeCommand — see
   # doctor.feature's "initializeCommand is reported as refused" — so this is a failing

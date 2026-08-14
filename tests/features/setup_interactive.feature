@@ -45,6 +45,10 @@ Feature: am setup — the interactive prompts
     And the global config sets "tmux.agent_pane" to "right"
     And the global config sets "tmux.split" to "horizontal"
     And the global config sets "tmux.split_percent" to "60"
+    # Pins `set_tmux_layout_line`'s wiring in `cmd_setup` (see the coverage note on "every
+    # question states where its answer will be saved" above) — the fourth of the five
+    # shortened-path call sites; only unit-tested against synthetic paths before this.
+    And the output contains "Set tmux.agent_pane, tmux.split, tmux.split_percent in ~/.config/am/config.toml"
 
   Scenario: customize words the pane question top/bottom after a vertical split, and writes the chosen triple
     When I run "am setup --agent claude" through a pty with input "5\n2\n1\n40\ny\nn"
@@ -67,14 +71,35 @@ Feature: am setup — the interactive prompts
 
   Scenario: every question states where its answer will be saved, with paths shortened for display
     # Overrides the Background's mock runtime with two nonexistent binaries, so the containers
-    # question — normally skipped once a runtime is found — actually fires, and its own
-    # write-target line can be pinned alongside the other two.
+    # question — normally skipped once a runtime is found — actually fires, alongside the
+    # agent and layout questions, so all three write-target lines appear in the same run. The
+    # write-target line no longer names its own question (that's the header line right above
+    # it now) — containers and layout share the exact same "every repo on this machine; saved
+    # to ..." text, so each question's own header is asserted alongside it to confirm it was
+    # actually shown, not just present somewhere in the output.
     Given I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
     And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
     When I run "am setup" through a pty with input "\ny\n\nn"
-    Then the output contains "Agent — just this repo; saved to .am/config.toml."
-    And the output contains "Containers — every repo on this machine; saved to ~/.config/am/config.toml."
-    And the output contains "Pane layout — every repo on this machine; saved to ~/.config/am/config.toml."
+    Then the output contains "Which agent do you use?"
+    And the output contains "just this repo; saved to .am/config.toml."
+    And the output contains "No container runtime found on this machine"
+    And the output contains "Which layout do you want?"
+    And the output contains "every repo on this machine; saved to ~/.config/am/config.toml."
+    # The confirmation lines below are the other place these five call sites (main.rs's
+    # `created_global_config_line`, `set_project_agent_line`, `set_container_enabled_line`,
+    # `set_tmux_layout_line`, `found_devcontainer_line`) are only unit-tested in isolation — no
+    # test previously proved `cmd_setup` actually wires the real `home_dir`/`repo_root` through
+    # to them. Pinning three of the five here (the other two, tmux layout and devcontainer, are
+    # pinned in the scenarios below and in setup.feature respectively) closes that gap.
+    And the output contains "Created ~/.config/am/config.toml"
+    And the output contains 'Set defaults.agent = "claude" in .am/config.toml'
+    And the output contains "Set container.enabled = false in ~/.config/am/config.toml"
+    # This run touches every dim line `am setup` prints (the init report, both write-target
+    # lines, both "currently: ..." lines) — the one scenario worth spending the ANSI-byte check
+    # on, since `run_am_pty`'s `NO_COLOR=1` is what keeps every `contains` assertion above
+    # meaningful: `contains` still matches its substring even if ANSI codes wrapped around it,
+    # so nothing above would fail if `NO_COLOR` silently stopped working.
+    And the output contains no color escape codes
 
   Scenario: an interactive first run leaves no stale example above any value it activates
     When I run "am setup" through a pty with input "\n5\n2\n2\n77\ny\nn"

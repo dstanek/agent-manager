@@ -49,11 +49,20 @@ detected state can't answer, then verifies the result with `am doctor`'s own che
 agent to use, whether to proceed with containers disabled (only when no container runtime is
 found and there's a global config to write to), and a pane layout (always asked, unless `--yes`
 or there's no global config to write to), writes the answers, and runs `doctor::run()` to
-verify — offering to start a first session on success. Every question now states, as its own
-first line, the scope and file path its answer is saved to (`Agent — just this repo; saved to
-.am/config.toml.`), so a change's destination is never left to be inferred. `cargo clippy
---all-targets -- -D warnings` is clean and `cargo test` passes (446 unit tests + 93 cucumber
-scenarios / 753 steps, 0 failed). Code review passed with all findings resolved.
+verify — offering to start a first session on success. Every question states where its answer
+is saved — scope first, then the file path (e.g. `just this repo; saved to .am/config.toml.`)
+— so a change's destination is never left to be inferred.
+
+A follow-up readability pass restyled both `am init` and `am setup`'s output: `am init` moved
+from a flat line list to a headline-plus-detail shape (`Initialized am in this repo.` /
+`am is already initialized in this repo.`, with the detail indented underneath); `am setup`'s
+own status and confirmation lines now shorten every path (project repo-relative, global
+`~`-prefixed), and each question opens with its own header line, then the dimmed, indented
+write-target and "currently: ..." lines below it, with blank lines separating phases —
+`[1] claude  (already authenticated on this host)` shortened to `[1] claude    authenticated`.
+Presentation only; no behavior, exit code, or write changed. `cargo clippy --all-targets --
+-D warnings` is clean and `cargo test` passes (467 unit tests + 96 cucumber scenarios / 791
+steps, 0 failed). Code review passed with all findings resolved.
 
 - [x] `src/cli.rs`: `Commands::Setup { yes, agent }`
 - [x] `main.rs`: `cmd_init`'s directory/`.gitignore` logic extracted into `init_project`, shared
@@ -64,7 +73,7 @@ scenarios / 753 steps, 0 failed). Code review passed with all findings resolved.
       for `defaults.agent`, `container.enabled`, and the three `tmux.*` layout keys), the
       `Io`/`TermIo`/`ScriptedIo` seam, `ask_agent`/`ask_container_enabled`/`ask_layout`
       (`ask_layout_custom`'s direction-first sub-flow, `render_layout`'s ASCII previews), the
-      shared `write_target_line` helper all three questions print as their first line, the
+      shared `write_target_line`/`dim_line` helpers each question prints under its own header, the
       config skeletons, and the `toml_edit`-based `update_project_agent`/
       `update_global_container_enabled`/`update_global_tmux_layout` (no-op, byte-for-byte, when
       the requested value already matches, and per-key for the three layout keys, so a
