@@ -821,18 +821,91 @@ async fn then_output_not_contains(world: &mut AmWorld, text: String) {
     );
 }
 
+/// The absolute-path half of pinning `start_detail_lines`'s worktree shortening: `project_path`
+/// is a tempdir path known only at runtime, so it can't be spelled out as a literal Gherkin
+/// `{string}`. Written as its own step (rather than reusing `then_output_not_contains` with a
+/// computed string from a `Given`/`When` step) because nothing else needs this value —
+/// `am setup`'s own shortening is already pinned elsewhere without needing the raw path back.
+#[then("the output does not contain the project's absolute path")]
+async fn then_output_lacks_absolute_project_path(world: &mut AmWorld) {
+    let project_path = world.project_path().to_path_buf();
+    let combined = world.combined_output();
+    assert!(
+        !combined.contains(&project_path.display().to_string()),
+        "expected output to NOT contain the absolute project path {}\ngot:\n{combined}",
+        project_path.display(),
+    );
+}
+
 /// `{string}` never unescapes its capture (see `given_project_config`'s and `when_run_pty`'s
 /// own manual `.replace("\\n", ...)` calls above) — a literal `\x1b` in a `.feature` file would
 /// be matched as those four characters, not the ESC control byte, so a step written that way
-/// would be silently vacuous against real ANSI output. This checks for the real byte directly,
-/// the only reliable way to assert `run_am_pty`'s `NO_COLOR=1` (see its own doc comment) is
-/// doing its job: the dim lines `am setup` prints render as plain text, not `\x1b[2m...\x1b[0m`.
+/// would be silently vacuous against real ANSI output (confirmed by injection: `init.feature`
+/// used to assert `the output does not contain "\x1b[2m"` and stayed green with the dimming it
+/// was meant to catch actually present). This checks for the real byte directly. Two distinct
+/// uses: asserting `run_am_pty`'s `NO_COLOR=1` (see its own doc comment) is doing its job — the
+/// dim lines `am setup` prints render as plain text, not `\x1b[2m...\x1b[0m` — and, with color
+/// forced on instead (`CLICOLOR_FORCE=1`, `NO_COLOR` cleared via `extra_env`), proving a
+/// command that must never color or dim anything (`am init`'s own report) genuinely doesn't,
+/// rather than merely not doing so because color happened to be off.
 #[then("the output contains no color escape codes")]
 async fn then_output_has_no_color(world: &mut AmWorld) {
     let combined = world.combined_output();
     assert!(
         !combined.contains('\u{1b}'),
-        "expected no ANSI escape bytes under NO_COLOR=1:\n{combined}",
+        "expected no ANSI escape bytes in the output:\n{combined}",
+    );
+}
+
+/// Checks `text` appears as a complete, unadorned line — no leading indent, no ANSI escapes.
+/// Written for headlines (`Started session '...'`, `Opened new window for session '...'`)
+/// that the content/structure split requires to stay plain even when detail lines under them
+/// are dimmed; a full-line match (not `contains`) is what actually proves that, since a
+/// substring check would still pass if the same text were wrapped in `\x1b[2m...\x1b[0m` or
+/// indented. Assert this only under a scenario that forces color on (`CLICOLOR_FORCE=1`,
+/// `NO_COLOR` cleared) — under the harness's default `NO_COLOR=1` a dimmed line renders
+/// identically to a plain one, so the check would prove nothing.
+#[then(expr = "the output contains the plain line {string}")]
+async fn then_output_contains_plain_line(world: &mut AmWorld, text: String) {
+    let combined = world.combined_output();
+    assert!(
+        combined.lines().any(|line| line == text),
+        "expected output to contain the plain (unindented, uncolored) line {text:?}\ngot:\n{combined}",
+    );
+}
+
+/// Checks `text` appears as a complete line wrapped exactly the way `onboarding::dim_line`
+/// wraps it: two-space indent, `Color::Dim`'s `\x1b[2m`, then `\x1b[0m`. Compares the real ESC
+/// byte directly rather than through a `{string}` capture — the cucumber crate does not
+/// unescape `\x1b` in a quoted Gherkin string (confirmed by injection: a step written as
+/// `the output contains "\x1b[2m"` compares against four literal ASCII characters and never
+/// matches real ANSI output), so a step relying on that would pass whether or not the line was
+/// actually dimmed. Full-line match, not `contains`, for the same reason as
+/// `then_output_contains_plain_line`: substring matching can't tell "dimmed" from "dimmed
+/// twice" or "dimmed inside something else dimmed".
+#[then(expr = "the output contains the dimmed line {string}")]
+async fn then_output_contains_dimmed_line(world: &mut AmWorld, text: String) {
+    let combined = world.combined_output();
+    let expected = format!("\x1b[2m  {text}\x1b[0m");
+    assert!(
+        combined.lines().any(|line| line == expected),
+        "expected output to contain the dimmed line {text:?}\ngot:\n{combined}",
+    );
+}
+
+/// Checks `text` appears as a complete line prefixed by the yellow `Note:` `note_prefix()`
+/// produces, indented two spaces, and *not* nested inside a further `Color::Dim` wrap — the
+/// same "don't nest a second color inside an already-colored token" rule
+/// `render_init_report`'s `.gitignore` advisory follows. Full-line match: a substring check
+/// would still pass if the whole line were additionally wrapped in `\x1b[2m...\x1b[0m`, which
+/// is exactly the regression this exists to catch.
+#[then(expr = "the output contains the note line {string}")]
+async fn then_output_contains_note_line(world: &mut AmWorld, text: String) {
+    let combined = world.combined_output();
+    let expected = format!("  \x1b[33mNote:\x1b[0m {text}");
+    assert!(
+        combined.lines().any(|line| line == expected),
+        "expected output to contain the note line {text:?}\ngot:\n{combined}",
     );
 }
 

@@ -744,6 +744,8 @@ fn cmd_start(
         container: session_container,
     };
 
+    let color_enabled = color::enabled(color::Stream::Stdout);
+
     // Not in tmux with a container: record the session then replace this process.
     // Recording before exec ensures the session is always tracked; if exec fails
     // the user can run 'am destroy <slug>' to clean up.
@@ -752,8 +754,18 @@ fn cmd_start(
             session::add_session_global(new_session)?;
             guard.commit();
             println!("Started session '{slug}'");
-            println!("  worktree:  {}", worktree_path.display());
-            println!("  container: {container_name}");
+            for line in start_detail_lines(
+                &worktree_path,
+                &repo_root,
+                None,
+                Some(container_name.as_str()),
+                // `None` even in devcontainer mode: this path never showed the `image:`
+                // line either — see `start_detail_lines`'s doc comment.
+                None,
+                color_enabled,
+            ) {
+                println!("{line}");
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -785,15 +797,59 @@ fn cmd_start(
     guard.commit();
 
     println!("Started session '{slug}'");
-    println!("  worktree:  {}", worktree_path.display());
-    println!("  branch:    am/{slug}");
-    if let Some((mode, image)) = mode {
-        println!("  container: {container_name}");
-        if mode == session::ContainerMode::Devcontainer {
-            println!("  image:     {image} (from devcontainer.json)");
-        }
+    for line in start_detail_lines(
+        &worktree_path,
+        &repo_root,
+        Some(&format!("am/{slug}")),
+        mode.is_some().then_some(container_name.as_str()),
+        mode,
+        color_enabled,
+    ) {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// `am start`'s indented detail lines — dimmed, with the worktree path shortened relative to
+/// the repo root the same way `am setup` shortens a project-scoped path (a worktree always
+/// lives at `<repo-root>/.am/worktrees/<slug>` — see `worktree.rs` — so repo-relative reads as
+/// `.am/worktrees/<slug>`, far shorter than a `~`-relative path through the repo's own location
+/// on disk, which is what makes repo-relative the right shortening here even though `am setup`
+/// uses `~` for its own, differently-scoped, paths).
+///
+/// Shared by both `cmd_start` call sites — the container-exec early return and the normal
+/// return — so the styling can't drift between them. Which fields are passed at each site is
+/// left as it already was (the exec path never reported `branch` or `image`); unifying that is
+/// a content change, not a styling one, so it's out of scope here.
+fn start_detail_lines(
+    worktree_path: &Path,
+    repo_root: &Path,
+    branch: Option<&str>,
+    container_name: Option<&str>,
+    devcontainer_image: Option<(session::ContainerMode, String)>,
+    color: bool,
+) -> Vec<String> {
+    let shown_worktree = onboarding::relative_shorten(worktree_path, Some(repo_root));
+    let mut lines = vec![onboarding::dim_line(
+        &format!("worktree:  {}", shown_worktree.display()),
+        color,
+    )];
+    if let Some(branch) = branch {
+        lines.push(onboarding::dim_line(&format!("branch:    {branch}"), color));
+    }
+    if let Some(container_name) = container_name {
+        lines.push(onboarding::dim_line(
+            &format!("container: {container_name}"),
+            color,
+        ));
+        if let Some((session::ContainerMode::Devcontainer, image)) = devcontainer_image {
+            lines.push(onboarding::dim_line(
+                &format!("image:     {image} (from devcontainer.json)"),
+                color,
+            ));
+        }
+    }
+    lines
 }
 
 // ── am start: container planning ──────────────────────────────────────────────
@@ -1279,8 +1335,19 @@ fn cmd_attach(slug: &str) -> anyhow::Result<()> {
         session::update_session_global(s.clone())?;
         println!("Opened new window for session '{slug}'.");
         if s.container.is_some() {
-            println!("  Note: the container was stopped when the window closed.");
-            println!("  To restart cleanly: am destroy --force {slug} && am start {slug}");
+            let color_enabled = color::enabled(color::Stream::Stdout);
+            // `note_prefix()` already carries its own color; dimming this line too would
+            // nest a second color inside it, the same case `render_init_report`'s own
+            // `.gitignore` advisory line handles by keeping the prefix at its own severity
+            // and leaving only the rest of the line plain.
+            println!("  {} the container was stopped when the window closed.", note_prefix());
+            println!(
+                "{}",
+                onboarding::dim_line(
+                    &format!("To restart cleanly: am destroy --force {slug} && am start {slug}"),
+                    color_enabled
+                )
+            );
         }
     } else {
         println!("Attached to session '{slug}'.");
@@ -1667,10 +1734,12 @@ mod tests {
     use super::{
         created_global_config_line, found_devcontainer_line, init_project, note_prefix,
         pane_layout, print_init_line_dim, print_init_line_plain, render_init_report,
-        set_container_enabled_line, set_project_agent_line, set_tmux_layout_line, InitLine,
+        set_container_enabled_line, set_project_agent_line, set_tmux_layout_line,
+        start_detail_lines, InitLine,
     };
     use crate::command::shell_quote;
     use crate::config::PaneSide;
+    use crate::session;
 
     // ── init_project ─────────────────────────────────────────────────────────
 
@@ -2013,6 +2082,80 @@ mod tests {
             "Found .devcontainer/devcontainer.json — sessions will use it automatically \
              (container.mode = \"auto\")"
         );
+    }
+
+    // ── `am start`'s detail lines ─────────────────────────────────────────────
+
+    #[test]
+    fn start_detail_lines_shortens_the_worktree_path_relative_to_the_repo_root() {
+        let worktree = Path::new("/repo/.am/worktrees/feat");
+        let lines = start_detail_lines(worktree, Path::new("/repo"), None, None, None, false);
+        assert_eq!(lines, vec!["  worktree:  .am/worktrees/feat"]);
+    }
+
+    #[test]
+    fn start_detail_lines_includes_branch_and_container_when_given() {
+        let worktree = Path::new("/repo/.am/worktrees/feat");
+        let lines = start_detail_lines(
+            worktree,
+            Path::new("/repo"),
+            Some("am/feat"),
+            Some("am-feat-abc123"),
+            None,
+            false,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "  worktree:  .am/worktrees/feat",
+                "  branch:    am/feat",
+                "  container: am-feat-abc123",
+            ]
+        );
+    }
+
+    #[test]
+    fn start_detail_lines_includes_the_image_only_in_devcontainer_mode() {
+        let worktree = Path::new("/repo/.am/worktrees/feat");
+        let image_lines = start_detail_lines(
+            worktree,
+            Path::new("/repo"),
+            None,
+            Some("am-feat-abc123"),
+            Some((session::ContainerMode::Devcontainer, "my-image:latest".to_string())),
+            false,
+        );
+        assert_eq!(
+            image_lines.last().unwrap(),
+            "  image:     my-image:latest (from devcontainer.json)"
+        );
+
+        let no_image_lines = start_detail_lines(
+            worktree,
+            Path::new("/repo"),
+            None,
+            Some("am-feat-abc123"),
+            Some((session::ContainerMode::Image, "my-image:latest".to_string())),
+            false,
+        );
+        assert_eq!(no_image_lines.len(), 2);
+    }
+
+    #[test]
+    fn start_detail_lines_dims_every_line_when_color_is_enabled() {
+        let worktree = Path::new("/repo/.am/worktrees/feat");
+        let lines = start_detail_lines(
+            worktree,
+            Path::new("/repo"),
+            Some("am/feat"),
+            Some("am-feat-abc123"),
+            None,
+            true,
+        );
+        for line in &lines {
+            assert!(line.starts_with("\x1b[2m  "), "expected a dimmed line, got: {line}");
+            assert!(line.ends_with("\x1b[0m"), "expected a dimmed line, got: {line}");
+        }
     }
 
     #[test]

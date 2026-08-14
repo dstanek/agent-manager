@@ -60,9 +60,21 @@ own status and confirmation lines now shorten every path (project repo-relative,
 `~`-prefixed), and each question opens with its own header line, then the dimmed, indented
 write-target and "currently: ..." lines below it, with blank lines separating phases —
 `[1] claude  (already authenticated on this host)` shortened to `[1] claude    authenticated`.
-Presentation only; no behavior, exit code, or write changed. `cargo clippy --all-targets --
--D warnings` is clean and `cargo test` passes (467 unit tests + 96 cucumber scenarios / 791
-steps, 0 failed). Code review passed with all findings resolved.
+
+A second pass carried the same treatment to `am start` and `am attach`. `am start`'s indented
+detail lines (`worktree:`, `branch:`, `container:`, `image:`) are now dimmed, and `worktree:`
+is shortened relative to the repo root instead of printing the full absolute path; the two
+near-duplicate renderers at its two call sites (the exec-without-tmux early return and the
+normal in-tmux return) were unified into one, `start_detail_lines`, with no change to which
+fields either path prints. `am attach`'s `Note:` line, printed when a stopped session's window
+is recreated, now goes through the shared `note_prefix()` instead of a hardcoded string, so it
+carries the same yellow severity as every other note in `am`; the `To restart cleanly: ...` line
+beneath it is dimmed. Presentation only; no behavior, exit code, or write changed in either pass.
+`cargo clippy --all-targets -- -D warnings` is clean in both colour environments and `cargo test`
+passes (471 unit tests + 102 cucumber scenarios / 839 steps, 0 failed) as of the `am start`/
+`am attach` pass. Code review passed for both passes, with all findings resolved — the second
+pass's only finding was that `am attach`'s headline had nothing pinning it as plain, proven by
+wrapping it in `dim_line` and watching the whole suite stay green; it is now covered.
 
 - [x] `src/cli.rs`: `Commands::Setup { yes, agent }`
 - [x] `main.rs`: `cmd_init`'s directory/`.gitignore` logic extracted into `init_project`, shared

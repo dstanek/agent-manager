@@ -51,5 +51,26 @@ Feature: am start and am attach with tmux
     And the tmux window no longer exists
     When I run "am attach my-feature"
     Then the command succeeds
-    And the output contains "am destroy"
-    And the output contains "am start"
+    And the output contains "  Note: the container was stopped when the window closed."
+    And the output contains "To restart cleanly: am destroy --force my-feature && am start my-feature"
+
+  Scenario: attach's headline stays plain when its window is recreated
+    Given a session "my-feature" has been started
+    And the tmux window no longer exists
+    And I have set env "NO_COLOR" to ""
+    And I have set env "CLICOLOR_FORCE" to "1"
+    When I run "am attach my-feature"
+    Then the command succeeds
+    And the output contains the plain line "Opened new window for session 'my-feature'."
+
+  Scenario: attach's restart note is colored like every other Note, and stays outside the dimmed hint under it
+    Given am init has been run
+    And I am using a mock container runtime
+    And a session "my-feature" has been started
+    And the tmux window no longer exists
+    And I have set env "NO_COLOR" to ""
+    And I have set env "CLICOLOR_FORCE" to "1"
+    When I run "am attach my-feature"
+    Then the command succeeds
+    And the output contains the note line "the container was stopped when the window closed."
+    And the output contains the dimmed line "To restart cleanly: am destroy --force my-feature && am start my-feature"

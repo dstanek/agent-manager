@@ -24,6 +24,19 @@ Feature: am setup — guided setup
     And the global config file exists
     And the output contains "Ready"
 
+  Scenario: setup's init report renders dimmed — the contrast to init's own plain report
+    # init.feature's "init's report never dims, even when color is forced on" scenario pins
+    # the other half of this rule: the same report (`InitLine`, `main.rs`) renders plain for
+    # `am init` and dimmed for `am setup`. Neither half means anything without the other —
+    # a renderer that dims unconditionally would still pass an "am setup dims" check alone.
+    Given I have set env "NO_COLOR" to ""
+    And I have set env "CLICOLOR_FORCE" to "1"
+    And claude credentials are present
+    And I am using a mock container runtime
+    When I run "am setup --yes --agent claude"
+    Then the command succeeds
+    And the output contains the dimmed line "Created .am/config.toml"
+
   Scenario: setup preserves comments and table order when changing the agent
     Given a project config containing "# custom note above container\n[container]\nenabled = true\n\n# defaults section, deliberately placed below container\n[defaults]\nagent = \"codex\"  # picked for the OPENAI project\n"
     And claude credentials are present
