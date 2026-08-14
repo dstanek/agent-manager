@@ -17,6 +17,28 @@ Feature: am setup — the interactive prompts
     And claude credentials are present
     And I am using a mock container runtime
 
+  Scenario: verification is printed before the layout question on a clean report
+    # Pins the new ordering (Resolved Decisions #10) directly, not just the presence of both
+    # pieces of text — `then_output_order` proves "Checking your setup..." actually came
+    # first, which two separate `contains` checks could not.
+    Given a global config containing ""
+    When I run "am setup --agent claude" through a pty with input "1\nn"
+    Then the command succeeds
+    And the output contains "Checking your setup..." before "Which layout do you want?"
+
+  Scenario: the layout question is never reached when verification still fails
+    # A returning setup (global config already exists) with no runtime reachable: the
+    # containers question offers to disable containers; declining ("n") leaves them enabled,
+    # so verification still fails on the missing runtime and the layout question — reached
+    # only after a clean report — is never shown.
+    Given a global config containing ""
+    And I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
+    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
+    When I run "am setup --agent claude" through a pty with input "n"
+    Then the command fails
+    And the output contains "What to do next:"
+    And the output does not contain "Which layout do you want?"
+
   Scenario Outline: choosing a layout preset writes exactly that triple to the global config, never the project one
     Given a global config containing "[tmux]\nagent_pane = \"right\"\nsplit = \"vertical\"\nsplit_percent = 33\n"
     When I run "am setup --agent claude" through a pty with input "<answer>\nn"
@@ -36,7 +58,11 @@ Feature: am setup — the interactive prompts
       | 4      | left       | vertical   | 50             |
 
   Scenario: customize words the pane question left/right after a horizontal split, and writes the chosen triple
-    When I run "am setup --agent claude" through a pty with input "5\n1\n2\n60\ny\nn"
+    # No global config exists yet, so this is a fresh setup: the containers consent question
+    # (ask_container_consent) fires before verification and layout. Accepting its default
+    # ("") keeps container.enabled at its compiled-default true, matching this scenario's
+    # mocked runtime and writing nothing — the extra token is purely to get past it.
+    When I run "am setup --agent claude" through a pty with input "\n5\n1\n2\n60\ny\nn"
     Then the command succeeds
     And the output contains "Which side should the agent be on?"
     And the output contains "[1] left"
@@ -51,7 +77,9 @@ Feature: am setup — the interactive prompts
     And the output contains "Set tmux.agent_pane, tmux.split, tmux.split_percent in ~/.config/am/config.toml"
 
   Scenario: customize words the pane question top/bottom after a vertical split, and writes the chosen triple
-    When I run "am setup --agent claude" through a pty with input "5\n2\n1\n40\ny\nn"
+    # See the note on the scenario above: fresh setup, so the leading "" accepts the
+    # containers consent question's default before the layout customize flow begins.
+    When I run "am setup --agent claude" through a pty with input "\n5\n2\n1\n40\ny\nn"
     Then the command succeeds
     And the output contains "Should the agent be on top or on the bottom?"
     And the output contains "[1] top"
@@ -62,7 +90,9 @@ Feature: am setup — the interactive prompts
     And the global config sets "tmux.split_percent" to "40"
 
   Scenario: declining the customize preview re-shows the preset menu instead of the whole flow restarting elsewhere
-    When I run "am setup --agent claude" through a pty with input "5\n\n\n\nn\n2\nn"
+    # See the note on "customize words the pane question left/right ..." above: fresh setup,
+    # so the leading "" accepts the containers consent question's default first.
+    When I run "am setup --agent claude" through a pty with input "\n5\n\n\n\nn\n2\nn"
     Then the command succeeds
     And the output contains "Use this layout?"
     And the global config sets "tmux.agent_pane" to "right"
@@ -70,19 +100,26 @@ Feature: am setup — the interactive prompts
     And the global config sets "tmux.split_percent" to "50"
 
   Scenario: every question states where its answer will be saved, with paths shortened for display
-    # Overrides the Background's mock runtime with two nonexistent binaries, so the containers
-    # question — normally skipped once a runtime is found — actually fires, alongside the
-    # agent and layout questions, so all three write-target lines appear in the same run. The
-    # write-target line no longer names its own question (that's the header line right above
-    # it now) — containers and layout share the exact same "every repo on this machine; saved
-    # to ..." text, so each question's own header is asserted alongside it to confirm it was
-    # actually shown, not just present somewhere in the output.
-    Given I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
-    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
-    When I run "am setup" through a pty with input "\ny\n\nn"
+    # No global config exists yet (this scenario never seeds one), so this is a fresh setup:
+    # the containers question is `ask_container_consent`, not the returning-setup
+    # `ask_container_enabled` — it fires alongside the agent and layout questions regardless
+    # of the Background's mocked (found) runtime, so all three write-target lines appear in
+    # the same run. Declining it ("n") still writes container.enabled = false, and — because a
+    # runtime genuinely is mocked as present — verification still passes, so the layout
+    # question is still reached. The write-target line no longer names its own question
+    # (that's the header line right above it now) — containers and layout share the exact
+    # same "every repo on this machine; saved to ..." text, so each question's own header is
+    # asserted alongside it to confirm it was actually shown, not just present somewhere in
+    # the output.
+    When I run "am setup" through a pty with input "\nn\n\nn"
     Then the output contains "Which agent do you use?"
     And the output contains "just this repo; saved to .am/config.toml."
-    And the output contains "No container runtime found on this machine"
+    And the output contains "Use isolated containers for your sessions?"
+    # A runtime is mocked as present (the feature Background), so the consent question's "no
+    # runtime found yet" note must not appear, and neither must the old failure-framed
+    # question it replaces on a fresh setup — see Resolved Decisions #12.
+    And the output does not contain "no container runtime was found"
+    And the output does not contain "No container runtime found on this machine"
     And the output contains "Which layout do you want?"
     And the output contains "every repo on this machine; saved to ~/.config/am/config.toml."
     # The confirmation lines below are the other place these five call sites (main.rs's
@@ -101,8 +138,35 @@ Feature: am setup — the interactive prompts
     # so nothing above would fail if `NO_COLOR` silently stopped working.
     And the output contains no color escape codes
 
+  Scenario: the containers consent question notes a missing runtime without blocking the choice
+    # Fresh setup (no global config seeded) with no runtime reachable — the consent question
+    # still fires (it is never gated on runtime absence, unlike the returning-setup framing
+    # below), and adds its one extra dim note. Verification fails afterwards regardless of the
+    # answer given here (no real runtime, and the mocked-runtime test harness itself forces
+    # container.enabled = true via AM_CONTAINER_ENABLED) — this scenario only cares what the
+    # consent question itself printed before that happens.
+    Given I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
+    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
+    When I run "am setup" through a pty with input "\n\n"
+    Then the output contains "Use isolated containers for your sessions?"
+    And the output contains "no container runtime was found on this machine yet"
+
+  Scenario: a returning setup still uses the original failure-framed containers question, unchanged
+    # A global config already exists (even an empty one), so this is a returning setup: the
+    # containers question is the original `ask_container_enabled`, not `ask_container_consent`
+    # — the two framings are mutually exclusive, and this pins the other half of that.
+    Given a global config containing ""
+    And I have set env "AM_PODMAN_BIN" to "/nonexistent/podman"
+    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
+    When I run "am setup --agent claude" through a pty with input "n"
+    Then the output contains "No container runtime found on this machine (neither podman nor docker)."
+    And the output does not contain "Use isolated containers for your sessions?"
+
   Scenario: an interactive first run leaves no stale example above any value it activates
-    When I run "am setup" through a pty with input "\n5\n2\n2\n77\ny\nn"
+    # Fresh setup: the second "" accepts the containers consent question's default, ahead of
+    # the layout customize flow — see the note on "customize words the pane question left/right
+    # ..." above.
+    When I run "am setup" through a pty with input "\n\n5\n2\n2\n77\ny\nn"
     Then the command succeeds
     And the file ".am/config.toml" does not contain '# agent = "claude"'
     And the file ".am/config.toml" contains 'agent = "claude"'
@@ -115,7 +179,9 @@ Feature: am setup — the interactive prompts
 
   Scenario: a project config from an earlier "am init" invocation also loses its stale agent example
     Given am init has been run
-    When I run "am setup" through a pty with input "\n1\nn"
+    # Fresh setup (an earlier "am init" only creates the project file, not the global one), so
+    # the second "" accepts the containers consent question's default.
+    When I run "am setup" through a pty with input "\n\n1\nn"
     Then the command succeeds
     And the file ".am/config.toml" contains 'agent = "claude"'
     And the file ".am/config.toml" does not contain '# agent = "claude"'
@@ -143,11 +209,14 @@ Feature: am setup — the interactive prompts
 
   Scenario: the project-override caveat appears only when the project config sets its own layout
     Given a project config containing "[defaults]\nagent = \"claude\"\n[tmux]\nsplit_percent = 65\n"
-    When I run "am setup --agent claude" through a pty with input "1\nn"
+    # Fresh setup (no global config seeded): the leading "" accepts the containers consent
+    # question's default before the layout question is reached.
+    When I run "am setup --agent claude" through a pty with input "\n1\nn"
     Then the command succeeds
     And the output contains "this project's config already sets its own pane layout"
 
   Scenario: no project-override caveat when the project config sets nothing of its own
-    When I run "am setup --agent claude" through a pty with input "1\nn"
+    # Fresh setup: same leading "" as the scenario above.
+    When I run "am setup --agent claude" through a pty with input "\n1\nn"
     Then the command succeeds
     And the output does not contain "already sets its own"

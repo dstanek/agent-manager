@@ -821,6 +821,25 @@ async fn then_output_not_contains(world: &mut AmWorld, text: String) {
     );
 }
 
+/// Asserts relative ordering in the captured output — the direct way to pin a sequencing
+/// claim (e.g. "verification runs before the layout question") instead of inferring it from
+/// two separate `contains` checks, which prove presence but say nothing about order. Mirrors
+/// `then_global_config_order`'s same pattern for a config file.
+#[then(expr = "the output contains {string} before {string}")]
+async fn then_output_order(world: &mut AmWorld, first: String, second: String) {
+    let combined = world.combined_output();
+    let first_pos = combined
+        .find(&first)
+        .unwrap_or_else(|| panic!("{first:?} not found in output\n{combined}"));
+    let second_pos = combined
+        .find(&second)
+        .unwrap_or_else(|| panic!("{second:?} not found in output\n{combined}"));
+    assert!(
+        first_pos < second_pos,
+        "expected {first:?} to appear before {second:?} in output\n{combined}",
+    );
+}
+
 /// The absolute-path half of pinning `start_detail_lines`'s worktree shortening: `project_path`
 /// is a tempdir path known only at runtime, so it can't be spelled out as a literal Gherkin
 /// `{string}`. Written as its own step (rather than reusing `then_output_not_contains` with a

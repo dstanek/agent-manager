@@ -105,6 +105,16 @@ Feature: am setup — guided setup
     And the output contains "problem"
     And the output does not contain "Next steps"
 
+  Scenario: a failing report ends with concrete remediation, not a bare pointer back at itself
+    Given I have set env "AM_CONTAINER_ENABLED" to "true"
+    And I have set env "AM_DOCKER_BIN" to "/nonexistent/docker"
+    When I run "am setup --yes" with env "AM_PODMAN_BIN" = "/nonexistent/podman"
+    Then the command fails
+    And the output contains "What to do next:"
+    And the output contains "  - install Podman"
+    And the output contains "Then re-run 'am setup'."
+    And the output does not contain "Fix the items above, then re-run 'am setup'."
+
   Scenario: an unknown --agent value is rejected before any file is written
     When I run "am setup --yes --agent not-a-real-agent"
     Then the command fails

@@ -455,7 +455,9 @@ fn check_runtime(report: &mut Report, cfg: &Config) -> Option<container::Contain
                 RUNTIME,
                 "runtime",
                 e.to_string(),
-                "install Podman or Docker, or set container.enabled = false",
+                "install Podman (https://podman.io/docs/installation) or Docker \
+                 (https://docs.docker.com/get-docker/), or set container.enabled = false in \
+                 .am/config.toml",
             ));
             None
         }
@@ -580,7 +582,8 @@ fn check_image_mode(report: &mut Report, cfg: &Config, agent_name: Option<&str>)
             ENVIRONMENT,
             "image",
             "no image configured for the selected agent",
-            "set an agent with --agent or defaults.agent, or set container.image",
+            "run 'am setup --agent <name>', or set defaults.agent = \"...\" in \
+             .am/config.toml, or set container.image",
         )),
     }
 }
@@ -797,7 +800,7 @@ fn check_agent(report: &mut Report, agent_name: Option<&str>) {
             AGENT,
             "credentials",
             first_line(&e.to_string()),
-            format!("authenticate {agent} on this machine, then re-run 'am doctor'"),
+            container::credentials_hint(agent),
         )),
     }
 }
@@ -834,6 +837,14 @@ fn first_line(text: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // Serializes tests that mutate process-wide env vars (HOME, AM_PODMAN_BIN, ...) so
+    // they cannot observe each other's state — see CLAUDE.md's Testing section.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn find(report: &Report, name: &str) -> Check {
         report
@@ -1290,6 +1301,63 @@ mod tests {
         let check = find(&report, "agent");
         assert_eq!(check.status, Status::Ok);
         assert_eq!(check.detail, "claude");
+    }
+
+    #[test]
+    fn missing_credentials_hint_matches_container_credentials_hint() {
+        // HOME points somewhere with no ~/.claude, so credentials is guaranteed to fail
+        // regardless of whatever the developer running the suite has signed into.
+        let _g = lock_env();
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let report = run(Some((tmp.path(), Vcs::Git)), Some("claude"));
+
+        std::env::remove_var("HOME");
+
+        let check = find(&report, "credentials");
+        assert_eq!(check.status, Status::Fail);
+        assert_eq!(
+            check.hint.as_deref(),
+            Some(container::credentials_hint(container::KnownAgent::Claude))
+        );
+    }
+
+    #[test]
+    fn missing_runtime_hint_names_both_install_links() {
+        let _g = lock_env();
+        std::env::set_var("AM_PODMAN_BIN", "/does/not/exist/podman");
+        std::env::set_var("AM_DOCKER_BIN", "/does/not/exist/docker");
+
+        let mut report = Report::default();
+        let mut cfg = Config::default();
+        cfg.container.enabled = true;
+        check_runtime(&mut report, &cfg);
+
+        std::env::remove_var("AM_PODMAN_BIN");
+        std::env::remove_var("AM_DOCKER_BIN");
+
+        let check = find(&report, "runtime");
+        assert_eq!(check.status, Status::Fail);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("https://podman.io/docs/installation"), "{hint}");
+        assert!(hint.contains("https://docs.docker.com/get-docker/"), "{hint}");
+        assert!(hint.contains("container.enabled = false"), "{hint}");
+    }
+
+    #[test]
+    fn missing_image_hint_names_a_concrete_fix() {
+        let mut report = Report::default();
+        let cfg = Config::default();
+        check_image_mode(&mut report, &cfg, None);
+
+        let check = find(&report, "image");
+        assert_eq!(check.status, Status::Fail);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("am setup --agent"), "{hint}");
+        assert!(hint.contains("defaults.agent"), "{hint}");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

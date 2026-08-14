@@ -70,11 +70,32 @@ fields either path prints. `am attach`'s `Note:` line, printed when a stopped se
 is recreated, now goes through the shared `note_prefix()` instead of a hardcoded string, so it
 carries the same yellow severity as every other note in `am`; the `To restart cleanly: ...` line
 beneath it is dimmed. Presentation only; no behavior, exit code, or write changed in either pass.
-`cargo clippy --all-targets -- -D warnings` is clean in both colour environments and `cargo test`
-passes (471 unit tests + 102 cucumber scenarios / 839 steps, 0 failed) as of the `am start`/
-`am attach` pass. Code review passed for both passes, with all findings resolved — the second
-pass's only finding was that `am attach`'s headline had nothing pinning it as plain, proven by
-wrapping it in `dim_line` and watching the whole suite stay green; it is now covered.
+
+A third pass, an on-ramp revision (spec: [Resolved Decisions](specs/guided-setup.md#resolved-decisions)
+#10–#14), responded to feedback that `am setup` was "a strong guided configuration command, but
+not yet a complete first-time-user on-ramp." Five changes: readiness (`doctor::run()`) now runs
+before the pane-layout question instead of after it, so a first-time user is never asked to pick
+pane proportions before knowing whether the tool can even start a session — agent → containers →
+doctor's checks → *(only if clean)* layout → first session; a failing run now ends with a
+"What to do next:" block that re-lists every failing check's own hint as a flat checklist,
+replacing the old "Fix the items above, then re-run 'am setup'." dead end — the hints themselves
+were strengthened in `doctor.rs`/`container.rs` (concrete install links for a missing runtime,
+`container::credentials_hint` naming each agent's actual sign-in command, a concrete example for
+a missing image), so `am doctor` gets the identical improvement for free; a brand-new machine
+(no `~/.config/am/config.toml` yet) is now asked once, explicitly, whether it wants isolated
+containers at all — recommended, defaulted to yes — rather than the choice being made implicitly
+by whatever happened to be on `PATH`; the agent menu's per-agent note changed from
+`"authenticated"` to `"credentials found"`, matching `doctor::check_agent`'s own presence-only
+"present" wording, with an explicit `claude` fallback line when nothing is configured or
+credentialed anywhere; and the docs' quick-start path now leads with `am setup` instead of
+`am init`, with `am init` retained as the later, scriptable-path step.
+
+`cargo clippy --all-targets -- -D warnings` is clean in all four colour environments
+(default, `NO_COLOR=1`, `CLICOLOR_FORCE=1`, both together) and `cargo test` passes
+(487 unit tests + 107 cucumber scenarios / 887 steps, 0 failed) as of the on-ramp pass.
+Code review passed for all three passes, with all findings resolved — the second pass's only
+finding was that `am attach`'s headline had nothing pinning it as plain, proven by wrapping it
+in `dim_line` and watching the whole suite stay green; it is now covered.
 
 - [x] `src/cli.rs`: `Commands::Setup { yes, agent }`
 - [x] `main.rs`: `cmd_init`'s directory/`.gitignore` logic extracted into `init_project`, shared
@@ -103,6 +124,24 @@ wrapping it in `dim_line` and watching the whole suite stay green; it is now cov
       project-override caveat note
 - [x] Docs: `docs/reference/commands.md` (`## am setup`), `docs/reference/configuration.md`
       ("Writing config with `am setup`"), `README.md` quick start
+- [x] `main.rs::cmd_setup`: moved the layout question and its write-back from before
+      verification to after it, gated on `report.failures() == 0`; `print_what_to_do_next`
+      replaces the old one-line failure message
+- [x] `src/onboarding.rs`: `ask_container_consent` (informed-consent framing on a fresh setup),
+      wired in `cmd_setup` to branch on `detected.global_config_exists` against the unchanged
+      `ask_container_enabled`; `ask_agent`'s menu note changed to "credentials found" plus the
+      explicit `claude`-fallback line
+- [x] `src/doctor.rs` + `src/container.rs`: `container::credentials_hint` (per-agent, used by
+      `check_agent`'s `Status::Fail` hint), concrete install links added to `check_runtime`'s
+      hint, a concrete example added to `check_image_mode`'s hint
+- [x] `tests/features/setup.feature` + `setup_interactive.feature`: ordering (layout never
+      reached on a failing report; "Checking your setup..." precedes "Which layout do you
+      want?" on a clean one), the "What to do next:" block, the consent question's two framings
+      (fresh + runtime present, fresh + no runtime, returning-setup unaffected)
+- [x] Docs: `docs/getting-started/quick-start.md` (`am setup` promoted to Step 1, `am init`
+      retained as the scriptable-path tip), `docs/reference/commands.md` (`## am setup`'s
+      question order, container consent question, and failure ending; `## am doctor`'s
+      strengthened hints)
 
 Deferred review items, not dropped:
 

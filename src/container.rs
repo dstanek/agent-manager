@@ -553,6 +553,30 @@ pub fn validate_agent_credentials(agent: KnownAgent) -> Result<()> {
     }
 }
 
+/// A concrete, agent-specific instruction for a credentials failure — presence-only, the
+/// same guarantee `validate_agent_credentials` itself makes; never prints or implies
+/// anything about whether the credentials found are still *valid*, only how to obtain some.
+/// Used exclusively as `doctor::check_agent`'s `Status::Fail` hint.
+pub fn credentials_hint(agent: KnownAgent) -> &'static str {
+    match agent {
+        KnownAgent::Claude => {
+            "run 'claude auth login' (or set ANTHROPIC_API_KEY) — see \
+             docs/guides/claude-code.md#prerequisites"
+        }
+        KnownAgent::Copilot => {
+            "run 'gh auth login' — see docs/guides/github-copilot.md#prerequisites"
+        }
+        KnownAgent::Gemini => {
+            "authenticate with the Gemini CLI on this host — see \
+             docs/guides/gemini.md#prerequisites"
+        }
+        KnownAgent::Codex => {
+            "run 'codex' once to sign in (or set OPENAI_API_KEY) — see \
+             docs/guides/codex.md#prerequisites"
+        }
+    }
+}
+
 // ── Command building ──────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -2273,6 +2297,23 @@ mod tests {
         assert_eq!(auth.mounts.len(), 1);
 
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn credentials_hint_names_a_concrete_command_per_agent() {
+        assert!(credentials_hint(KnownAgent::Claude).contains("claude auth login"));
+        assert!(credentials_hint(KnownAgent::Claude).contains("ANTHROPIC_API_KEY"));
+        assert!(credentials_hint(KnownAgent::Claude).contains("docs/guides/claude-code.md#prerequisites"));
+
+        assert!(credentials_hint(KnownAgent::Copilot).contains("gh auth login"));
+        assert!(credentials_hint(KnownAgent::Copilot).contains("docs/guides/github-copilot.md#prerequisites"));
+
+        assert!(credentials_hint(KnownAgent::Gemini).contains("Gemini CLI"));
+        assert!(credentials_hint(KnownAgent::Gemini).contains("docs/guides/gemini.md#prerequisites"));
+
+        assert!(credentials_hint(KnownAgent::Codex).contains("codex"));
+        assert!(credentials_hint(KnownAgent::Codex).contains("OPENAI_API_KEY"));
+        assert!(credentials_hint(KnownAgent::Codex).contains("docs/guides/codex.md#prerequisites"));
     }
 
     #[test]
