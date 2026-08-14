@@ -105,7 +105,8 @@ drop (`initializeCommand`, `runArgs`).
 **Output**
 
 Each check is `✓` (ready), `!` (usable, worth knowing), or `✗` (will stop `am start`),
-with the fix indented underneath:
+with the fix indented underneath. Hints are concrete — an install link, an exact command to
+run, a doc section to read — rather than naming the problem abstractly:
 
 ```
 Environment
@@ -116,6 +117,28 @@ Environment
   ! built image            am-dc-f260010a69f5 not built yet
       → the next 'am start' will build it — this can take a few minutes
 ```
+
+A missing container runtime and missing agent credentials get the same treatment:
+
+```
+Container runtime
+  ✗ runtime                neither podman nor docker found on PATH
+      → install Podman (https://podman.io/docs/installation) or Docker
+        (https://docs.docker.com/get-docker/), or set container.enabled = false in
+        .am/config.toml
+
+Agent
+  ✓ agent                  claude
+  ✗ credentials            ~/.claude does not exist
+      → run 'claude auth login' (or set ANTHROPIC_API_KEY) — see
+        docs/guides/claude-code.md#prerequisites
+```
+
+Every agent's credentials hint names that agent's actual sign-in command (`gh auth login` for
+`copilot`, a `codex` sign-in or `OPENAI_API_KEY` for `codex`, and so on) and links to that
+agent's guide. These are the same hints [`am setup`](#am-setup) re-lists in its own "What to do
+next" block on failure — strengthening one strengthens both, since `am setup`'s verification
+step *is* this command.
 
 **Exit code**
 
@@ -152,9 +175,17 @@ am setup --yes --agent claude
 
 1. Requires an interactive terminal unless `--yes` is passed. With no TTY and no `--yes`, it fails immediately with "am setup requires an interactive terminal" — no file is touched.
 2. Runs the same directory and `.gitignore` setup as `am init` (creates `.am/config.toml` if missing, adds `.am/worktrees/` to `.gitignore`), and creates `~/.config/am/config.toml` if it doesn't exist yet — both fully commented skeletons, same as `am init`'s output.
-3. Asks which agent to use, unless `--agent` was given. Every question below opens with its own header line naming what's being asked, then a dimmed, indented line naming where the answer is saved — scope first, then the file path, e.g. `  just this repo; saved to .am/config.toml.` The prompt's default is the effective current value — project config, then global config, then (if nothing is configured anywhere) the first agent with credentials already detected on this host, falling back to `claude` — labeled with its source on its own dimmed line below the menu, e.g. `  currently: claude (from your global config)`. Note this can name a *different* file than the write-target line above the menu: the default may come from the global config, but a change is always written to the project file. Pressing Enter accepts the default; if that default is already what's configured, nothing is written. An agent already authenticated on this host is marked `authenticated` in its own aligned column, e.g. `[1] claude    authenticated`.
-4. Asks whether to proceed with containers disabled, but only when neither Podman nor Docker is on `PATH` *and* there is a global config file to write the answer to. Which runtime to use is never asked — `container.runtime = "auto"` already resolves that on its own.
-5. Asks for a pane layout, unless `--yes` was passed or there is no global config file to write to. Unlike the agent and containers questions, this one is always asked — pane layout is a genuine preference no amount of host detection can answer, so it isn't gated behind a failure condition. A single menu offers four presets plus a customize option, each shown with a small ASCII preview:
+3. Asks which agent to use, unless `--agent` was given. Every question below opens with its own header line naming what's being asked, then a dimmed, indented line naming where the answer is saved — scope first, then the file path, e.g. `  just this repo; saved to .am/config.toml.` The prompt's default is the effective current value — project config, then global config, then (if nothing is configured anywhere) the first agent with credentials already detected on this host, falling back to `claude` — labeled with its source on its own dimmed line below the menu, e.g. `  currently: claude (from your global config)`. Note this can name a *different* file than the write-target line above the menu: the default may come from the global config, but a change is always written to the project file. Pressing Enter accepts the default; if that default is already what's configured, nothing is written. An agent whose credentials are present on this host is marked `credentials found` in its own aligned column, e.g. `[1] claude    credentials found` — presence-only, the same guarantee `am doctor`'s `credentials` check makes, so the wording never claims more than that. When nothing is configured anywhere and no agent has credentials found for it either, one extra line states the `claude` fallback explicitly: `nothing found configured or credentialed on this host — defaulting to claude.`
+4. Asks about containers, in exactly one of two framings, chosen by whether `~/.config/am/config.toml` already existed *before this run*:
+   - **Fresh setup (no global config yet):** always asked, regardless of whether a runtime is currently found — "Use isolated containers for your sessions?", explained, recommended, defaulted to yes. If no runtime was detected yet, one extra dim line says so without blocking the choice. This is the informed-consent framing: a newcomer may not know sessions run in containers at all, so the question isn't gated behind a detection failure the way the returning-setup framing is.
+   - **Returning setup (a global config already exists):** the original framing, unchanged — asked only when neither Podman nor Docker is on `PATH` *and* there is a global config file to write the answer to: "Proceed with containers disabled for now?"
+
+   These two are mutually exclusive per run — you are never shown both in the same invocation. Which runtime to use is never asked either way — `container.runtime = "auto"` already resolves that on its own.
+5. Prints a one-line note when `.devcontainer/devcontainer.json` is found (sessions will use it automatically), and a warning if it declares `initializeCommand` — never a prompt, since defaulting host command execution on would be an unsafe wizard default.
+6. Runs `am doctor`'s checks against whatever was just written (steps 3–4) and prints the identical report.
+   - **Clean (0 failures):** continues to step 7.
+   - **Failures:** prints a "What to do next:" block right after the report — every failing check's hint, one per line, in report order — then exits with the same code `am doctor` would (`1`). Steps 7–8 are not reached; you're sent back to fix the readiness problem before being asked anything cosmetic.
+7. Asks for a pane layout — only reached once step 6 reports zero failures — unless `--yes` was passed or there is no global config file to write to. This question is deliberately asked *after* verification rather than alongside agent/containers: a "wrong" layout doesn't stop `am start` from working, so personalisation is deferred until the tool is confirmed to actually run a session. Unlike the agent and containers questions it is always asked once reached — pane layout is a genuine preference no amount of host detection can answer. A single menu offers four presets plus a customize option, each shown with a small ASCII preview:
 
    ```
    Which layout do you want?
@@ -177,29 +208,31 @@ am setup --yes --agent claude
    ```
 
    `[5] customize…` asks direction (side by side or stacked) first, then a pane-side question worded to match — "left"/"right" for a side-by-side split, "top"/"bottom" for a stacked one — then a percentage (1-99), then previews the result with a proportion line (e.g. `agent (top) gets 95%, the other pane gets 5%.`) and a final "Use this layout? [Y/n]" confirmation. Declining the preview re-shows the preset menu rather than restarting just the last sub-question. Accepting a preset or a customized combination writes only the `tmux.*` keys that actually changed — picking a layout that only differs by percentage does not also rewrite `agent_pane`/`split`. If the project config already sets its own `[tmux]` values, one line is printed before the menu: "Note: this project's config already sets its own pane layout — your answer here is saved globally and won't change sessions in this repo until that override is removed."
-6. Prints a one-line note when `.devcontainer/devcontainer.json` is found (sessions will use it automatically), and a warning if it declares `initializeCommand` — never a prompt, since defaulting host command execution on would be an unsafe wizard default.
-7. Runs `am doctor`'s checks against whatever was just written and prints the identical report. Exit code matches `am doctor`'s: `0` if clean, `1` on any failure. Pane layout plays no part in this verdict — it's a preference, not a readiness check.
-8. If the report is clean and the session is interactive (not `--yes`, stdin is a TTY), offers to start a first session — accepting prompts for a slug and calls the same code path as `am start`. Declining, or running under `--yes`/non-interactively, prints a "Next steps" block instead and exits `0`.
+8. If step 6 was clean and the session is interactive (not `--yes`, stdin is a TTY), offers to start a first session — accepting prompts for a slug and calls the same code path as `am start`. Declining, or running under `--yes`/non-interactively, prints a "Next steps" block instead and exits `0`.
 
 **What it writes**
 
 | Question | Written to | Key |
 |---|---|---|
 | Agent | `.am/config.toml` (project) | `defaults.agent` |
-| Containers disabled | `~/.config/am/config.toml` (global) | `container.enabled` |
+| Containers | `~/.config/am/config.toml` (global) | `container.enabled` |
 | Pane layout | `~/.config/am/config.toml` (global) | `tmux.agent_pane`, `tmux.split`, `tmux.split_percent` |
 
-Changing the agent always writes to the project file, even when the current value was inherited from the global config — the agent is a per-repo decision. `container.enabled` and the three `tmux.*` layout keys are host decisions and always go to the global file, one key at a time — each is only written if its own value actually changed.
+Changing the agent always writes to the project file, even when the current value was inherited from the global config — the agent is a per-repo decision. `container.enabled` and the three `tmux.*` layout keys are host decisions and always go to the global file, one key at a time — each is only written if its own value actually changed. Both container framings write through the same key; accepting the fresh-setup default (yes) writes nothing, since containers enabled is already the compiled default — only a decline writes `container.enabled = false`.
 
 Under `--yes`, the containers and pane-layout questions are skipped entirely and write nothing, even on a fresh repo — neither has an "unanswered means broken" stake the way an unset agent does. The agent question still resolves to a proactive best-guess default under `--yes` when nothing is configured.
+
+Agent and container writes are **not** rolled back if the doctor check in step 6 still fails for an unrelated reason (e.g. you fixed your agent choice but the report still flags missing git identity) — they're real corrections you asked for, not drafts contingent on everything else also passing.
 
 An existing file is edited in place with `toml_edit`, preserving comments, table order, and formatting; if the answer already matches what's there, nothing is written at all — the file's content and modification time are untouched. If the key already holds something other than a plain string, boolean, or integer (a table, an array, an array-of-tables, or an inline table), `am setup` refuses to overwrite it and reports an error instead, leaving the file byte-for-byte unchanged.
 
 **Relationship to `am init` and `am doctor`**
 
-`am init` stays the fast, silent, scriptable primitive — `am setup`'s first action is exactly what `am init` does, so the two share one implementation and cannot drift apart. `am setup`'s verification step *is* `am doctor`: it calls the same check logic and renders the same report, after any answers from steps 3–5 have been written. Use `am init` when you already know what you want and would rather script it; use `am setup` when you want to be walked through it.
+`am init` stays the fast, silent, scriptable primitive — `am setup`'s first action is exactly what `am init` does, so the two share one implementation and cannot drift apart. `am setup`'s verification step *is* `am doctor`: it calls the same check logic and renders the same report, after any answers from steps 3–4 have been written — and the same shared `hint` text is what powers `am setup`'s "What to do next" block, so improving one improves both. Use `am init` when you already know what you want and would rather script it; use `am setup` when you want to be walked through it.
 
 **Example output**
+
+A run on a fresh repo, with `claude` credentials already present and no container runtime installed yet:
 
 ```
 Setting up am for the git repository at /home/user/project
@@ -210,7 +243,7 @@ Setting up am for the git repository at /home/user/project
 Which agent do you use?
   just this repo; saved to .am/config.toml.
 
-  [1] claude    authenticated
+  [1] claude    credentials found
   [2] copilot
   [3] gemini
   [4] codex
@@ -218,6 +251,20 @@ Which agent do you use?
   currently: none configured
 
 Agent [1-4] (Enter for claude): 
+
+Use isolated containers for your sessions?
+  every repo on this machine; saved to ~/.config/am/config.toml.
+
+Each session gets its own isolated filesystem and process sandbox. Without containers, sessions run directly on the host.
+  no container runtime was found on this machine yet — you can still opt in and install one before starting a session.
+
+Use isolated containers for your sessions? [Y/n] 
+Set defaults.agent = "claude" in .am/config.toml
+
+Checking your setup...
+
+[... the same report `am doctor` prints, ending in its verdict line ...]
+Ready.
 
 Which layout do you want?
   every repo on this machine; saved to ~/.config/am/config.toml.
@@ -236,12 +283,6 @@ Which layout do you want?
   currently: agent_pane=left, split=horizontal, split_percent=50 (am's default)
 
 Layout [1-5] (Enter to keep current): 
-Set defaults.agent = "claude" in .am/config.toml
-
-Checking your setup...
-
-[... the same report `am doctor` prints, ending in its verdict line ...]
-Ready.
 
 Start your first session now? [Y/n] n
 

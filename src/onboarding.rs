@@ -1,15 +1,17 @@
 //! `am setup` — the guided front door.
 //!
 //! Everything specific to the question flow lives here: what `am` can work out on its own
-//! (`DetectedState`), the two questions it cannot (`ask_agent`, `ask_container_enabled`),
-//! and the two config writes those answers can produce.
+//! (`DetectedState`), the questions it cannot ask by detection alone (`ask_agent`,
+//! `ask_container_enabled`/`ask_container_consent` — mutually exclusive, see their own doc
+//! comments — and `ask_layout`), and the config writes those answers can produce.
 //!
 //! Two rules shape the module:
 //!
 //! - **Ask only what detected state cannot answer.** Every prompt shows the *effective*
 //!   current value and where it comes from, and accepting it is a guaranteed no-op —
-//!   `update_project_agent` / `update_global_container_enabled` return `Ok(false)` without
-//!   touching the file at all. That is what makes a second `am setup` run silent.
+//!   `update_project_agent` / `update_global_container_enabled` / `update_global_tmux_layout`
+//!   return `Ok(false)` (or an empty `Vec`) without touching the file at all. That is what
+//!   makes a second `am setup` run silent.
 //! - **Credentials are probed for presence only.** Nothing here reads, prints, or writes a
 //!   secret; `agent_credentials` holds the same booleans `am doctor` already derives.
 
@@ -31,10 +33,10 @@ const MENU: [container::KnownAgent; 4] = [
     container::KnownAgent::Codex,
 ];
 
-/// The gap between the longest agent name and its "authenticated" note, so every note lines
-/// up in a column regardless of which names have one. The gap itself is a fixed 3 spaces;
-/// it's the column *width* it's added to that's computed from `MENU` at the call site, so a
-/// longer agent name added later doesn't silently misalign the menu.
+/// The gap between the longest agent name and its "credentials found" note, so every note
+/// lines up in a column regardless of which names have one. The gap itself is a fixed 3
+/// spaces; it's the column *width* it's added to that's computed from `MENU` at the call
+/// site, so a longer agent name added later doesn't silently misalign the menu.
 const MENU_NOTE_GAP: usize = 3;
 
 // ── Effective values, and where they come from ────────────────────────────────
@@ -622,7 +624,7 @@ pub fn ask_agent(
             // which it doesn't use) — going through an owned `String` first sidesteps that,
             // since `str`'s own `Display` impl does.
             let name = agent.to_string();
-            io.println(&format!("  [{}] {name:<width$}authenticated", index + 1));
+            io.println(&format!("  [{}] {name:<width$}credentials found", index + 1));
         } else {
             io.println(&format!("  [{}] {agent}", index + 1));
         }
@@ -635,6 +637,18 @@ pub fn ask_agent(
         },
         color,
     ));
+    // Nothing configured anywhere, and no agent has credentials found for it either — the
+    // genuine "am has no basis for a guess" case. Without this line, a user would have to
+    // infer the fallback from "currently: none configured" plus "Enter for claude" below;
+    // stating it explicitly removes that inference.
+    if detected.effective_agent.value.is_none()
+        && !detected.agent_credentials.iter().any(|(_, present)| *present)
+    {
+        io.println(&dim_line(
+            "nothing found configured or credentialed on this host — defaulting to claude.",
+            color,
+        ));
+    }
     io.println("");
 
     loop {
@@ -724,6 +738,65 @@ pub fn ask_container_enabled(io: &mut dyn Io, detected: &DetectedState, color: b
             }
         };
         let enabled = !disable;
+        return Ok((enabled != currently_enabled).then_some(enabled));
+    }
+}
+
+/// Ask, on a fresh setup, whether the user wants sessions containerised at all — the
+/// informed-consent framing. Unlike [`ask_container_enabled`], this is not gated on whether
+/// a runtime is currently found: that's the wrong question for a user who may not know
+/// containers are involved at all. Only gated on there being a global file to write the
+/// answer to (`detected.global_config_path` is `Some`) — same "nowhere to save it" rule
+/// every other question in this module uses.
+///
+/// `cmd_setup` calls this only when `!detected.global_config_exists` and calls
+/// `ask_container_enabled` otherwise — never both in the same run.
+pub fn ask_container_consent(
+    io: &mut dyn Io,
+    detected: &DetectedState,
+    color: bool,
+) -> Result<Option<bool>> {
+    let Some(path) = detected.global_config_path.as_deref() else {
+        return Ok(None);
+    };
+
+    let currently_enabled = detected.effective_container_enabled.value;
+    io.println("");
+    io.println("Use isolated containers for your sessions?");
+    io.println(&dim_line(
+        &write_target_line(WriteScope::Global, path, detected.home_dir.as_deref()),
+        color,
+    ));
+    io.println("");
+    io.println(
+        "Each session gets its own isolated filesystem and process sandbox. Without \
+         containers, sessions run directly on the host.",
+    );
+    if detected.runtimes_found.is_empty() {
+        io.println(&dim_line(
+            "no container runtime was found on this machine yet — you can still opt in \
+             and install one before starting a session.",
+            color,
+        ));
+    }
+    io.println("");
+
+    loop {
+        let Some(answer) = io.prompt_line("Use isolated containers for your sessions? [Y/n] ")
+        else {
+            return Err(eof_aborted());
+        };
+        let enabled = if answer.is_empty() {
+            true
+        } else {
+            match parse_yes_no(&answer) {
+                Some(yes) => yes,
+                None => {
+                    io.println(&format!("Answer y or n (got '{answer}')."));
+                    continue;
+                }
+            }
+        };
         return Ok((enabled != currently_enabled).then_some(enabled));
     }
 }
@@ -1577,6 +1650,13 @@ mod tests {
             Some(KnownAgent::Gemini)
         );
         assert!(io.output.contains("Enter for gemini"), "{}", io.output);
+        // Gemini's credentials were found, so the "nothing found anywhere" fallback note —
+        // which only applies when *no* agent has credentials — must not appear here.
+        assert!(
+            !io.output.contains("defaulting to claude"),
+            "{}",
+            io.output
+        );
     }
 
     #[test]
@@ -1587,6 +1667,28 @@ mod tests {
         assert_eq!(
             ask_agent(&mut io, &state, None, false).unwrap(),
             Some(KnownAgent::Claude)
+        );
+        assert!(
+            io.output.contains("nothing found configured or credentialed on this host"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn an_already_configured_agent_suppresses_the_fallback_note_even_with_no_credentials() {
+        // Gated on effective_agent.value being None, not on credentials alone — a repo that
+        // already names an agent is not the "am has no basis for a guess" case, even if that
+        // agent's own credentials happen to be missing.
+        let state = configured(Some(KnownAgent::Codex), Source::Project);
+        let mut io = ScriptedIo::new(&[""]);
+
+        ask_agent(&mut io, &state, None, false).unwrap();
+
+        assert!(
+            !io.output.contains("defaulting to claude"),
+            "{}",
+            io.output
         );
     }
 
@@ -1713,8 +1815,8 @@ mod tests {
 
         ask_agent(&mut io, &state, None, false).unwrap();
 
-        assert!(io.output.contains("claude    authenticated"), "{}", io.output);
-        assert!(!io.output.contains("copilot   authenticated"), "{}", io.output);
+        assert!(io.output.contains("claude    credentials found"), "{}", io.output);
+        assert!(!io.output.contains("copilot   credentials found"), "{}", io.output);
     }
 
     // ── The containers question ───────────────────────────────────────────────
@@ -1826,6 +1928,124 @@ mod tests {
         let mut io = ScriptedIo::new(&[]);
 
         assert!(ask_container_enabled(&mut io, &state, false).is_err());
+    }
+
+    // ── The containers consent question ───────────────────────────────────────
+
+    fn fresh(enabled: bool, source: Source, runtimes: Vec<container::RuntimeKind>) -> DetectedState {
+        detected(
+            Effective {
+                value: None,
+                source: Source::CompiledDefault,
+            },
+            Effective {
+                value: enabled,
+                source,
+            },
+            &[],
+            runtimes,
+        )
+    }
+
+    #[test]
+    fn consent_states_where_the_answer_will_be_saved_and_explains_itself() {
+        let state = fresh(true, Source::CompiledDefault, vec![container::RuntimeKind::Podman]);
+        let mut io = ScriptedIo::new(&[""]);
+
+        ask_container_consent(&mut io, &state, false).unwrap();
+
+        let target_line = write_target_line(
+            WriteScope::Global,
+            state.global_config_path.as_deref().unwrap(),
+            state.home_dir.as_deref(),
+        );
+        assert!(io.output.contains(&target_line), "{}", io.output);
+        assert!(io.output.contains("isolated filesystem"), "{}", io.output);
+    }
+
+    #[test]
+    fn consent_notes_a_missing_runtime_without_blocking_the_choice() {
+        let state = fresh(true, Source::CompiledDefault, Vec::new());
+        let mut io = ScriptedIo::new(&[""]);
+
+        let answer = ask_container_consent(&mut io, &state, false).unwrap();
+
+        assert_eq!(answer, None, "accepting yes matches the compiled default");
+        assert!(
+            io.output.contains("no container runtime was found"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn consent_omits_the_missing_runtime_note_when_a_runtime_exists() {
+        let state = fresh(true, Source::CompiledDefault, vec![container::RuntimeKind::Docker]);
+        let mut io = ScriptedIo::new(&[""]);
+
+        ask_container_consent(&mut io, &state, false).unwrap();
+
+        assert!(
+            !io.output.contains("no container runtime was found"),
+            "{}",
+            io.output
+        );
+        // And the two framings are mutually exclusive at the call site — this one must never
+        // print the other question's failure-framed header.
+        assert!(
+            !io.output.contains("No container runtime found on this machine"),
+            "{}",
+            io.output
+        );
+    }
+
+    #[test]
+    fn accepting_the_consent_default_writes_nothing() {
+        let state = fresh(true, Source::CompiledDefault, Vec::new());
+        let mut io = ScriptedIo::new(&[""]);
+
+        assert_eq!(ask_container_consent(&mut io, &state, false).unwrap(), None);
+    }
+
+    #[test]
+    fn declining_consent_writes_false() {
+        let state = fresh(true, Source::CompiledDefault, Vec::new());
+        let mut io = ScriptedIo::new(&["n"]);
+
+        assert_eq!(
+            ask_container_consent(&mut io, &state, false).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn consent_re_asks_on_a_junk_answer() {
+        let state = fresh(true, Source::CompiledDefault, Vec::new());
+        let mut io = ScriptedIo::new(&["maybe", "n"]);
+
+        assert_eq!(
+            ask_container_consent(&mut io, &state, false).unwrap(),
+            Some(false)
+        );
+        assert!(io.output.contains("Answer y or n"), "{}", io.output);
+    }
+
+    #[test]
+    fn end_of_input_aborts_the_consent_question() {
+        let state = fresh(true, Source::CompiledDefault, Vec::new());
+        let mut io = ScriptedIo::new(&[]);
+
+        assert!(ask_container_consent(&mut io, &state, false).is_err());
+    }
+
+    #[test]
+    fn consent_is_skipped_without_a_global_config_to_write_to() {
+        let mut state = fresh(true, Source::CompiledDefault, Vec::new());
+        state.global_config_path = None;
+        let mut io = ScriptedIo::new(&[]);
+
+        assert_eq!(ask_container_consent(&mut io, &state, false).unwrap(), None);
+        assert!(io.output.is_empty(), "{}", io.output);
     }
 
     // ── The first-session question ────────────────────────────────────────────

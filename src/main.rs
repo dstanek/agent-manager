@@ -426,17 +426,17 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
         Some(answer) => answer,
         None => onboarding::ask_agent(&mut io, &detected, flag_agent, color_enabled)?,
     };
+    // The containers question is exactly one of two mutually exclusive framings, chosen by
+    // whether a global config file already existed *before this run* — never both in the
+    // same run. `detected.global_config_exists` is what makes this precise: it was gathered
+    // before steps 2-3's own writes, so it describes what the user arrived with, not what
+    // this run just created.
     let container_answer = if yes {
         None
-    } else {
+    } else if detected.global_config_exists {
         onboarding::ask_container_enabled(&mut io, &detected, color_enabled)?
-    };
-    // Layout, like containers, is skipped entirely under `--yes` — neither has an "unanswered
-    // means broken" stake the way an unset agent does, so `--yes` writes nothing for either.
-    let layout_answer = if yes {
-        None
     } else {
-        onboarding::ask_layout(&mut io, &detected, color_enabled)?
+        onboarding::ask_container_consent(&mut io, &detected, color_enabled)?
     };
 
     if let Some(agent) = agent_answer {
@@ -479,20 +479,6 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some((agent_pane, split, split_percent)) = layout_answer {
-        if let Some(path) = detected.global_config_path.as_deref() {
-            let written =
-                onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
-            if !written.is_empty() {
-                println!(
-                    "{}",
-                    set_tmux_layout_line(&written, path, detected.home_dir.as_deref())
-                );
-                onboarding::strip_global_tmux_layout_examples(path, &written)?;
-            }
-        }
-    }
-
     // Step 6: what the repo itself brings, stated rather than asked about — "auto" is
     // already the right answer for a repo that describes its own environment.
     if let Some(path) = &detected.devcontainer {
@@ -511,16 +497,43 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    // Step 7: the verification is `am doctor`, run for real and rendered identically.
+    // Step 7: the verification is `am doctor`, run for real and rendered identically. Moved
+    // ahead of the layout question in this revision: readiness (does 'am start' even work?)
+    // takes priority over personalisation (what should the panes look like?) for a
+    // first-time user — see specs/guided-setup.md, Resolved Decisions #10.
     println!("\nChecking your setup...\n");
     let report = doctor::run(Some((repo_root.as_path(), vcs.clone())), agent_flag);
     print!("{}", report.render(color_enabled));
     if report.failures() > 0 {
-        println!("Fix the items above, then re-run 'am setup'.");
+        print_what_to_do_next(&report, color_enabled);
         std::process::exit(1);
     }
 
-    // Step 8: never under --yes — a bootstrap step should not create a worktree, a branch
+    // Step 8: the layout question, only ever reached once the report above is clean — a
+    // "wrong" layout doesn't stop 'am start' from working, but asking a first-time user to
+    // pick pane proportions before confirming the tool can even run a session gets the
+    // priorities backwards. Skipped entirely under `--yes`, the same as before this
+    // reordering — layout has no "unanswered means broken" stake the way an unset agent does.
+    let layout_answer = if yes {
+        None
+    } else {
+        onboarding::ask_layout(&mut io, &detected, color_enabled)?
+    };
+    if let Some((agent_pane, split, split_percent)) = layout_answer {
+        if let Some(path) = detected.global_config_path.as_deref() {
+            let written =
+                onboarding::update_global_tmux_layout(path, agent_pane, split, split_percent)?;
+            if !written.is_empty() {
+                println!(
+                    "{}",
+                    set_tmux_layout_line(&written, path, detected.home_dir.as_deref())
+                );
+                onboarding::strip_global_tmux_layout_examples(path, &written)?;
+            }
+        }
+    }
+
+    // Step 9: never under --yes — a bootstrap step should not create a worktree, a branch
     // and possibly a container image unasked.
     let resolved_agent = flag_agent
         .or(agent_answer)
@@ -534,6 +547,59 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     }
     print_next_steps(resolved_agent, detected.tmux_present);
     Ok(())
+}
+
+/// `am setup`'s failure ending: every `Status::Fail` check's hint, listed as a flat,
+/// scannable checklist in report order — replaces the old "Fix the items above, then re-run
+/// 'am setup'." line. `Status::Warn` checks are excluded: they don't block `am start`, and
+/// their hints are already visible inline in the report itself, right under the `!` line
+/// they belong to.
+///
+/// No new remediation text is invented here — every line is `doctor::Check::hint`,
+/// re-surfaced rather than duplicated, which is what keeps `am doctor` and this block from
+/// drifting apart: strengthening a hint improves both at once. Empty when there are no
+/// `Status::Fail` hints — this is only ever called from the failure branch, but should
+/// degrade sensibly if that changes. (`Check::fail` takes `impl Into<String>`, not
+/// `Option`, so every `Status::Fail` check already has a hint in practice — the
+/// `filter_map` on `c.hint.as_deref()` is defensive rather than load-bearing.)
+///
+/// The hint lines are dimmed, same as the heading and closing line: `Report::render`
+/// already dims this exact text one screen up, and `color.rs` reserves `Dim` for "hints
+/// that belong to a finding already stated above them" — precisely what these are.
+///
+/// Pure formatting, same reason `set_container_enabled_line` and its siblings are: rendering
+/// stays testable without capturing stdout.
+fn render_what_to_do_next(report: &doctor::Report, color: bool) -> String {
+    let hints: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.status == doctor::Status::Fail)
+        .filter_map(|c| c.hint.as_deref())
+        .collect();
+    if hints.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n{}\n",
+        color::paint("What to do next:", color::Color::Dim, color)
+    );
+    for hint in hints {
+        // The newline stays outside the painted region, same as the heading and closing
+        // line below: a color region must never span a line break, or the reset lands at
+        // column 0 of the following line — stray output, and a bleed risk if the terminal
+        // wraps or the text gets copied.
+        out.push_str(&color::paint(&format!("  - {hint}"), color::Color::Dim, color));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n{}\n",
+        color::paint("Then re-run 'am setup'.", color::Color::Dim, color)
+    ));
+    out
+}
+
+fn print_what_to_do_next(report: &doctor::Report, color: bool) {
+    print!("{}", render_what_to_do_next(report, color));
 }
 
 fn print_next_steps(agent: Option<container::KnownAgent>, tmux_present: bool) {
@@ -1734,11 +1800,12 @@ mod tests {
     use super::{
         created_global_config_line, found_devcontainer_line, init_project, note_prefix,
         pane_layout, print_init_line_dim, print_init_line_plain, render_init_report,
-        set_container_enabled_line, set_project_agent_line, set_tmux_layout_line,
-        start_detail_lines, InitLine,
+        render_what_to_do_next, set_container_enabled_line, set_project_agent_line,
+        set_tmux_layout_line, start_detail_lines, InitLine,
     };
     use crate::command::shell_quote;
     use crate::config::PaneSide;
+    use crate::doctor;
     use crate::session;
 
     // ── init_project ─────────────────────────────────────────────────────────
@@ -2082,6 +2149,92 @@ mod tests {
             "Found .devcontainer/devcontainer.json — sessions will use it automatically \
              (container.mode = \"auto\")"
         );
+    }
+
+    // ── render_what_to_do_next ───────────────────────────────────────────────
+
+    fn check(status: doctor::Status, name: &str, hint: Option<&str>) -> doctor::Check {
+        doctor::Check {
+            section: "S",
+            name: name.to_string(),
+            status,
+            detail: "detail".to_string(),
+            hint: hint.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn what_to_do_next_lists_only_fail_hints_in_report_order() {
+        let report = doctor::Report {
+            checks: vec![
+                check(doctor::Status::Ok, "fine", None),
+                check(doctor::Status::Warn, "hmm", Some("warn hint")),
+                check(doctor::Status::Fail, "first broken", Some("fix the first thing")),
+                check(doctor::Status::Fail, "second broken", Some("fix the second thing")),
+            ],
+        };
+
+        let out = render_what_to_do_next(&report, false);
+
+        assert!(out.contains("What to do next:"), "{out}");
+        assert!(out.contains("  - fix the first thing"), "{out}");
+        assert!(out.contains("  - fix the second thing"), "{out}");
+        assert!(!out.contains("warn hint"), "{out}");
+        assert!(
+            out.find("fix the first thing").unwrap() < out.find("fix the second thing").unwrap(),
+            "hints must stay in report order: {out}"
+        );
+        assert!(out.contains("Then re-run 'am setup'."), "{out}");
+        assert!(
+            !out.contains("Fix the items above"),
+            "the old failure-ending sentence must be gone: {out}"
+        );
+    }
+
+    #[test]
+    fn what_to_do_next_is_empty_when_there_are_no_failures() {
+        let report = doctor::Report {
+            checks: vec![
+                check(doctor::Status::Ok, "fine", None),
+                check(doctor::Status::Warn, "hmm", Some("warn hint")),
+            ],
+        };
+
+        assert_eq!(render_what_to_do_next(&report, false), "");
+    }
+
+    #[test]
+    fn what_to_do_next_dims_the_whole_block_when_color_is_enabled() {
+        // Mirrors doctor::tests::hints_are_dimmed_rather_than_colored_by_severity: the
+        // same hint text is dimmed one screen up by `Report::render`, so this block must
+        // match rather than render the same sentence plain right below it.
+        let report = doctor::Report {
+            checks: vec![
+                check(doctor::Status::Ok, "fine", None),
+                check(doctor::Status::Warn, "hmm", Some("warn hint")),
+                check(doctor::Status::Fail, "first broken", Some("fix the first thing")),
+                check(doctor::Status::Fail, "second broken", Some("fix the second thing")),
+            ],
+        };
+
+        let out = render_what_to_do_next(&report, true);
+
+        // Every reset sits right after its text and before the newline — a color region
+        // must never span a line break, or the reset lands at column 0 of the following
+        // line instead of closing the line it belongs to.
+        assert_eq!(
+            out,
+            "\n\x1b[2mWhat to do next:\x1b[0m\n\
+             \x1b[2m  - fix the first thing\x1b[0m\n\
+             \x1b[2m  - fix the second thing\x1b[0m\n\n\
+             \x1b[2mThen re-run 'am setup'.\x1b[0m\n",
+            "{out}"
+        );
+        // Nothing in this block is red or yellow: the finding's severity was already
+        // shown in the report above, so re-coloring the hint here would read as a new
+        // problem rather than a repeat of the one already stated.
+        assert!(!out.contains("\x1b[31m"), "no red in: {out:?}");
+        assert!(!out.contains("\x1b[33m"), "no yellow in: {out:?}");
     }
 
     // ── `am start`'s detail lines ─────────────────────────────────────────────
