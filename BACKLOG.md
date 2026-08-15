@@ -481,13 +481,16 @@ Let a session's environment come from the repo's own `.devcontainer/devcontainer
 instead of an `am`-specific image, so projects stop maintaining a second, `am`-shaped
 image alongside the one they already describe for editors and CI.
 
-Design is a **build/run split**: delegate `devcontainer build` to the reference CLI (the
-half with all the complexity and churn — OCI feature resolution, install ordering,
-Dockerfile generation), then run the resulting image with `am`'s existing mount, user,
-network, and SELinux machinery in `container.rs`. Because `am` keeps the run path,
-host-path mirroring still applies and **both git worktrees and jj workspaces work** with
-no CLI-side workarounds. Images are keyed by a config hash, so the Node CLI runs once per
-config change rather than once per session.
+Design is a **build/run split**: something builds the image, then `am` runs it with its
+existing mount, user, network, and SELinux machinery in `container.rs`. Because `am` keeps
+the run path, host-path mirroring still applies and **both git worktrees and jj workspaces
+work** with no builder-side workarounds. Images are keyed by a config hash, so a build
+happens once per config change rather than once per session.
+
+The build half began as pure delegation to the reference CLI and is now `am`'s own for most
+configs. Both builders emit the same `devcontainer.metadata` label, which is the entire
+contract between the two halves — so the run path never learned which one produced the
+image, and the split is what made replacing the build half a contained change.
 
 - [x] **Phase 0 — spike.** Done 2026-08-09 against CLI 0.88.0 + podman; results and their
       implementation consequences are in the spec's *Spike results*. Both technical questions
@@ -499,13 +502,20 @@ config change rather than once per session.
       defaults to `"auto"`: a repo that describes its environment means for that
       description to be used, and repos without a `.devcontainer/` are unaffected because
       `auto` falls back to an image. `mode = "image"` is the opt-out.
-- [ ] **Phase 2.** `userEnvProbe`, `forwardPorts`, and vendoring the CLI bundle if
-      `npm install -g @devcontainers/cli` proves to be real friction (it is one
-      dependency-free 1.7 MB script, so this is cheap).
-- [ ] **Phase 3.** Docker Compose configs (`dockerComposeFile`), if worth owning.
-- [ ] **Optional.** Replace the build step with a native Rust feature-builder, ideally as
-      its own crate — crates.io has no devcontainer runtime today. The run path is
-      unaffected by design.
+- [x] **Native builder.** Done 2026-08-15. `am` builds the image itself for a base `image`
+      or a `build.dockerfile`, plus Features pulled from an OCI registry and ordered by
+      `installsAfter` with an alphabetical tie-break — no Node, no `@devcontainers/cli`.
+      `devcontainer.builder` chooses: `"auto"` (default) falls back to the CLI and names the
+      construct that forced it, `"cli"` always delegates, and `"native"` turns a fallback
+      into an error, for users who want a guarantee that no config silently reintroduces
+      Node. Correctness is pinned by `#[ignore]`d differential tests that build the same
+      config both ways and compare the resulting label. Not its own crate yet — crates.io
+      still has no devcontainer runtime — but the seam is there if extracting it is worth it.
+- [ ] **Phase 2.** `userEnvProbe` and `forwardPorts`. Vendoring the CLI bundle was the third
+      item here; the native builder removed the friction that was meant to relieve, so it is
+      only worth revisiting if the remaining fallbacks turn out to be common in practice.
+- [ ] **Phase 3.** Docker Compose configs (`dockerComposeFile`), if worth owning. Still a
+      CLI fallback under both builders.
 
 Prerequisites this surfaced, both now done and both a fix in their own right:
 
@@ -531,7 +541,23 @@ Follow-ups phase 1 left behind:
       ran.
 - [ ] The config hash does not cover build-context files, only the config and the
       Dockerfile. `--rebuild` is the workaround; a bounded context fingerprint would be
-      better.
+      better. The native builder now knows the context and could close this with a git-aware
+      hash of tracked files under it, but the fix belongs to both builders, so it stayed out
+      of that change.
+
+Follow-ups the native builder left behind:
+
+- [ ] **`dependsOn` falls back to the CLI.** It needs round-trip resolution — a dependency
+      can pull in Features the config never named — which changes the shape of the resolver
+      rather than adding to it. The obvious next increment, and the largest remaining reason
+      a real config still needs Node.
+- [ ] **Registry auth is anonymous only.** Private Feature registries need `docker
+      config.json` credentials and credential helpers. This one does not degrade gracefully:
+      a private ref is still a registry ref, so it is never handed to the CLI and instead
+      fails with the registry's own 401 text.
+- [ ] **`overrideFeatureInstallOrder`, plus Features referenced by local path or tarball
+      URL.** Each is named in the fallback message rather than failing mysteriously. Worth
+      ordering by how often they show up in real configs, not by implementation cost.
 
 ---
 
