@@ -500,15 +500,41 @@ that has to survive Docker's variable expansion to be substituted later by the r
 
 ## Scope
 
-Implemented natively: a base `image` or `build.dockerfile`, and Features pulled from an OCI
-registry, ordered by the spec's round-based algorithm over `dependsOn` (hard, resolved
-recursively), `installsAfter` (soft, ordering only), and `overrideFeatureInstallOrder`
-(`roundPriority`).
+Implemented natively: a base `image` or `build.dockerfile`, and Features from all three sources
+the spec defines — an OCI registry, a local path, or a tarball URL — ordered by the spec's
+round-based algorithm over `dependsOn` (hard, resolved recursively), `installsAfter` (soft,
+ordering only), and `overrideFeatureInstallOrder` (`roundPriority`).
 
-Falls back to the CLI, naming the construct: `dockerComposeFile`, and Features referenced by
-local path or tarball URL — including one reached through another Feature's `dependsOn`.
-`devcontainer.builder = "native"` turns the fallback into an error, for users who want a
-guarantee that no config silently reintroduces Node.
+`dockerComposeFile` is the only remaining fallback. `devcontainer.builder = "native"` turns it
+into an error, for users who want a guarantee that no config silently reintroduces Node.
+
+## The three Feature sources differ only in where the bytes come from
+
+Once a Feature's directory exists on disk, everything downstream — options, ordering, staging,
+the label — is identical. The differences are confined to fetching:
+
+| | metadata from | identity | cacheable |
+|---|---|---|---|
+| Registry | the manifest annotation | layer digest | yes, digests are immutable |
+| Local | `devcontainer-feature.json` on disk | its resolved path | n/a |
+| Tarball | the same file, after unpacking | sha256 of the bytes fetched | no, a URL is mutable |
+
+Identity follows the spec's equality rule in each case. A local Feature has no content hash
+because the spec says every local Feature is distinct — so its path *is* its identity, and two
+directories with byte-identical contents are still two Features. A tarball is hashed from the
+bytes, so two URLs serving the same archive are one Feature. Only the registry case can be
+looked up in the cache before it is fetched; a tarball must be downloaded every build because
+there is no immutable name to check first, and only the unpacking is skipped on a hit.
+
+Three details found by running the reference CLI rather than by reading the spec:
+
+- **The staging directory is named from the Feature's declared `id`, not from where it came
+  from.** A local Feature in a folder called `folderx` declaring `"id": "featy"` is staged as
+  `featy_0`. For a registry Feature the two normally coincide, which is why this went unnoticed.
+- **A tarball's filename is load-bearing.** The CLI requires `devcontainer-feature-<id>.tgz` and
+  refuses anything else. It also rejects `http://` outright, treating it as a malformed registry
+  reference rather than a URL.
+- **A local Feature's label id is the path as written** (`./folderx`), like every other source.
 
 ## `dependsOn`, and the ordering bug it uncovered
 
@@ -562,11 +588,18 @@ the contract.
 
 ## Known gaps
 
-- **`dependsOn` has no differential test.** The ordering algorithm and the graph resolver are
-  unit-tested, and the resolver is checked against the CLI for `installsAfter` — but no Feature
-  in the common registries declares `dependsOn` (15 popular ones were checked, none did), so
-  the recursive-fetch path is never exercised against the reference implementation. Closing
-  this needs a Feature published for the purpose.
+- **`dependsOn` has no differential test.** The recursive walk is exercised offline through
+  local Features — transitive pull-in, diamond dedup, and cycle termination all have unit
+  tests — and the ordering is checked against the CLI for `installsAfter`. What is missing is a
+  comparison of the two implementations on a `dependsOn` graph, because no Feature in the
+  common registries declares one (15 popular ones were checked, none did). Closing this needs
+  a Feature published for the purpose.
+- **Tarball Features have no differential test.** The CLI's *resolver* accepts one served from
+  a local TLS server, but its *build* path refuses to fetch from one even with the certificate
+  trusted, so no reference label can be produced locally. Unpacking is unit tested for both
+  plain and gzipped archives and everything after the fetch is shared with the other two
+  sources, but the HTTP fetch itself, and the end-to-end comparison that backs everything else
+  here, are untested for this case.
 - **A typo'd `overrideFeatureInstallOrder` entry is silently ignored** rather than being the
   error the CLI raises. Harmless for the label, but it does mean a misspelled entry quietly
   does nothing. Closing it means resolving every entry against the registry — a network round

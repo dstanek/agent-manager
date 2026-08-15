@@ -11,12 +11,13 @@ Nothing beyond your usual Podman or Docker. `am` builds the image itself — res
 Features from their registries, generating the Dockerfile, and handing the build to your
 container runtime.
 
-Some configs still need the reference CLI, and `am` falls back to it automatically when it
-sees one:
+Features work whether they come from a registry, from a directory in your repo
+(`./my-feature`), or from a tarball URL — and whether your config names them directly or
+another Feature pulls them in through its `dependsOn`.
+
+One config shape still needs the reference CLI, and `am` falls back to it automatically:
 
 - `dockerComposeFile`
-- a Feature referenced by local path (`./my-feature`) or by tarball URL — including one
-  reached through another Feature's `dependsOn`
 
 If you hit one, `am` tells you which construct caused it, and the CLI needs Node 20+:
 

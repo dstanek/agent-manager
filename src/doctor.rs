@@ -595,10 +595,6 @@ fn check_devcontainer_mode(
     agent_name: Option<&str>,
     config_path: &Path,
 ) {
-    let json_text = std::fs::read_to_string(config_path).unwrap_or_default();
-    let raw: serde_json::Value =
-        serde_json_lenient::from_str(&json_text).unwrap_or(serde_json::Value::Null);
-
     // Whether the CLI matters at all depends on the builder *and* on this particular config:
     // under `auto`, a config am can build itself never touches Node, so reporting a missing
     // CLI as a failure would send the user to install something they do not need.
@@ -606,7 +602,7 @@ fn check_devcontainer_mode(
         config::Builder::Cli => true,
         config::Builder::Native => false,
         config::Builder::Auto => match devcontainer::parse_config(config_path) {
-            Ok(parsed) => devcontainer::native::check_static(&parsed, &raw).is_err(),
+            Ok(parsed) => devcontainer::native::check_static(&parsed).is_err(),
             // An unparseable config is reported separately below; assume the worst here.
             Err(_) => true,
         },

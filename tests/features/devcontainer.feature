@@ -122,23 +122,32 @@ Feature: Dev container sessions
 
   Scenario: an unsupported construct falls back to the CLI and says why
     Given I am using am's own devcontainer builder
-    And the repo has a devcontainer config using a local feature
+    And the repo has a devcontainer config with no base image
     When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
     Then the command succeeds
     And the output contains "Falling back to the devcontainer CLI"
-    And the output contains "local path"
+    And the output contains "build.dockerfile"
     And the mock devcontainer CLI was called 1 time
 
   # builder = "native" is the setting for someone who wants no Node dependency at all;
   # silently falling back would defeat the point, so it is an error instead.
   Scenario: the native builder refuses to fall back when told not to
     Given I am using am's own devcontainer builder with no fallback
-    And the repo has a devcontainer config using a local feature
+    And the repo has a devcontainer config with no base image
     When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
     Then the command fails
     And the output contains "cannot handle this config"
     And the mock devcontainer CLI was called 0 times
     And the worktree ".am/worktrees/my-feature" does not exist
+
+  # A Feature vendored in the repo needs no registry at all, so this is the one Feature path
+  # that runs end to end with no network — which is why it can live in the ordinary suite.
+  Scenario: a feature vendored in the repo is built without the CLI
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config using a local feature
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock devcontainer CLI was called 0 times
 
   Scenario: image mode ignores a devcontainer config entirely
     Given I am using a mock devcontainer CLI

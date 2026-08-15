@@ -230,11 +230,7 @@ mod tests {
             include_str!("../../../tests/fixtures/devcontainer/native/git-devcontainer-feature.json");
         let (metadata, raw) = parse_metadata(text).unwrap();
         let options = resolve_options(&metadata, &BTreeMap::new());
-        let oci::FeatureSource::Registry(reference) =
-            oci::parse_ref("ghcr.io/devcontainers/features/git:1")
-        else {
-            unreachable!()
-        };
+        let reference = oci::parse_ref("ghcr.io/devcontainers/features/git:1");
         ResolvedFeature {
             reference,
             metadata,
@@ -276,6 +272,8 @@ mod tests {
         let mut second = git_feature();
         second.reference.raw = "ghcr.io/devcontainers/features/node:1".to_string();
         second.reference.repository = "devcontainers/features/node".to_string();
+        // The declared id is what names the staging directory, not the reference.
+        second.metadata.id = Some("node".to_string());
         let rendered = render(&[git_feature(), second], "[]", "root", "root");
 
         let git = rendered.find("dev-container-features/git_0").unwrap();

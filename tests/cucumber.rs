@@ -879,6 +879,14 @@ async fn given_devcontainer_config(world: &mut AmWorld) {
     );
 }
 
+/// A config with no base at all. Compose would be the more natural fallback trigger, but `am`
+/// rejects compose configs before the builder is ever consulted, so this is the only construct
+/// left that reaches the native builder and is handed back.
+#[given("the repo has a devcontainer config with no base image")]
+async fn given_baseless_config(world: &mut AmWorld) {
+    world.write_devcontainer_config("{\"name\":\"test\"}");
+}
+
 #[given("the repo has a devcontainer config using docker compose")]
 async fn given_compose_config(world: &mut AmWorld) {
     world.write_devcontainer_config(
@@ -886,15 +894,31 @@ async fn given_compose_config(world: &mut AmWorld) {
     );
 }
 
-/// A Feature vendored in the repo — the cheapest construct that `am`'s builder does not
-/// implement, so it is what the fallback scenarios use.
+/// A Feature vendored in the repo, written out for real: `am` builds these itself, so the
+/// directory has to exist and be committed.
 #[given("the repo has a devcontainer config using a local feature")]
 async fn given_local_feature_config(world: &mut AmWorld) {
+    // The Feature itself, beside the config, and written *first* so the commit that
+    // `write_devcontainer_config` makes picks it up — the session builds from a worktree, so an
+    // uncommitted Feature directory would not be there. `am` builds these itself now, and
+    // really does read this directory: a config naming a Feature that is not present is an
+    // error, not a fallback.
+    let dir = world.project_path().join(".devcontainer").join("vendored-feature");
+    std::fs::create_dir_all(&dir).expect("create the vendored feature");
+    std::fs::write(
+        dir.join("devcontainer-feature.json"),
+        "{\"id\":\"vendored\",\"version\":\"1.0.0\",\"name\":\"Vendored\"}",
+    )
+    .expect("write devcontainer-feature.json");
+    std::fs::write(dir.join("install.sh"), "#!/bin/sh\necho vendored\n")
+        .expect("write install.sh");
+
     world.write_devcontainer_config(
         "{\"name\":\"test\",\"image\":\"debian:bookworm\",\
          \"features\":{\"./vendored-feature\":{}}}",
     );
 }
+
 
 #[given("the repo has a devcontainer config with an initializeCommand")]
 async fn given_initialize_command_config(world: &mut AmWorld) {
