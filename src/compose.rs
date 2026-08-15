@@ -36,6 +36,7 @@ use crate::config::NetworkMode;
 use crate::container::{
     self, ContainerMounts, ContainerRuntime, DevcontainerRuntime, MountMode,
 };
+use crate::devcontainer::ForwardedPort;
 use crate::error::AmError;
 
 /// Turn an argv into a `Command`. Compose invocations are assembled as `Vec<String>` so they can
@@ -315,7 +316,35 @@ pub fn override_document(
         }),
     );
 
-    json!({ "services": { service: Value::Object(service_doc) } })
+    // forwardPorts. A bare port belongs to the agent's own service; a `"<service>:<port>"` entry
+    // names another one, which is the one case where `am` writes an override for a service it
+    // does not run the agent in — publishing what the config asked for is the whole point, and
+    // refusing would make the entry silently inert.
+    let mut services = Map::new();
+    let mut own_ports: Vec<String> = Vec::new();
+    for port in &dc.ports {
+        match port {
+            ForwardedPort::Own(p) => own_ports.push(ForwardedPort::publish_spec(*p)),
+            ForwardedPort::Service { service: other, port } => {
+                let entry = services
+                    .entry(other.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.entry("ports")
+                        .or_insert_with(|| Value::Array(Vec::new()))
+                        .as_array_mut()
+                        .expect("ports is an array")
+                        .push(json!(ForwardedPort::publish_spec(*port)));
+                }
+            }
+        }
+    }
+    if !own_ports.is_empty() {
+        service_doc.insert("ports".to_string(), json!(own_ports));
+    }
+
+    services.insert(service.to_string(), Value::Object(service_doc));
+    json!({ "services": services })
 }
 
 /// `container.network = "none"` cannot be honoured for a compose project.
@@ -542,6 +571,62 @@ mod tests {
         assert_eq!(app["environment"]["TOKEN"], json!("secret"));
         // The compose file's own command must survive: it is what keeps the service alive.
         assert_eq!(app["command"], json!(["sleep", "infinity"]));
+    }
+
+    #[test]
+    fn forwarded_ports_are_published_on_the_right_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mounts = ContainerMounts {
+            worktree_host: tmp.path().to_path_buf(),
+            vcs_host: tmp.path().join(".git"),
+            colocated_git_host: None,
+            gitconfig_host: tmp.path().join("gitconfig"),
+            ssh_host: tmp.path().join("ssh"),
+            ssh_agent_sock: None,
+            agent_auth: Vec::new(),
+            container_home: "/home/vscode".to_string(),
+        };
+        let dc = DevcontainerRuntime {
+            ports: vec![
+                ForwardedPort::Own(3000),
+                ForwardedPort::Service { service: "db".into(), port: 5432 },
+            ],
+            ..DevcontainerRuntime::default()
+        };
+        let doc = override_document(&runtime(), "app", "img", &mounts, &[], &[], &dc);
+        let services = doc["services"].as_object().unwrap();
+
+        assert_eq!(services["app"]["ports"], json!(["127.0.0.1:3000:3000"]));
+        // The one case where am writes an override for a service it does not run the agent in:
+        // a `"db:5432"` entry names another service, and publishing it is the whole point.
+        assert_eq!(services["db"]["ports"], json!(["127.0.0.1:5432:5432"]));
+        // ...and it contributes nothing else to that service.
+        assert_eq!(services["db"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_service_with_no_forwarded_ports_gets_no_ports_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mounts = ContainerMounts {
+            worktree_host: tmp.path().to_path_buf(),
+            vcs_host: tmp.path().join(".git"),
+            colocated_git_host: None,
+            gitconfig_host: tmp.path().join("gitconfig"),
+            ssh_host: tmp.path().join("ssh"),
+            ssh_agent_sock: None,
+            agent_auth: Vec::new(),
+            container_home: "/home/vscode".to_string(),
+        };
+        let doc = override_document(
+            &runtime(),
+            "app",
+            "img",
+            &mounts,
+            &[],
+            &[],
+            &DevcontainerRuntime::default(),
+        );
+        assert!(doc["services"]["app"].as_object().unwrap().get("ports").is_none());
     }
 
     #[test]

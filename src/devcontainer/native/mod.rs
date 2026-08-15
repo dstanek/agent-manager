@@ -942,6 +942,24 @@ mod tests {
         );
     }
 
+    /// Seven config-level metadata properties at once, which is what it takes to pin the order.
+    ///
+    /// The two fixtures above each exercise one or two keys, and agreed with the CLI by luck:
+    /// the pairs they happen to contain sort the same way under either ordering. This one does
+    /// not — `customizations` lands second here and last under the Feature order, so it fails
+    /// loudly if the two lists are ever conflated again. It also covers `forwardPorts` and
+    /// `portsAttributes` reaching the label at all, which they previously did not.
+    #[test]
+    #[ignore = "needs a container runtime and network access"]
+    fn native_build_matches_the_cli_across_the_config_metadata_schema() {
+        assert_matches_reference(
+            include_str!("../../../tests/fixtures/devcontainer/native/ports-devcontainer.json"),
+            include_str!("../../../tests/fixtures/devcontainer/native/cli-ports-label.json"),
+            "am-dc-native-difftest-ports",
+            None,
+        );
+    }
+
     /// A compose config: the Features go onto the *service's* image, and the label that comes
     /// out has to be the same one the reference CLI produces for the same project.
     ///

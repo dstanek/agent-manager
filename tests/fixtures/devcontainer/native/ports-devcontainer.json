@@ -1,0 +1,11 @@
+{
+  "name": "ports and ordering",
+  "image": "debian:bookworm-slim",
+  "init": true,
+  "customizations": { "vscode": { "extensions": ["rust-lang.rust-analyzer"] } },
+  "forwardPorts": [3000, "db:5432"],
+  "portsAttributes": { "3000": { "label": "web" } },
+  "containerEnv": { "PORTS_PROBE": "1" },
+  "postCreateCommand": "echo created",
+  "remoteUser": "root"
+}

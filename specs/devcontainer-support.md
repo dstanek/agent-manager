@@ -617,6 +617,32 @@ installed is ignored, where the CLI resolves every entry and errors if it cannot
 an entry cannot change any ordering, so the label is identical either way — and the label is
 the contract.
 
+## Ports, and the label-order bug they uncovered
+
+`forwardPorts` is an *editor* key: the reference CLI publishes nothing for it, writing it into
+the label for an editor to act on. `am` has no editor, so it publishes — bound to `127.0.0.1`,
+which is both the conservative reading of "forward this to me" and what the CLI does for a bare
+`appPort`. Not publishing would leave the key inert, which is what it was.
+
+Adding it required fixing something else first, found by asking the CLI what it emits:
+
+**Features and configs use different metadata schemas, in different orders.** `am` had one list
+for both, taken from the Feature order. Against a real `devcontainer build`:
+
+- a **Feature** contributes `init, privileged, capAdd, securityOpt, entrypoint, mounts,
+  customizations` — and nothing else. A Feature declaring `containerEnv` or `forwardPorts` has
+  them dropped.
+- a **`devcontainer.json`** contributes 23 properties in a different order entirely:
+  `onCreateCommand` first, `customizations` seventh, `init` eleventh, the three port keys near
+  the end.
+
+The shipped code therefore emitted config properties in Feature order — wrong for any config
+setting more than one of them — and dropped `forwardPorts`, `portsAttributes` and
+`otherPortsAttributes` from the label entirely, since the Feature list has no such keys. Both
+fixtures in place at the time agreed with the CLI by luck: each exercised one or two keys whose
+relative order happens to match under either list. `ports-devcontainer.json` exercises seven at
+once and fails loudly if the lists are ever merged again.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -631,6 +657,11 @@ the contract.
   plain and gzipped archives and everything after the fetch is shared with the other two
   sources, but the HTTP fetch itself, and the end-to-end comparison that backs everything else
   here, are untested for this case.
+- **`portsAttributes` and `otherPortsAttributes` are carried but not acted on.** They exist to
+  tell an editor how to treat a forwarded port — a label, whether to open a browser — and `am`
+  has no equivalent. They now reach the label, which is what a downstream reader needs.
+- **A port conflict surfaces as a runtime failure**, not a preflight one. `am` does not check
+  whether a forwarded port is already bound before starting the session.
 - **A typo'd `overrideFeatureInstallOrder` entry is silently ignored** rather than being the
   error the CLI raises. Harmless for the label, but it does mean a misspelled entry quietly
   does nothing. Closing it means resolving every entry against the registry — a network round

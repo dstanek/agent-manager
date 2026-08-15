@@ -325,7 +325,13 @@ service's image, brings the project up, runs the agent inside it, and takes the 
 `command: sleep infinity`. `container.network = "none"` is refused for compose sessions rather
 than silently ignored, since the services need the project network to reach each other.
 
-**Not yet supported.** `userEnvProbe` and `forwardPorts` are parsed but not applied.
+**Ports.** `forwardPorts` publishes each port on `127.0.0.1`. The reference CLI publishes
+nothing here and leaves forwarding to an editor; `am` has none, so publishing is what makes the
+key mean anything. In a compose project a bare port lands on the agent's service and a
+`"<service>:<port>"` entry on the service it names.
+
+**Not yet supported.** `userEnvProbe` is parsed but not applied, and `portsAttributes` is
+carried in the image label but not acted on — it exists to describe ports to an editor.
 
 ### `[attach]`
 
