@@ -330,8 +330,14 @@ nothing here and leaves forwarding to an editor; `am` has none, so publishing is
 key mean anything. In a compose project a bare port lands on the agent's service and a
 `"<service>:<port>"` entry on the service it names.
 
-**Not yet supported.** `userEnvProbe` is parsed but not applied, and `portsAttributes` is
-carried in the image label but not acted on — it exists to describe ports to an editor.
+**Environment.** `userEnvProbe` decides how the agent's environment is derived, defaulting to
+`loginInteractiveShell` per the spec: `am` runs the container user's login shell, reads the
+environment it produces, and applies it — so a toolchain installed via a dotfile is on `PATH`.
+Variables `am` set deliberately are never overwritten by it. Set `"userEnvProbe": "none"` to opt
+out. Image-mode sessions never probe.
+
+**Not yet supported.** `portsAttributes` is carried in the image label but not acted on — it
+exists to describe ports to an editor.
 
 ### `[attach]`
 

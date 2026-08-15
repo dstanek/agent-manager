@@ -116,6 +116,32 @@ To add one for an agent that gains a Feature later:
 devcontainer_feature = "ghcr.io/someone/gemini:1"
 ```
 
+## The agent's environment
+
+A devcontainer's toolchain is often installed by something that appends to `PATH` in a dotfile —
+nvm, rbenv, sdkman, a Feature's own line in `.bashrc`. A process started directly in the
+container never sources those, so the agent would not see tools that are plainly there in an
+editor terminal.
+
+`userEnvProbe` is the spec's answer, and `am` applies it: before the agent starts, `am` runs your
+login shell in the container, reads the environment it ends up with, and applies it. The default
+is `loginInteractiveShell`, so a config that says nothing still gets this.
+
+```jsonc
+{
+  // "loginInteractiveShell" (default) | "loginShell" | "interactiveShell" | "none"
+  "userEnvProbe": "none"
+}
+```
+
+Two things `am` guarantees here. The probe runs in a *throwaway* process, so a `.bashrc` that
+prints a banner does not end up in the agent's own process tree. And variables `am` set
+deliberately — `containerEnv`, `remoteEnv`, your agent's credentials, the jj identity — are never
+overwritten by what the probe finds, so a dotfile cannot quietly undo the session's setup.
+
+Image-mode sessions are unaffected: there is no devcontainer config to ask for a probe, and their
+behaviour is unchanged.
+
 ## Ports
 
 `forwardPorts` publishes each port on `127.0.0.1`, so a server started inside the session is
@@ -201,7 +227,6 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 
 | Construct | Status |
 |---|---|
-| `userEnvProbe` | Parsed, not applied — interactive panes get the login environment anyway |
 | `portsAttributes` | Carried in the label, not acted on — it describes ports to an editor |
 | `postAttachCommand` | Not run (see above) |
 

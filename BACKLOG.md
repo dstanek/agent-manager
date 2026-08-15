@@ -511,10 +511,13 @@ image, and the split is what made replacing the build half a contained change.
       Node. Correctness is pinned by `#[ignore]`d differential tests that build the same
       config both ways and compare the resulting label. Not its own crate yet — crates.io
       still has no devcontainer runtime — but the seam is there if extracting it is worth it.
-- [ ] **Phase 2.** `userEnvProbe`. `forwardPorts` is done (2026-08-15): each port is published
-      on `127.0.0.1`, which is a deliberate divergence — the reference CLI publishes nothing and
-      leaves forwarding to an editor, and `am` has none. Vendoring the CLI bundle was the third
-      item here; the native builder removed the friction that was meant to relieve.
+- [x] **Phase 2.** Done 2026-08-15. `forwardPorts` publishes each port on `127.0.0.1` — a
+      deliberate divergence, since the reference CLI publishes nothing and leaves forwarding to
+      an editor, and `am` has none. `userEnvProbe` runs the container user's login shell,
+      captures its environment and applies it, skipping the variables `am` set on purpose;
+      defaulting to `loginInteractiveShell` per the spec, so it applies unless a config opts
+      out. Vendoring the CLI bundle was the third item here; the native builder removed the
+      friction that was meant to relieve.
 - [x] **Phase 3 — compose.** Done 2026-08-15. `dockerComposeFile` configs now bring their
       project up, run the agent in the named `service`, and go down on `am destroy`. The build
       half was nearly free — the service's image with Features baked in, same label; the run
@@ -586,6 +589,8 @@ Follow-ups the native builder left behind:
 - [ ] **`podman compose` is untested.** The code shells out to `<runtime> compose`, which
       podman 4+ provides, but the dev container has no podman to check it against.
 - [ ] **A compose session whose service exits** leaves the project up until `am destroy`.
+- [ ] **The env probe truncates a variable whose value contains a newline.** It converts the
+      NUL-separated `/proc/self/environ` to lines; the reference CLI parses the NUL stream.
 - [ ] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
       They describe a port to an editor; `am` has no equivalent behaviour to apply.
 - [ ] **A forwarded port that is already bound fails at session start**, not in preflight.

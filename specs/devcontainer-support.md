@@ -643,6 +643,32 @@ fixtures in place at the time agreed with the CLI by luck: each exercised one or
 relative order happens to match under either list. `ports-devcontainer.json` exercises seven at
 once and fails loudly if the lists are ever merged again.
 
+## userEnvProbe: capture the environment, do not run inside it
+
+The reference CLI resolves the container user's shell and runs
+`<shell> -lic 'cat /proc/self/environ'`, parsing the NUL-separated result and applying it to the
+processes it starts. `/proc/self/environ` rather than `env` is the detail worth keeping: it is
+NUL-separated, so a value containing a newline survives.
+
+`am` does the same, as a shell snippet ahead of the agent in the command it already composes for
+Feature entrypoints. The tempting shortcut — run the agent under `bash -lic` directly — was
+rejected for two reasons:
+
+- A `.bashrc` that prints a banner, enables job control, or `exec`s another shell would land in
+  the agent's own process tree. Probing puts all of that in a throwaway process instead.
+- Precedence. `am` sets `containerEnv`, `remoteEnv`, agent credentials and the jj identity
+  deliberately; under a login shell a dotfile could overwrite any of them silently. The
+  generated snippet skips exactly the names `am` set, derived from the same inputs the run
+  command emits `-e` flags for so the two cannot drift.
+
+The probe is joined to the agent with a newline rather than `&&`: finding no variables is not a
+failure. Feature entrypoints keep their `&&`, because one of those failing genuinely should stop
+the session.
+
+The spec's default is `loginInteractiveShell`, so this applies to every devcontainer session
+unless the config opts out — a behaviour change, and the point of the property. Image-mode
+sessions have no config to ask for a probe and are untouched.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -657,6 +683,9 @@ once and fails loudly if the lists are ever merged again.
   plain and gzipped archives and everything after the fetch is shared with the other two
   sources, but the HTTP fetch itself, and the end-to-end comparison that backs everything else
   here, are untested for this case.
+- **The probe's variable list is line-based.** `/proc/self/environ` is read NUL-separated and
+  converted to lines, so a value containing a literal newline is truncated at it. The reference
+  CLI parses the NUL stream directly and does not have this limit.
 - **`portsAttributes` and `otherPortsAttributes` are carried but not acted on.** They exist to
   tell an editor how to treat a forwarded port — a label, whether to open a browser — and `am`
   has no equivalent. They now reach the label, which is what a downstream reader needs.
