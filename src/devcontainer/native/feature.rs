@@ -71,10 +71,13 @@ pub struct FeatureMetadata {
     pub documentation_url: Option<String>,
     #[serde(default)]
     pub options: BTreeMap<String, OptionDef>,
+    /// Soft dependencies: ordering only, and only against Features already being installed.
+    /// Never pulls anything in, and carries no options — unlike [`Self::depends_on`].
     #[serde(default)]
     pub installs_after: Vec<String>,
-    /// Presence alone matters: `dependsOn` needs round-trip resolution (a dependency can pull
-    /// in Features the config never named), which this pass does not implement.
+    /// Hard dependencies, same shape as the `features` object in a `devcontainer.json`: a map
+    /// of Feature id to its options. Resolved recursively, so a dependency can pull in Features
+    /// the config never named.
     #[serde(default)]
     pub depends_on: Option<Value>,
 }
@@ -88,6 +91,46 @@ pub struct ResolvedFeature {
     pub raw: Value,
     /// Option values as install-time env vars, defaults already applied.
     pub options: BTreeMap<String, String>,
+    /// The options as the *caller* wrote them, before defaults were merged in. Only the
+    /// round-stable sort uses these: the spec tie-breaks on user-defined options, so a default
+    /// the author never typed must not affect where the Feature lands.
+    pub supplied: BTreeMap<String, Value>,
+    /// Content digest of the Feature's layer. Two Features are the same Feature when their
+    /// contents and options match, and the digest is what "same contents" means for a registry
+    /// Feature — a moving tag like `:1` resolving to the same bytes is not a second install.
+    pub digest: String,
+    /// [`Self::key`] of every Feature this one hard-depends on, resolved. Keys rather than
+    /// indices because ordering permutes the set.
+    pub hard_deps: Vec<String>,
+}
+
+impl ResolvedFeature {
+    /// Identity for deduplication and for hard-dependency links.
+    ///
+    /// Contents plus options, per the spec's Feature-equality rule. Deliberately *not* the
+    /// written id: two ids that resolve to the same digest with the same options are one node,
+    /// and the same id with different options is two.
+    pub fn key(&self) -> String {
+        format!("{}|{}", self.digest, canonical_options(&self.supplied))
+    }
+}
+
+/// Identity for a Feature that has been *asked for* but not yet fetched.
+///
+/// The written id rather than a digest, because that is all a caller has before the manifest
+/// comes back. Used to collapse repeat requests for the same thing — including the cycle a
+/// `dependsOn` graph can contain — before spending a round trip on them.
+pub fn request_key(id: &str, options: &BTreeMap<String, Value>) -> String {
+    format!("{id}|{}", canonical_options(options))
+}
+
+/// Options rendered to a stable string, for identity and for the sort's key/value tie-breaks.
+fn canonical_options(options: &BTreeMap<String, Value>) -> String {
+    options
+        .iter()
+        .map(|(k, v)| format!("{k}={}", stringify(v)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl ResolvedFeature {
@@ -181,54 +224,106 @@ fn stringify(value: &Value) -> String {
     }
 }
 
-/// Order Features for installation.
+/// Order Features for installation, by the spec's round-based algorithm.
 ///
-/// The rule implemented here is the spec's simple case: start alphabetically by id, then
-/// repeatedly take the first Feature whose `installsAfter` dependencies — counting only
-/// Features actually being installed — are already placed.
+/// Each round takes **every** Feature whose dependencies are already placed, sorts that whole
+/// group by [`round_stable_sort`], and commits it. The round is the part that is easy to get
+/// wrong: picking one Feature at a time and re-testing — the obvious reading, and what this
+/// function used to do — interleaves independent chains differently. Given `a` after `b` and
+/// `c` after `d`, one-at-a-time yields `b, a, d, c` while the spec yields `b, d, a, c`, because
+/// `b` and `d` are both eligible in round one and sort together. Any config with two unrelated
+/// `installsAfter` chains diverges, which is most real configs.
 ///
-/// `dependsOn` and `overrideFeatureInstallOrder` are **not** handled; the caller rejects
-/// configs using them before reaching this point.
+/// Hard dependencies (`dependsOn`) are always part of the set, since the resolver pulled them
+/// in. Soft ones (`installsAfter`) constrain only Features that happen to be present.
+///
+/// `overrideFeatureInstallOrder` is the spec's `roundPriority`, which would slot in here as a
+/// filter on each round; the caller still rejects configs using it.
 pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeature>> {
-    let mut remaining = features;
-    // Alphabetical by id is the documented tie-break, and it is also what makes the generated
-    // Dockerfile stable across runs — which is what lets the image hash stay meaningful.
-    remaining.sort_by(|a, b| a.reference.raw.cmp(&b.reference.raw));
+    let present: Vec<String> = features.iter().map(|f| f.reference.untagged()).collect();
+    let mut worklist = features;
+    let mut ordered: Vec<ResolvedFeature> = Vec::with_capacity(worklist.len());
+    let mut placed_keys: Vec<String> = Vec::new();
+    let mut placed_ids: Vec<String> = Vec::new();
 
-    let present: Vec<String> = remaining.iter().map(|f| f.reference.untagged()).collect();
-    let mut ordered: Vec<ResolvedFeature> = Vec::with_capacity(remaining.len());
-    let mut placed: Vec<String> = Vec::new();
-
-    while !remaining.is_empty() {
-        let next = remaining.iter().position(|f| {
-            f.metadata.installs_after.iter().all(|dep| {
+    while !worklist.is_empty() {
+        // Eligibility is judged against what was placed in *previous* rounds, so two Features
+        // that could order either way both land in this round rather than one waiting on the
+        // other.
+        let (mut round, rest): (Vec<_>, Vec<_>) = worklist.into_iter().partition(|f| {
+            let hard = f.hard_deps.iter().all(|k| placed_keys.iter().any(|p| p == k));
+            let soft = f.metadata.installs_after.iter().all(|dep| {
                 let dep = dep.split(':').next().unwrap_or(dep);
-                // A dependency on a Feature that is not part of this build is satisfied by
-                // definition — installsAfter is an ordering hint, not a requirement.
-                !present.iter().any(|p| p == dep) || placed.iter().any(|p| p == dep)
-            })
+                // A soft dependency on a Feature that is not part of this build is satisfied
+                // by definition — installsAfter is an ordering hint, not a requirement.
+                !present.iter().any(|p| p == dep) || placed_ids.iter().any(|p| p == dep)
+            });
+            hard && soft
         });
 
-        match next {
-            Some(index) => {
-                let feature = remaining.remove(index);
-                placed.push(feature.reference.untagged());
-                ordered.push(feature);
-            }
-            None => {
-                let cycle = remaining
-                    .iter()
-                    .map(|f| f.reference.raw.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(AmError::DevcontainerBuildFailed(format!(
-                    "these Features have a circular installsAfter relationship: {cycle}"
-                ))
-                .into());
+        if round.is_empty() {
+            let cycle = rest
+                .iter()
+                .map(|f| f.reference.raw.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AmError::DevcontainerBuildFailed(format!(
+                "these Features depend on each other circularly: {cycle}"
+            ))
+            .into());
+        }
+
+        round.sort_by(round_stable_sort);
+        placed_keys.extend(round.iter().map(ResolvedFeature::key));
+        placed_ids.extend(round.iter().map(|f| f.reference.untagged()));
+        ordered.extend(round);
+        worklist = rest;
+    }
+    Ok(ordered)
+}
+
+/// The spec's "Round Stable Sort": the tie-break among Features committed in the same round.
+///
+/// The order of the comparisons is the spec's, and the third one is inverted on purpose —
+/// *more* user-defined options sorts first.
+fn round_stable_sort(a: &ResolvedFeature, b: &ResolvedFeature) -> std::cmp::Ordering {
+    a.reference
+        .untagged()
+        .cmp(&b.reference.untagged())
+        .then_with(|| compare_versions(&a.reference.tag, &b.reference.tag))
+        .then_with(|| b.supplied.len().cmp(&a.supplied.len()))
+        .then_with(|| a.supplied.keys().cmp(b.supplied.keys()))
+        .then_with(|| {
+            a.supplied.values().map(stringify).cmp(b.supplied.values().map(stringify))
+        })
+        .then_with(|| a.digest.cmp(&b.digest))
+}
+
+/// Compare version tags oldest-to-newest.
+///
+/// Dot-separated, numeric where both sides are numeric so `2` sorts after `10`'s prefix rather
+/// than before it, and lexicographic otherwise. Tags that are not versions at all (`latest`)
+/// compare as strings, which is arbitrary but stable — and the digest tie-break below it means
+/// two Features never compare equal by accident.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut left = a.split('.');
+    let mut right = b.split('.');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ordering = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(xn), Ok(yn)) => xn.cmp(&yn),
+                    _ => x.cmp(y),
+                };
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
             }
         }
     }
-    Ok(ordered)
 }
 
 #[cfg(test)]
@@ -240,6 +335,9 @@ mod tests {
         let oci::FeatureSource::Registry(reference) = oci::parse_ref(id) else {
             panic!("test ids must be registry refs");
         };
+        // A distinct digest per id keeps the sort's last tie-break from ever deciding, so a
+        // test that means to pin an earlier comparison cannot pass by accident.
+        let digest = format!("sha256:{id}");
         ResolvedFeature {
             reference,
             metadata: FeatureMetadata {
@@ -248,7 +346,20 @@ mod tests {
             },
             raw: Value::Object(Default::default()),
             options: BTreeMap::new(),
+            supplied: BTreeMap::new(),
+            digest,
+            hard_deps: Vec::new(),
         }
+    }
+
+    /// A Feature that hard-depends on others, linked by the same key scheme the resolver uses.
+    fn feature_depending_on(id: &str, hard: &[&str]) -> ResolvedFeature {
+        let mut f = feature(id, &[]);
+        f.hard_deps = hard
+            .iter()
+            .map(|dep| feature(dep, &[]).key())
+            .collect();
+        f
     }
 
     fn ids(features: &[ResolvedFeature]) -> Vec<String> {
@@ -318,6 +429,9 @@ mod tests {
             metadata,
             raw,
             options: BTreeMap::new(),
+            supplied: BTreeMap::new(),
+            digest: "sha256:test".to_string(),
+            hard_deps: Vec::new(),
         };
         let snippet = resolved.label_snippet();
         let obj = snippet.as_object().unwrap();
@@ -395,6 +509,129 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("circular"), "got: {err}");
+    }
+
+    #[test]
+    fn independent_chains_interleave_by_round_not_one_at_a_time() {
+        // The case that separates the round-based algorithm from the obvious one. Ordering is
+        // pinned to what `devcontainer features resolve-dependencies` returns for exactly this
+        // config, so it is the reference CLI's answer, not a reading of the spec:
+        //
+        //   gh-release, common-utils, act, git
+        //
+        // Taking one eligible Feature at a time instead yields `gh-release, act, common-utils,
+        // git` — `act` jumps the queue because it becomes eligible the moment `gh-release`
+        // lands, rather than waiting for the round to close.
+        let ordered = install_order(vec![
+            feature(
+                "ghcr.io/devcontainers-extra/features/act:1",
+                &["ghcr.io/devcontainers-extra/features/gh-release"],
+            ),
+            feature("ghcr.io/devcontainers-extra/features/gh-release:1", &[]),
+            feature(
+                "ghcr.io/devcontainers/features/git:1",
+                &["ghcr.io/devcontainers/features/common-utils"],
+            ),
+            feature("ghcr.io/devcontainers/features/common-utils:2", &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec![
+                "ghcr.io/devcontainers-extra/features/gh-release:1",
+                "ghcr.io/devcontainers/features/common-utils:2",
+                "ghcr.io/devcontainers-extra/features/act:1",
+                "ghcr.io/devcontainers/features/git:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hard_dependency_installs_before_its_dependent() {
+        // `apple` sorts first alphabetically and has no installsAfter, but dependsOn is a hard
+        // edge and outranks the tie-break.
+        let ordered = install_order(vec![
+            feature_depending_on("ghcr.io/x/features/apple:1", &["ghcr.io/x/features/zebra:1"]),
+            feature("ghcr.io/x/features/zebra:1", &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec!["ghcr.io/x/features/zebra:1", "ghcr.io/x/features/apple:1"]
+        );
+    }
+
+    #[test]
+    fn a_hard_dependency_cycle_is_reported() {
+        let err = install_order(vec![
+            feature_depending_on("ghcr.io/x/features/a:1", &["ghcr.io/x/features/b:1"]),
+            feature_depending_on("ghcr.io/x/features/b:1", &["ghcr.io/x/features/a:1"]),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("circularly"), "got: {err}");
+        // The message has to name both, or there is nothing to go edit.
+        assert!(err.to_string().contains("a:1") && err.to_string().contains("b:1"), "got: {err}");
+    }
+
+    #[test]
+    fn the_same_feature_at_two_versions_sorts_oldest_first() {
+        // Same resource name, so the tie-break falls through to the version tag.
+        let ordered = install_order(vec![
+            feature("ghcr.io/x/features/node:10", &[]),
+            feature("ghcr.io/x/features/node:2", &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec!["ghcr.io/x/features/node:2", "ghcr.io/x/features/node:10"],
+            "version tags compare numerically, not as strings"
+        );
+    }
+
+    #[test]
+    fn more_user_defined_options_sorts_first() {
+        // The one tie-break the spec inverts: greatest number of options wins.
+        let mut bare = feature("ghcr.io/x/features/node:1", &[]);
+        bare.digest = "sha256:bare".to_string();
+        let mut configured = feature("ghcr.io/x/features/node:1", &[]);
+        configured.digest = "sha256:configured".to_string();
+        configured.supplied =
+            BTreeMap::from([("version".to_string(), Value::String("20".to_string()))]);
+
+        let ordered = install_order(vec![bare, configured]).unwrap();
+        assert_eq!(
+            ordered.iter().map(|f| f.digest.as_str()).collect::<Vec<_>>(),
+            vec!["sha256:configured", "sha256:bare"]
+        );
+    }
+
+    #[test]
+    fn version_comparison_is_numeric_per_segment() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("1", "2"), Ordering::Less);
+        assert_eq!(compare_versions("2", "10"), Ordering::Less);
+        assert_eq!(compare_versions("1.2.3", "1.10.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.2", "1.2"), Ordering::Equal);
+        // A shorter tag is a prefix of the longer one and sorts first.
+        assert_eq!(compare_versions("1", "1.0"), Ordering::Less);
+        // Not a version at all: stable, and the digest tie-break decides after it.
+        assert_eq!(compare_versions("latest", "latest"), Ordering::Equal);
+    }
+
+    #[test]
+    fn identity_is_contents_plus_options_not_the_written_id() {
+        // A moving tag and the version it currently points at are one Feature...
+        let mut moving = feature("ghcr.io/x/features/node:1", &[]);
+        moving.digest = "sha256:same".to_string();
+        let mut pinned = feature("ghcr.io/x/features/node:1.2.3", &[]);
+        pinned.digest = "sha256:same".to_string();
+        assert_eq!(moving.key(), pinned.key());
+
+        // ...but the same contents with different options are two.
+        let mut configured = pinned.clone();
+        configured.supplied =
+            BTreeMap::from([("version".to_string(), Value::String("20".to_string()))]);
+        assert_ne!(pinned.key(), configured.key());
     }
 
     #[test]

@@ -71,6 +71,7 @@ our reading of the spec.
 | `cli-Dockerfile.extended` | The Dockerfile the CLI generates to install Features |
 | `cli-Dockerfile.buildContent` | Its throwaway `FROM scratch` content image |
 | `cli-builtin.env`, `cli-git_0-features.env`, `cli-git_0-install-wrapper.sh` | The Feature install contract: the env files and the generated wrapper that sources them |
+| `two-chains-devcontainer.json` | Input: four Features forming *two independent* `installsAfter` chains — the shape that tells the round-based install order apart from a one-at-a-time one |
 
 ### What these catch
 
@@ -82,6 +83,13 @@ our reading of the spec.
   not the order the config declares them — a `devcontainer.json` writing `remoteUser` before
   `containerEnv` still yields `containerEnv` first. `METADATA_KEYS` in `native/feature.rs`
   encodes that order, and `cli-features-label.json` is what pins it.
+- **`two-chains-devcontainer.json`** is fed to `devcontainer features resolve-dependencies`,
+  which prints the CLI's install order without building anything — so that differential test
+  costs a few manifest GETs rather than minutes. Prefer it when the question is about ordering;
+  the label fixtures only pin the order of the Features they happen to contain. The four
+  Features are chosen so the two orderings differ: one-at-a-time selection gives
+  `gh-release, act, common-utils, git`, the spec's rounds give `gh-release, common-utils, act,
+  git`.
 - **`cli-Dockerfile.extended`** documents the install contract `am` reproduces: where Features
   are copied, the `_CONTAINER_USER`/`_REMOTE_USER` env files, and the `getent` home probe.
   `am` deliberately generates a *simpler* Dockerfile (one stage, not three) — this fixture is

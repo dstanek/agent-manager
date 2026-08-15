@@ -501,18 +501,56 @@ that has to survive Docker's variable expansion to be substituted later by the r
 ## Scope
 
 Implemented natively: a base `image` or `build.dockerfile`, and Features pulled from an OCI
-registry ordered by `installsAfter` with an alphabetical tie-break.
+registry, ordered by the spec's round-based algorithm over both `dependsOn` (hard, resolved
+recursively) and `installsAfter` (soft, ordering only).
 
 Falls back to the CLI, naming the construct: `dockerComposeFile`,
-`overrideFeatureInstallOrder`, Features using `dependsOn`, and Features referenced by local
-path or tarball URL. `devcontainer.builder = "native"` turns the fallback into an error, for
-users who want a guarantee that no config silently reintroduces Node.
+`overrideFeatureInstallOrder`, and Features referenced by local path or tarball URL — including
+one reached through another Feature's `dependsOn`. `devcontainer.builder = "native"` turns the
+fallback into an error, for users who want a guarantee that no config silently reintroduces
+Node.
+
+## `dependsOn`, and the ordering bug it uncovered
+
+Implementing `dependsOn` meant implementing the spec's ordering algorithm properly, and that
+turned out to fix a defect in what shipped first.
+
+**The install order is round-based.** Each round takes *every* Feature whose dependencies are
+already placed, sorts that whole group by the spec's "Round Stable Sort", and commits it. The
+first implementation read the rule as "repeatedly take the first eligible Feature", which is
+the natural reading and is wrong: given `a` after `b` and `c` after `d`, one-at-a-time yields
+`b, a, d, c` while the spec yields `b, d, a, c`. Any config with two *independent*
+`installsAfter` chains diverges — and since `installsAfter` appears in nearly every published
+Feature while `dependsOn` appears in almost none, this was the bug that actually mattered.
+
+**`devcontainer features resolve-dependencies` is the cheap oracle.** The reference CLI will
+walk the graph and print the install order without building anything. That turns an ordering
+check from a multi-minute image build into a few manifest GETs, and it is what
+`install_order_matches_the_reference_cli_resolver` uses. Reach for it before reaching for a
+differential build.
+
+**A dependency appears in the label under the id its dependent wrote.** Verified by building a
+local Feature whose `dependsOn` names a registry Feature: the label carried
+`ghcr.io/…/apt-get-packages:1`, the id as written in the `dependsOn` map, not the resolved
+digest form the resolver reports. So dependencies contribute to the label exactly like
+config-declared Features.
+
+**Feature equality is contents plus options, not the written id.** Two ids resolving to the
+same digest with the same options are one install; the same id with different options is two.
+`am` keys identity on the layer digest, which is what makes a diamond collapse and a
+`dependsOn` cycle terminate during resolution rather than during sorting.
 
 ## Known gaps
 
-- **`dependsOn` is the main one.** It needs round-trip resolution — a dependency can pull in
-  Features the config never named — which changes the shape of the resolver rather than adding
-  to it. It is the obvious next increment.
+- **`dependsOn` has no differential test.** The ordering algorithm and the graph resolver are
+  unit-tested, and the resolver is checked against the CLI for `installsAfter` — but no Feature
+  in the common registries declares `dependsOn` (15 popular ones were checked, none did), so
+  the recursive-fetch path is never exercised against the reference implementation. Closing
+  this needs a Feature published for the purpose.
+- **`overrideFeatureInstallOrder` is now cheap.** It is the spec's `roundPriority`: commit only
+  the maximum-priority nodes of each round and return the rest to the worklist. The round
+  machinery it needs is in place, so this is a small change rather than the structural one it
+  used to be.
 - **Registry auth is anonymous only.** Private Feature registries need `docker config.json`
   credentials and credential helpers; today they fall back to the CLI only if the ref happens
   to be non-registry, otherwise they fail with the registry's own 401 text.

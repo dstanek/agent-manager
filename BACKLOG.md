@@ -547,17 +547,26 @@ Follow-ups phase 1 left behind:
 
 Follow-ups the native builder left behind:
 
-- [ ] **`dependsOn` falls back to the CLI.** It needs round-trip resolution — a dependency
-      can pull in Features the config never named — which changes the shape of the resolver
-      rather than adding to it. The obvious next increment, and the largest remaining reason
-      a real config still needs Node.
+- [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist
+      over manifests, so walking the graph costs one small GET per node and downloads no
+      layers. Identity is contents-plus-options per the spec, so a diamond installs once and
+      a cycle terminates. Doing this properly meant implementing the spec's round-based
+      ordering, which **fixed an ordering bug in the previous release**: order was computed
+      one eligible Feature at a time, which diverges from the CLI for any config with two
+      independent `installsAfter` chains — that is, most real configs. `installsAfter` is in
+      nearly every published Feature and `dependsOn` in almost none (15 popular Features
+      checked, none used it), so the incidental fix is worth more than the feature.
+- [ ] **`dependsOn` is not differentially tested.** No Feature in the common registries
+      declares it, so the recursive-fetch path is never checked against the reference
+      implementation. Needs a Feature published for the purpose.
 - [ ] **Registry auth is anonymous only.** Private Feature registries need `docker
       config.json` credentials and credential helpers. This one does not degrade gracefully:
       a private ref is still a registry ref, so it is never handed to the CLI and instead
       fails with the registry's own 401 text.
 - [ ] **`overrideFeatureInstallOrder`, plus Features referenced by local path or tarball
-      URL.** Each is named in the fallback message rather than failing mysteriously. Worth
-      ordering by how often they show up in real configs, not by implementation cost.
+      URL.** Each is named in the fallback message rather than failing mysteriously.
+      `overrideFeatureInstallOrder` is now the cheap one: it is the spec's `roundPriority`,
+      and the round machinery it needs already exists.
 
 ---
 
