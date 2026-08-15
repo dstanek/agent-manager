@@ -291,8 +291,8 @@ A `devcontainer.json` is repo-controlled code, and `am` exists to *isolate* agen
 
 ### Compose
 
-`dockerComposeFile` configs need run-time orchestration `am` would have to own. Detect and
-error with "not yet supported" in phases 1–2.
+`dockerComposeFile` configs need run-time orchestration `am` has to own — see *Compose is a
+second run model* below. Phases 1–2 detected them and errored.
 
 ### Session state
 
@@ -505,8 +505,39 @@ the spec defines — an OCI registry, a local path, or a tarball URL — ordered
 round-based algorithm over `dependsOn` (hard, resolved recursively), `installsAfter` (soft,
 ordering only), and `overrideFeatureInstallOrder` (`roundPriority`).
 
-`dockerComposeFile` is the only remaining fallback. `devcontainer.builder = "native"` turns it
-into an error, for users who want a guarantee that no config silently reintroduces Node.
+Compose projects are supported too, which leaves no construct-level fallback at all: the CLI is
+reached only for a config with no `image`, no `build.dockerfile` and no `dockerComposeFile`.
+`devcontainer.builder = "native"` turns that into an error, for users who want a guarantee that
+no config silently reintroduces Node.
+
+## Compose is a second run model, not a builder change
+
+The build half of compose is nearly free: `devcontainer build` on a compose config builds the
+*service's* image with Features baked in and stamps the same `devcontainer.metadata` label, so
+`am`'s builder only had to learn where the base image comes from — the service's own `image:` or
+`build:`, read back from the runtime.
+
+The run half is the actual feature, and it is why this was refused for so long. A compose config
+is a whole project, so `am` brings it up, execs the agent into the named service, and takes it
+down on destroy. Three decisions worth recording:
+
+- **`am` never parses YAML.** Compose files use anchors, `extends`, interpolation and profiles;
+  re-implementing that would be a second source of truth that drifts. The resolved model comes
+  from `compose config --format json`, and the override `am` contributes is *written* as JSON —
+  which compose accepts, because JSON is valid YAML. Correct quoting for paths and env values
+  falls out for free, with no new dependency.
+- **The override is a separate file layered last**, never an edit of the project's own. Nothing
+  `am` does can corrupt a file the repo owns, and `am`'s contribution wins on conflict because
+  compose merges later files over earlier ones.
+- **`container.network = "none"` is refused rather than ignored.** Compose services reach each
+  other over the project network, so honouring it would cut the agent off from the very services
+  the config exists to provide. It is a security control; silently dropping it would be worse
+  than refusing.
+
+`am` contributes to the agent's service only. The rest of the project — the database, the cache
+— is left exactly as the repo described it, and the compose file stays responsible for keeping
+the service alive (`command: sleep infinity`, per the devcontainer convention), because the spec
+defaults `overrideCommand` to false for compose.
 
 ## The three Feature sources differ only in where the bytes come from
 

@@ -1,0 +1,10 @@
+services:
+  app:
+    image: debian:bookworm-slim
+    command: sleep infinity
+    volumes:
+      - ..:/workspace:cached
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: dev

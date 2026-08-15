@@ -1,6 +1,7 @@
 mod cli;
 mod color;
 mod command;
+mod compose;
 mod config;
 mod container;
 mod devcontainer;
@@ -1147,6 +1148,50 @@ fn plan_devcontainer(
     )?;
     mounts.container_home = home;
 
+    // Feature entrypoints and lifecycle hooks must run before the agent, and am overrides
+    // the image's own ENTRYPOINT to launch it — so they have to be chained explicitly.
+    let (hooks, hooks_ran) =
+        devcontainer::startup_commands(&resolved, cfg.devcontainer.skip_lifecycle);
+    let mut chain = trusted.entrypoints.clone();
+    chain.extend(hooks);
+    let agent_cmd = container::compose_entrypoint_command(
+        &chain,
+        &agent_command(agent_name, agent, auto, resume),
+    );
+
+    // A compose config is a whole project rather than one container, so it takes the other run
+    // model: bring the project up and exec into the agent's service. Everything above this line
+    // — the build, the metadata merge, the trust gate, mount resolution — is shared.
+    if json.docker_compose_file.is_some() {
+        let plan = plan_compose(
+            slug,
+            cfg,
+            runtime,
+            config_path,
+            &json,
+            &image,
+            &mounts,
+            &agent_auth.env,
+            &trusted,
+            &agent_cmd,
+        )?;
+        return Ok(ContainerPlan {
+            cmd: plan.0,
+            session: session::SessionContainer {
+                runtime: runtime.kind.to_string(),
+                image,
+                container_name: None,
+                container_id: None,
+                mode: session::ContainerMode::Devcontainer,
+                config_path: Some(config_path.to_path_buf()),
+                config_hash: Some(config_hash),
+                remote_user: resolved.remote_user.clone(),
+                lifecycle_done: hooks_ran,
+                compose: Some(plan.1),
+            },
+        });
+    }
+
     let mut cmd = container::build_run_command(
         runtime,
         &image,
@@ -1157,16 +1202,7 @@ fn plan_devcontainer(
         container_name,
         &trusted,
     );
-    // Feature entrypoints and lifecycle hooks must run before the agent, and am overrides
-    // the image's own ENTRYPOINT to launch it — so they have to be chained explicitly.
-    let (hooks, hooks_ran) =
-        devcontainer::startup_commands(&resolved, cfg.devcontainer.skip_lifecycle);
-    let mut chain = trusted.entrypoints.clone();
-    chain.extend(hooks);
-    cmd.extend(container::compose_entrypoint_command(
-        &chain,
-        &agent_command(agent_name, agent, auto, resume),
-    ));
+    cmd.extend(agent_cmd);
 
     Ok(ContainerPlan {
         cmd,
@@ -1180,8 +1216,59 @@ fn plan_devcontainer(
             config_hash: Some(config_hash),
             remote_user: resolved.remote_user.clone(),
             lifecycle_done: hooks_ran,
+            compose: None,
         },
     })
+}
+
+/// Bring a compose project up and return the pane command that execs the agent into it.
+///
+/// The project is started here rather than from the pane so a failure surfaces as an `am start`
+/// error the caller can roll the worktree back from, instead of as a dead tmux pane. It is the
+/// last thing this function does for the same reason: nothing that can fail comes after it.
+#[allow(clippy::too_many_arguments)]
+fn plan_compose(
+    slug: &str,
+    cfg: &config::Config,
+    runtime: &container::ContainerRuntime,
+    config_path: &std::path::Path,
+    json: &devcontainer::DevcontainerJson,
+    image: &str,
+    mounts: &container::ContainerMounts,
+    extra_env: &[(String, String)],
+    trusted: &container::DevcontainerRuntime,
+    agent_cmd: &[String],
+) -> anyhow::Result<(Vec<String>, compose::SessionCompose)> {
+    compose::check_network(&cfg.container.network)?;
+    let service = json
+        .service
+        .clone()
+        .expect("check_supported rejects a compose config without a service");
+
+    let document = compose::override_document(
+        runtime,
+        &service,
+        image,
+        mounts,
+        &cfg.container.env,
+        extra_env,
+        trusted,
+    );
+    let state_dir = config::global_state_dir()
+        .ok_or(error::AmError::GlobalStateDirNotFound)?
+        .join("compose")
+        .join(slug);
+    let override_path = compose::write_override(&state_dir, &document)?;
+
+    let project = compose::SessionCompose {
+        project: compose::project_name(slug),
+        service,
+        files: devcontainer::compose_files(config_path, json),
+        override_path,
+    };
+    compose::up(&runtime.bin, &project)?;
+    let cmd = compose::exec_command(&runtime.bin, &project, agent_cmd);
+    Ok((cmd, project))
 }
 
 /// The agent invocation appended as the container command, if there is one — or, for a
@@ -1845,9 +1932,26 @@ fn cmd_destroy(slug: &str, force: bool, msgs: &messages::Messages) -> anyhow::Re
             _ => config::RuntimePreference::Podman,
         };
         if let Ok(rt) = container::detect_runtime(pref) {
-            let container_name = sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
-            let _ = container::stop_container(&rt, container_name);
-            let _ = container::remove_container(&rt, container_name);
+            match &sc.compose {
+                // A compose session owns a whole project, so stopping the agent's container
+                // would leave its dependencies running. `down` takes the lot.
+                Some(project) => {
+                    if let Err(e) = compose::down(&rt.bin, project) {
+                        eprintln!(
+                            "{} could not take the compose project '{}' down: {e}",
+                            warning_prefix(),
+                            project.project
+                        );
+                    }
+                    let _ = std::fs::remove_file(&project.override_path);
+                }
+                None => {
+                    let container_name =
+                        sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
+                    let _ = container::stop_container(&rt, container_name);
+                    let _ = container::remove_container(&rt, container_name);
+                }
+            }
         }
     }
 
@@ -2017,11 +2121,21 @@ fn cmd_session_rm(slug: &str, repo: Option<&std::path::Path>, force: bool) -> an
         };
         if let Ok(rt) = container::detect_runtime(pref) {
             let container_name = sc.container_name.as_deref().unwrap_or(&s.tmux.tmux_window);
-            if let Err(e) = container::stop_container(&rt, container_name) {
-                eprintln!("{} container cleanup failed: {e}", warning_prefix());
-            }
-            if let Err(e) = container::remove_container(&rt, container_name) {
-                eprintln!("{} container cleanup failed: {e}", warning_prefix());
+            match &sc.compose {
+                Some(project) => {
+                    if let Err(e) = compose::down(&rt.bin, project) {
+                        eprintln!("{} compose cleanup failed: {e}", warning_prefix());
+                    }
+                    let _ = std::fs::remove_file(&project.override_path);
+                }
+                None => {
+                    if let Err(e) = container::stop_container(&rt, container_name) {
+                        eprintln!("{} container cleanup failed: {e}", warning_prefix());
+                    }
+                    if let Err(e) = container::remove_container(&rt, container_name) {
+                        eprintln!("{} container cleanup failed: {e}", warning_prefix());
+                    }
+                }
             }
         }
     }

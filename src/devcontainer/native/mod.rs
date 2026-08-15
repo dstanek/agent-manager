@@ -28,17 +28,17 @@ use crate::error::AmError;
 /// message is user-facing: it is the line printed when `am` falls back to the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unsupported {
-    Compose,
     NoBase,
 }
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unsupported::Compose => write!(f, "the config uses dockerComposeFile"),
-            Unsupported::NoBase => {
-                write!(f, "the config has neither an 'image' nor a 'build.dockerfile'")
-            }
+            Unsupported::NoBase => write!(
+                f,
+                "the config has no 'image', 'build.dockerfile', or 'dockerComposeFile' to \
+                 build from"
+            ),
         }
     }
 }
@@ -55,10 +55,12 @@ struct RequestedFeature {
 /// surface later, from [`build`]. Cheap checks run first so an unsupported config falls back
 /// before doing any I/O.
 pub fn check_static(json: &DevcontainerJson) -> Result<(), Unsupported> {
-    if json.docker_compose_file.is_some() {
-        return Err(Unsupported::Compose);
-    }
-    if json.image.is_none() && json.build.as_ref().and_then(|b| b.dockerfile.as_ref()).is_none() {
+    let has_base = json.image.is_some()
+        || json.build.as_ref().and_then(|b| b.dockerfile.as_ref()).is_some()
+        // A compose config's base is the agent service's own image or build section, which
+        // only the runtime can resolve — so this cannot be judged any further from here.
+        || json.docker_compose_file.is_some();
+    if !has_base {
         return Err(Unsupported::NoBase);
     }
     Ok(())
@@ -297,6 +299,9 @@ fn resolve_base(req: &BuildRequest, runtime_bin: &Path) -> Result<String> {
         ensure_present(runtime_bin, image)?;
         return Ok(image.clone());
     }
+    if req.json.docker_compose_file.is_some() {
+        return compose_base(req, runtime_bin);
+    }
 
     let dockerfile = super::dockerfile_path(req.config_path, req.json)
         .ok_or_else(|| AmError::DevcontainerBuildFailed("no Dockerfile to build".into()))?;
@@ -337,6 +342,43 @@ fn resolve_base(req: &BuildRequest, runtime_bin: &Path) -> Result<String> {
     args.push(context.to_string_lossy().into_owned());
 
     run_build(runtime_bin, &args, "building the devcontainer's Dockerfile")?;
+    Ok(tag)
+}
+
+/// The base image for a compose config: whatever the agent's service is defined with.
+///
+/// Features are installed on top of that one service's image and nothing else. The rest of the
+/// project is the repo's business — `am` is providing an environment for the agent, not taking
+/// ownership of a database's image.
+fn compose_base(req: &BuildRequest, runtime_bin: &Path) -> Result<String> {
+    let service = req.json.service.as_deref().ok_or_else(|| {
+        AmError::DevcontainerBuildFailed(
+            "a compose devcontainer must name the service to build".into(),
+        )
+    })?;
+    let files = super::compose_files(req.config_path, req.json);
+    let resolved = crate::compose::resolved_config(runtime_bin, &files)?;
+    let definition = crate::compose::service_definition(&resolved, service)?;
+
+    if let Some(image) = definition.image {
+        ensure_present(runtime_bin, &image)?;
+        return Ok(image);
+    }
+
+    // A service defined by `build:` is built first, exactly as a non-compose `build.dockerfile`
+    // config is — compose has already resolved the context and dockerfile to absolute paths.
+    let (context, dockerfile) = definition.build.expect("service_definition guarantees one");
+    let tag = format!("{}-base", req.image);
+    let mut args = vec!["build".to_string(), "-t".to_string(), tag.clone()];
+    if let Some(file) = dockerfile {
+        args.push("-f".to_string());
+        args.push(context.join(file).to_string_lossy().into_owned());
+    }
+    if req.no_cache {
+        args.push("--no-cache".to_string());
+    }
+    args.push(context.to_string_lossy().into_owned());
+    run_build(runtime_bin, &args, "building the compose service's image")?;
     Ok(tag)
 }
 
@@ -620,9 +662,11 @@ mod tests {
     }
 
     #[test]
-    fn compose_falls_back() {
-        let (typed, _) = json(r#"{"dockerComposeFile":"docker-compose.yml"}"#);
-        assert_eq!(check_static(&typed), Err(Unsupported::Compose));
+    fn a_compose_config_is_a_base_the_builder_accepts() {
+        // The service's image can only be resolved by asking the runtime, so the static check
+        // must not treat a compose config as baseless and hand it to the CLI.
+        let (typed, _) = json(r#"{"dockerComposeFile":"docker-compose.yml","service":"app"}"#);
+        assert_eq!(check_static(&typed), Ok(()));
     }
 
     #[test]
@@ -778,8 +822,8 @@ mod tests {
     #[test]
     fn fallback_reasons_name_the_offending_construct() {
         // These strings are printed to the user, so they must identify what to look at.
-        assert!(Unsupported::Compose.to_string().contains("dockerComposeFile"));
         assert!(Unsupported::NoBase.to_string().contains("build.dockerfile"));
+        assert!(Unsupported::NoBase.to_string().contains("dockerComposeFile"));
     }
 
     #[test]
@@ -898,6 +942,27 @@ mod tests {
         );
     }
 
+    /// A compose config: the Features go onto the *service's* image, and the label that comes
+    /// out has to be the same one the reference CLI produces for the same project.
+    ///
+    /// This is the build half of compose support. The run half — bringing the project up and
+    /// exec'ing into the service — is covered by the cucumber scenarios, which can drive it
+    /// against a mock runtime because nothing about it needs a real container.
+    #[test]
+    #[ignore = "needs a container runtime and network access"]
+    fn native_build_matches_the_cli_for_a_compose_service() {
+        assert_matches_reference_with(
+            include_str!("../../../tests/fixtures/devcontainer/native/compose-devcontainer.json"),
+            include_str!("../../../tests/fixtures/devcontainer/native/cli-compose-label.json"),
+            "am-dc-native-difftest-compose",
+            None,
+            &[(
+                "docker-compose.yml",
+                include_str!("../../../tests/fixtures/devcontainer/native/compose-project.yml"),
+            )],
+        );
+    }
+
     /// Differential check of the *resolver* against the reference CLI.
     ///
     /// Much cheaper than the two above — `devcontainer features resolve-dependencies` walks the
@@ -977,6 +1042,18 @@ mod tests {
         image: &str,
         probe: Option<(&str, &str, &str)>,
     ) {
+        assert_matches_reference_with(config_text, reference_label, image, probe, &[]);
+    }
+
+    /// As above, plus extra files to drop beside the `devcontainer.json` — a compose config is
+    /// only half a config without the compose file it names.
+    fn assert_matches_reference_with(
+        config_text: &str,
+        reference_label: &str,
+        image: &str,
+        probe: Option<(&str, &str, &str)>,
+        extra_files: &[(&str, &str)],
+    ) {
         let runtime = std::path::PathBuf::from(
             std::env::var("AM_DOCKER_BIN").unwrap_or_else(|_| "/usr/bin/docker".to_string()),
         );
@@ -986,6 +1063,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("devcontainer.json");
         std::fs::write(&config_path, config_text).unwrap();
+        for (name, body) in extra_files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
 
         let typed: DevcontainerJson = serde_json_lenient::from_str(config_text).unwrap();
         let raw: Value = serde_json_lenient::from_str(config_text).unwrap();

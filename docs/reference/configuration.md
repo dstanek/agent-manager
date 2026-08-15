@@ -266,10 +266,9 @@ Applies only when `container.mode` resolves to `devcontainer`. `am` builds an im
 config change and runs it itself, so nothing here is on the per-session path.
 
 By default (`builder = "auto"`) `am` builds the image itself and needs no extra tooling. It
-falls back to the reference CLI — which requires `npm install -g @devcontainers/cli` and
-Node 20+ — only for constructs it does not implement:
-
-- `dockerComposeFile`
+builds every config shape it supports, compose projects included. The reference CLI — which
+requires `npm install -g @devcontainers/cli` and Node 20+ — is now reached only for a config
+with no `image`, no `build.dockerfile` and no `dockerComposeFile` to build from.
 
 When it falls back, `am` prints the reason. Set `builder = "native"` to turn those cases into
 errors instead, so no config can silently reintroduce the Node dependency.
@@ -320,8 +319,13 @@ does not re-run them. `postAttachCommand` is still not run in either case — `a
 "exec into a live container" attach path yet, only "switch tmux focus" or "recreate the
 container from scratch."
 
-**Not yet supported.** Configs using `dockerComposeFile` are rejected with a pointer to
-`container.mode = "image"`. `userEnvProbe` and `forwardPorts` are parsed but not applied.
+**Compose.** A config with `dockerComposeFile` must also name a `service`. `am` builds that
+service's image, brings the project up, runs the agent inside it, and takes the project down on
+`am destroy`. Keeping the service alive is the compose file's job — the convention is
+`command: sleep infinity`. `container.network = "none"` is refused for compose sessions rather
+than silently ignored, since the services need the project network to reach each other.
+
+**Not yet supported.** `userEnvProbe` and `forwardPorts` are parsed but not applied.
 
 ### `[attach]`
 

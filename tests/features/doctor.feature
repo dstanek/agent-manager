@@ -64,14 +64,14 @@ Feature: am doctor — readiness reporting
     And the output contains "runs on your host"
     And the output contains "allow_host_commands"
 
-  Scenario: a compose config is reported as unsupported before a session is ever started
+  Scenario: a compose config missing its service is reported before a session is ever started
     Given a git repository
     And am init has been run
     And I am using a mock devcontainer CLI
-    And the repo has a devcontainer config using docker compose
+    And the repo has a devcontainer config using docker compose with no service
     When I run "am doctor"
     Then the command fails
-    And the output contains "dockerComposeFile"
+    And the output contains "service"
 
   # The whole point of the command: it is safe to run at any time.
   Scenario: doctor changes nothing
