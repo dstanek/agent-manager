@@ -1,9 +1,10 @@
 //! `am`'s own devcontainer image builder.
 //!
-//! Covers the two cases that account for most real configs: a base image or Dockerfile with no
-//! Features at all, and one with Features pulled from an OCI registry whose ordering is
-//! expressible with `installsAfter` alone. Anything else is reported as [`Unsupported`] so the
-//! caller can fall back to the reference CLI rather than build something subtly wrong.
+//! Covers a base `image` or `build.dockerfile`, plus Features from all three sources the spec
+//! defines — an OCI registry, a path in the repo, or a tarball URL — ordered by `dependsOn`,
+//! `installsAfter`, and `overrideFeatureInstallOrder`. What is left is reported as
+//! [`Unsupported`] so the caller can fall back to the reference CLI rather than build something
+//! subtly wrong.
 //!
 //! The contract with the rest of `am` is exactly one artifact: an image tagged `am-dc-<hash>`
 //! carrying a `devcontainer.metadata` label. Everything downstream — [`super::merge`],
@@ -29,8 +30,6 @@ use crate::error::AmError;
 pub enum Unsupported {
     Compose,
     NoBase,
-    LocalFeature(String),
-    TarballFeature(String),
 }
 
 impl std::fmt::Display for Unsupported {
@@ -39,12 +38,6 @@ impl std::fmt::Display for Unsupported {
             Unsupported::Compose => write!(f, "the config uses dockerComposeFile"),
             Unsupported::NoBase => {
                 write!(f, "the config has neither an 'image' nor a 'build.dockerfile'")
-            }
-            Unsupported::LocalFeature(id) => {
-                write!(f, "Feature '{id}' is a local path rather than a registry reference")
-            }
-            Unsupported::TarballFeature(id) => {
-                write!(f, "Feature '{id}' is a direct tarball rather than a registry reference")
             }
         }
     }
@@ -61,19 +54,12 @@ struct RequestedFeature {
 /// Feature-level problems (`dependsOn`) can only be found after fetching manifests; those
 /// surface later, from [`build`]. Cheap checks run first so an unsupported config falls back
 /// before doing any I/O.
-pub fn check_static(json: &DevcontainerJson, raw: &Value) -> Result<(), Unsupported> {
+pub fn check_static(json: &DevcontainerJson) -> Result<(), Unsupported> {
     if json.docker_compose_file.is_some() {
         return Err(Unsupported::Compose);
     }
     if json.image.is_none() && json.build.as_ref().and_then(|b| b.dockerfile.as_ref()).is_none() {
         return Err(Unsupported::NoBase);
-    }
-    for id in requested_ids(raw) {
-        match oci::parse_ref(&id) {
-            oci::FeatureSource::Registry(_) => {}
-            oci::FeatureSource::Local(_) => return Err(Unsupported::LocalFeature(id)),
-            oci::FeatureSource::Tarball(_) => return Err(Unsupported::TarballFeature(id)),
-        }
     }
     Ok(())
 }
@@ -89,14 +75,6 @@ fn override_install_order(raw: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The Feature ids a `devcontainer.json` asks for, in declaration order.
-fn requested_ids(raw: &Value) -> Vec<String> {
-    raw.get("features")
-        .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
 /// Collect the Features to install: the config's own, plus the ones `am` injects.
 ///
 /// An injected Feature that the config already requests is *not* added twice — the config's
@@ -106,10 +84,7 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
     let mut seen: Vec<String> = Vec::new();
 
     let mut push = |id: &str, options: BTreeMap<String, Value>, seen: &mut Vec<String>| {
-        let oci::FeatureSource::Registry(reference) = oci::parse_ref(id) else {
-            // check_static already rejected these; reaching here means a caller skipped it.
-            return;
-        };
+        let reference = oci::parse_ref(id);
         if seen.iter().any(|s| s == &reference.untagged()) {
             return;
         }
@@ -142,9 +117,11 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
 /// nodes, and the spec says to install both.
 fn resolve_graph(
     requested: Vec<RequestedFeature>,
-) -> Result<Result<Vec<(feature::ResolvedFeature, oci::Layer)>, Unsupported>> {
+    config_dir: &Path,
+) -> Result<Result<Vec<(feature::ResolvedFeature, Content)>, Unsupported>> {
+    let cache_root = oci::cache_root();
     let mut worklist: std::collections::VecDeque<RequestedFeature> = requested.into();
-    let mut nodes: Vec<(feature::ResolvedFeature, oci::Layer)> = Vec::new();
+    let mut nodes: Vec<(feature::ResolvedFeature, Content)> = Vec::new();
     // What a caller asked for → the node it got. A parent links to its dependencies through
     // this, so linking never needs to re-derive a digest it already fetched.
     let mut by_request: BTreeMap<String, usize> = BTreeMap::new();
@@ -159,25 +136,10 @@ fn resolve_graph(
             continue;
         }
 
-        let manifest = oci::fetch_manifest(&item.reference)?;
-        let metadata_text = manifest.feature_metadata().ok_or_else(|| {
-            AmError::DevcontainerBuildFailed(format!(
-                "{} is not a devcontainer Feature (its manifest carries no metadata)",
-                item.reference.raw
-            ))
-        })?;
-        let (metadata, raw) = feature::parse_metadata(metadata_text)?;
-        let layer = manifest
-            .feature_layer()
-            .ok_or_else(|| {
-                AmError::DevcontainerBuildFailed(format!(
-                    "{} has no layer to install",
-                    item.reference.raw
-                ))
-            })?
-            .clone();
+        let (metadata, raw, digest, content) =
+            fetch_feature(&item.reference, config_dir, &cache_root)?;
 
-        let identity = feature::request_key(&layer.digest, &item.options);
+        let identity = feature::request_key(&digest, &item.options);
         if let Some(&existing) = by_identity.get(&identity) {
             // A different id for contents already staged — a moving tag and its pinned version,
             // say. One install, and both requests point at it.
@@ -187,16 +149,11 @@ fn resolve_graph(
 
         let mut deps = Vec::new();
         for (id, options) in depends_on_entries(&metadata) {
-            match oci::parse_ref(&id) {
-                oci::FeatureSource::Registry(reference) => {
-                    deps.push(feature::request_key(&id, &options));
-                    worklist.push_back(RequestedFeature { reference, options });
-                }
-                // A dependency can drag in a construct the config itself never named, so these
-                // are reachable even though check_static passed.
-                oci::FeatureSource::Local(id) => return Ok(Err(Unsupported::LocalFeature(id))),
-                oci::FeatureSource::Tarball(id) => return Ok(Err(Unsupported::TarballFeature(id))),
-            }
+            deps.push(feature::request_key(&id, &options));
+            worklist.push_back(RequestedFeature {
+                reference: oci::parse_ref(&id),
+                options,
+            });
         }
 
         let index = nodes.len();
@@ -212,10 +169,10 @@ fn resolve_graph(
                 metadata,
                 raw,
                 supplied: item.options,
-                digest: layer.digest.clone(),
+                digest,
                 hard_deps: Vec::new(),
             },
-            layer,
+            content,
         ));
     }
 
@@ -228,6 +185,84 @@ fn resolve_graph(
         nodes[index].0.hard_deps = keys;
     }
     Ok(Ok(nodes))
+}
+
+/// Where a resolved Feature's files will come from when the build context is written.
+///
+/// A registry layer is deliberately *not* downloaded during resolution — the manifest already
+/// carries everything ordering needs — so it stays a reference until the order is settled. The
+/// other two have to be materialised to be read at all, so by then they are already directories.
+#[derive(Clone, Debug)]
+enum Content {
+    Layer(oci::Layer),
+    Directory(std::path::PathBuf),
+}
+
+/// Read a Feature's metadata, and say where its files are.
+///
+/// Returns the parsed metadata, the raw JSON behind it, the digest that identifies the Feature,
+/// and its content. The digest differs per kind by necessity: a registry Feature has an
+/// immutable layer digest, a tarball is hashed from the bytes fetched, and a local Feature has
+/// no content hash at all — the spec says every local Feature is distinct, so its resolved path
+/// *is* its identity.
+fn fetch_feature(
+    reference: &oci::FeatureRef,
+    config_dir: &Path,
+    cache_root: &Path,
+) -> Result<(feature::FeatureMetadata, Value, String, Content)> {
+    match reference.kind {
+        oci::FeatureKind::Registry => {
+            let manifest = oci::fetch_manifest(reference)?;
+            let text = manifest.feature_metadata().ok_or_else(|| {
+                AmError::DevcontainerBuildFailed(format!(
+                    "{} is not a devcontainer Feature (its manifest carries no metadata)",
+                    reference.raw
+                ))
+            })?;
+            let (metadata, raw) = feature::parse_metadata(text)?;
+            let layer = manifest
+                .feature_layer()
+                .ok_or_else(|| {
+                    AmError::DevcontainerBuildFailed(format!(
+                        "{} has no layer to install",
+                        reference.raw
+                    ))
+                })?
+                .clone();
+            let digest = layer.digest.clone();
+            Ok((metadata, raw, digest, Content::Layer(layer)))
+        }
+        oci::FeatureKind::Local => {
+            // Relative to the directory holding the devcontainer.json, which is what the
+            // reference CLI resolves against — including for a path reached through dependsOn.
+            let dir = config_dir.join(&reference.raw);
+            let (metadata, raw) = read_feature_dir(&dir, &reference.raw)?;
+            let canonical = dir.canonicalize().unwrap_or(dir.clone());
+            Ok((
+                metadata,
+                raw,
+                format!("local:{}", canonical.display()),
+                Content::Directory(dir),
+            ))
+        }
+        oci::FeatureKind::Tarball => {
+            let (dir, digest) = oci::fetch_tarball(reference, cache_root)?;
+            let (metadata, raw) = read_feature_dir(&dir, &reference.raw)?;
+            Ok((metadata, raw, digest, Content::Directory(dir)))
+        }
+    }
+}
+
+/// Read the `devcontainer-feature.json` out of an unpacked Feature directory.
+fn read_feature_dir(dir: &Path, id: &str) -> Result<(feature::FeatureMetadata, Value)> {
+    let path = dir.join("devcontainer-feature.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        AmError::DevcontainerBuildFailed(format!(
+            "{id} has no devcontainer-feature.json at {}: {e}",
+            path.display()
+        ))
+    })?;
+    feature::parse_metadata(&text)
 }
 
 /// The `dependsOn` map as (id, options) pairs. Absent, null, or non-object all mean none.
@@ -415,21 +450,22 @@ pub fn build(
     runtime_bin: &Path,
     raw_config: &Value,
 ) -> Result<Result<String, Unsupported>> {
-    if let Err(reason) = check_static(req.json, raw_config) {
+    if let Err(reason) = check_static(req.json) {
         return Ok(Err(reason));
     }
 
     let requested = collect_features(raw_config, req.injected);
-    let resolved = match resolve_graph(requested)? {
+    let config_dir = req.config_path.parent().unwrap_or(req.worktree);
+    let resolved = match resolve_graph(requested, config_dir)? {
         Ok(nodes) => nodes,
         Err(reason) => return Ok(Err(reason)),
     };
 
-    // Ordering moves the Features around, so the layer to download is looked up by id
-    // afterwards rather than carried along positionally.
-    let layers: BTreeMap<String, oci::Layer> = resolved
+    // Ordering moves the Features around, so each one's content is looked up by id afterwards
+    // rather than carried along positionally.
+    let contents: BTreeMap<String, Content> = resolved
         .iter()
-        .map(|(f, layer)| (f.reference.raw.clone(), layer.clone()))
+        .map(|(f, content)| (f.reference.raw.clone(), content.clone()))
         .collect();
     let ordered = feature::install_order(
         resolved.into_iter().map(|(f, _)| f).collect(),
@@ -449,10 +485,13 @@ pub fn build(
     let cache_root = oci::cache_root();
     let mut cached_dirs = Vec::with_capacity(ordered.len());
     for f in &ordered {
-        let layer = layers.get(&f.reference.raw).ok_or_else(|| {
-            AmError::DevcontainerBuildFailed(format!("lost the layer for {}", f.reference.raw))
+        let content = contents.get(&f.reference.raw).ok_or_else(|| {
+            AmError::DevcontainerBuildFailed(format!("lost the content for {}", f.reference.raw))
         })?;
-        cached_dirs.push(oci::fetch_layer(&f.reference, layer, &cache_root)?);
+        cached_dirs.push(match content {
+            Content::Layer(layer) => oci::fetch_layer(&f.reference, layer, &cache_root)?,
+            Content::Directory(dir) => dir.clone(),
+        });
     }
 
     let label = compose_label(&base_elements, &ordered, raw_config);
@@ -568,36 +607,39 @@ mod tests {
 
     #[test]
     fn a_plain_image_config_is_supported() {
-        let (typed, raw) = json(r#"{"image":"debian:bookworm-slim"}"#);
-        assert_eq!(check_static(&typed, &raw), Ok(()));
+        let (typed, _) = json(r#"{"image":"debian:bookworm-slim"}"#);
+        assert_eq!(check_static(&typed), Ok(()));
     }
 
     #[test]
     fn a_registry_feature_config_is_supported() {
-        let (typed, raw) = json(
+        let (typed, _) = json(
             r#"{"image":"debian","features":{"ghcr.io/devcontainers/features/git:1":{}}}"#,
         );
-        assert_eq!(check_static(&typed, &raw), Ok(()));
+        assert_eq!(check_static(&typed), Ok(()));
     }
 
     #[test]
     fn compose_falls_back() {
-        let (typed, raw) = json(r#"{"dockerComposeFile":"docker-compose.yml"}"#);
-        assert_eq!(check_static(&typed, &raw), Err(Unsupported::Compose));
+        let (typed, _) = json(r#"{"dockerComposeFile":"docker-compose.yml"}"#);
+        assert_eq!(check_static(&typed), Err(Unsupported::Compose));
     }
 
     #[test]
     fn a_config_with_no_base_falls_back() {
-        let (typed, raw) = json(r#"{"name":"nothing"}"#);
-        assert_eq!(check_static(&typed, &raw), Err(Unsupported::NoBase));
+        let (typed, _) = json(r#"{"name":"nothing"}"#);
+        assert_eq!(check_static(&typed), Err(Unsupported::NoBase));
     }
 
     #[test]
     fn override_install_order_is_supported() {
-        let (typed, raw) = json(
+        let (typed, _) = json(
             r#"{"image":"debian","overrideFeatureInstallOrder":["ghcr.io/devcontainers/features/git"]}"#,
         );
-        assert_eq!(check_static(&typed, &raw), Ok(()));
+        let (_, raw) = json(
+            r#"{"image":"debian","overrideFeatureInstallOrder":["ghcr.io/devcontainers/features/git"]}"#,
+        );
+        assert_eq!(check_static(&typed), Ok(()));
         assert_eq!(override_install_order(&raw), vec!["ghcr.io/devcontainers/features/git"]);
     }
 
@@ -608,31 +650,136 @@ mod tests {
     }
 
     #[test]
-    fn a_local_feature_falls_back() {
-        let (typed, raw) = json(r#"{"image":"debian","features":{"./local-feature":{}}}"#);
+    fn local_and_tarball_features_are_supported() {
+        let (local, _) = json(r#"{"image":"debian","features":{"./local-feature":{}}}"#);
+        assert_eq!(check_static(&local), Ok(()));
+        let (tarball, _) = json(
+            r#"{"image":"debian","features":{"https://example.com/devcontainer-feature-f.tgz":{}}}"#,
+        );
+        assert_eq!(check_static(&tarball), Ok(()));
+    }
+
+    #[test]
+    fn every_kind_of_feature_reference_is_collected() {
+        // `collect_features` used to silently drop everything that was not a registry ref,
+        // because check_static had already rejected those configs. Now they must survive.
+        let (_, raw) = json(
+            r#"{"image":"debian","features":{
+                "ghcr.io/devcontainers/features/git:1":{},
+                "./vendored":{},
+                "https://example.com/devcontainer-feature-f.tgz":{}
+            }}"#,
+        );
+        let kinds: Vec<_> =
+            collect_features(&raw, &[]).into_iter().map(|f| f.reference.kind).collect();
+        assert_eq!(kinds.len(), 3);
+        assert!(kinds.contains(&oci::FeatureKind::Registry));
+        assert!(kinds.contains(&oci::FeatureKind::Local));
+        assert!(kinds.contains(&oci::FeatureKind::Tarball));
+    }
+
+    /// Write a local Feature into `dir`, optionally hard-depending on other local Features.
+    fn write_local_feature(root: &Path, name: &str, depends_on: &[&str]) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let deps: String = depends_on
+            .iter()
+            .map(|d| format!("\"./{d}\":{{}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let depends = if deps.is_empty() {
+            String::new()
+        } else {
+            format!(",\"dependsOn\":{{{deps}}}")
+        };
+        std::fs::write(
+            dir.join("devcontainer-feature.json"),
+            format!("{{\"id\":\"{name}\",\"version\":\"1.0.0\"{depends}}}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("install.sh"), "#!/bin/sh\n").unwrap();
+    }
+
+    /// The whole resolver, offline.
+    ///
+    /// Local Features touch no registry, which makes them the only way to exercise
+    /// `dependsOn`'s recursive fetch in the ordinary test suite — the registry path needs
+    /// network, and no published Feature uses `dependsOn` to point at anyway.
+    #[test]
+    fn depends_on_pulls_in_features_the_config_never_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // top → middle → bottom, with only `top` named by the config.
+        write_local_feature(dir, "top", &["middle"]);
+        write_local_feature(dir, "middle", &["bottom"]);
+        write_local_feature(dir, "bottom", &[]);
+
+        let raw: Value = serde_json_lenient::from_str(
+            r#"{"image":"debian","features":{"./top":{}}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        assert_eq!(resolved.len(), 3, "transitive dependencies must be pulled in");
+
+        let ordered =
+            feature::install_order(resolved.into_iter().map(|(f, _)| f).collect(), &[]).unwrap();
         assert_eq!(
-            check_static(&typed, &raw),
-            Err(Unsupported::LocalFeature("./local-feature".to_string()))
+            ordered.iter().map(|f| f.reference.raw.as_str()).collect::<Vec<_>>(),
+            vec!["./bottom", "./middle", "./top"],
+            "a hard dependency installs before whatever depends on it"
         );
     }
 
     #[test]
-    fn a_tarball_feature_falls_back() {
-        let (typed, raw) =
-            json(r#"{"image":"debian","features":{"https://example.com/f.tgz":{}}}"#);
-        assert!(matches!(
-            check_static(&typed, &raw),
-            Err(Unsupported::TarballFeature(_))
-        ));
+    fn a_diamond_installs_the_shared_dependency_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_local_feature(dir, "left", &["shared"]);
+        write_local_feature(dir, "right", &["shared"]);
+        write_local_feature(dir, "shared", &[]);
+
+        let raw: Value = serde_json_lenient::from_str(
+            r#"{"image":"debian","features":{"./left":{},"./right":{}}}"#,
+        )
+        .unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        assert_eq!(resolved.len(), 3, "the shared dependency must not be installed twice");
+    }
+
+    #[test]
+    fn a_depends_on_cycle_terminates_rather_than_looping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_local_feature(dir, "a", &["b"]);
+        write_local_feature(dir, "b", &["a"]);
+
+        let raw: Value =
+            serde_json_lenient::from_str(r#"{"image":"debian","features":{"./a":{}}}"#).unwrap();
+        // Resolution itself must finish — identity dedup is what stops the walk.
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        assert_eq!(resolved.len(), 2);
+        // The cycle is then reported by ordering, which is where the spec puts it.
+        let err = feature::install_order(resolved.into_iter().map(|(f, _)| f).collect(), &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("circularly"), "got: {err}");
+    }
+
+    #[test]
+    fn a_local_feature_that_is_not_there_is_an_error_not_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw: Value =
+            serde_json_lenient::from_str(r#"{"image":"debian","features":{"./missing":{}}}"#)
+                .unwrap();
+        let err = resolve_graph(collect_features(&raw, &[]), tmp.path()).unwrap_err();
+        // The message has to name the path, since "no such file" alone would not say which.
+        assert!(err.to_string().contains("./missing"), "got: {err}");
     }
 
     #[test]
     fn fallback_reasons_name_the_offending_construct() {
         // These strings are printed to the user, so they must identify what to look at.
-        assert!(Unsupported::LocalFeature("./vendored/thing".into())
-            .to_string()
-            .contains("./vendored/thing"));
         assert!(Unsupported::Compose.to_string().contains("dockerComposeFile"));
+        assert!(Unsupported::NoBase.to_string().contains("build.dockerfile"));
     }
 
     #[test]
@@ -811,7 +958,7 @@ mod tests {
             .collect();
 
         let raw: Value = serde_json_lenient::from_str(config_text).unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[])).unwrap().unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), &dir).unwrap().unwrap();
         let ordered = feature::install_order(
             resolved.into_iter().map(|(f, _)| f).collect(),
             &override_install_order(&raw),

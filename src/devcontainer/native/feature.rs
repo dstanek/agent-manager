@@ -60,10 +60,10 @@ pub struct OptionDef {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeatureMetadata {
-    /// The Feature's own short id (`git`). Not used for identity — the label and the build
-    /// directory both key off the user-written reference — but kept because it is what a
-    /// Feature author sees when debugging a mismatch.
-    #[allow(dead_code)]
+    /// The Feature's own short id (`git`). Not identity — the label keys off the user-written
+    /// reference — but it does name the Feature's directory in the build context, which is
+    /// what the reference CLI does and which only diverges for a local Feature whose folder
+    /// name differs from the id it declares.
     pub id: Option<String>,
     pub version: Option<String>,
     pub name: Option<String>,
@@ -135,14 +135,16 @@ fn canonical_options(options: &BTreeMap<String, Value>) -> String {
 
 impl ResolvedFeature {
     /// The directory name this Feature gets in the build context (`git` → `git_0`).
+    ///
+    /// Keyed on the Feature's *declared* id, which is what the reference CLI uses: a local
+    /// Feature in a folder called `folderx` declaring `"id": "featy"` is staged as `featy_0`.
+    /// For a registry Feature the two normally coincide. Falls back to the reference's last
+    /// path segment for a Feature that declares no id at all.
     pub fn dir_name(&self, index: usize) -> String {
+        let name = self.metadata.id.as_deref().unwrap_or_else(|| self.reference.name());
         // Non-alphanumerics would break the shell contract in the generated install wrapper.
-        let sanitized: String = self
-            .reference
-            .name()
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect();
+        let sanitized: String =
+            name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
         format!("{sanitized}_{index}")
     }
 
@@ -375,9 +377,7 @@ mod tests {
     use crate::devcontainer::native::oci;
 
     fn feature(id: &str, installs_after: &[&str]) -> ResolvedFeature {
-        let oci::FeatureSource::Registry(reference) = oci::parse_ref(id) else {
-            panic!("test ids must be registry refs");
-        };
+        let reference = oci::parse_ref(id);
         // A distinct digest per id keeps the sort's last tie-break from ever deciding, so a
         // test that means to pin an earlier comparison cannot pass by accident.
         let digest = format!("sha256:{id}");
@@ -468,11 +468,7 @@ mod tests {
         let text =
             include_str!("../../../tests/fixtures/devcontainer/native/git-devcontainer-feature.json");
         let (metadata, raw) = parse_metadata(text).unwrap();
-        let oci::FeatureSource::Registry(reference) =
-            oci::parse_ref("ghcr.io/devcontainers/features/git:1")
-        else {
-            unreachable!()
-        };
+        let reference = oci::parse_ref("ghcr.io/devcontainers/features/git:1");
         let resolved = ResolvedFeature {
             reference,
             metadata,

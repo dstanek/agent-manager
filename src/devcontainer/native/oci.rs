@@ -22,12 +22,27 @@ use crate::error::AmError;
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
                               application/vnd.docker.distribution.manifest.v2+json";
 
-/// A Feature published in a registry, parsed from `<registry>/<namespace...>/<name>[:<tag>]`.
+/// Where a Feature's files come from. The three the devcontainer spec defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureKind {
+    Registry,
+    /// `./path` or `../path` — a Feature vendored in the repo, resolved against the directory
+    /// holding the `devcontainer.json`.
+    Local,
+    /// A direct `https://…/devcontainer-feature-<id>.tgz`.
+    Tarball,
+}
+
+/// A reference to a Feature, in any of the three forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRef {
+    pub kind: FeatureKind,
+    /// Registry host. Empty for a local path or a tarball.
     pub registry: String,
-    /// Everything between the registry and the tag, e.g. `devcontainers/features/git`.
+    /// For a registry Feature, everything between the host and the tag
+    /// (`devcontainers/features/git`). For the other two, the path or URL as written.
     pub repository: String,
+    /// Empty for a local path or a tarball — neither has a version to pin.
     pub tag: String,
     /// The id exactly as the user wrote it — this is what goes in the metadata label, so it
     /// must survive round-tripping rather than being reassembled from the parts.
@@ -35,42 +50,57 @@ pub struct FeatureRef {
 }
 
 impl FeatureRef {
-    /// The last path segment, used to name the feature's build directory (`git` → `git_0`).
+    /// The Feature's short alias, as `overrideFeatureInstallOrder` may write it.
+    ///
+    /// The last path segment for a registry Feature (`git`). A tarball has no alias at all —
+    /// the reference CLI lists none for one — and a local Feature's is its directory name.
     pub fn name(&self) -> &str {
-        self.repository.rsplit('/').next().unwrap_or(&self.repository)
+        match self.kind {
+            FeatureKind::Tarball => "",
+            _ => self.repository.rsplit('/').next().unwrap_or(&self.repository),
+        }
     }
 
-    /// The id without its tag. `installsAfter` entries are written untagged, so comparisons
-    /// between a dependency and an installed Feature have to happen on this form.
+    /// The identity an `installsAfter` entry or an override entry is compared against.
+    ///
+    /// `installsAfter` entries are written untagged, so a registry Feature drops its tag here.
+    /// A local path or a tarball URL has no tag to drop and compares as written.
     pub fn untagged(&self) -> String {
-        format!("{}/{}", self.registry, self.repository)
+        match self.kind {
+            FeatureKind::Registry => format!("{}/{}", self.registry, self.repository),
+            _ => self.raw.clone(),
+        }
     }
 }
 
-/// Classify a Feature id. Only the registry form is handled natively; the others are how the
-/// caller learns it must fall back rather than guess.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FeatureSource {
-    Registry(FeatureRef),
-    /// `./path` or `../path` — a Feature vendored in the repo.
-    Local(String),
-    /// A direct `https://…/feature.tgz`.
-    Tarball(String),
-}
-
-/// Parse a Feature id into its source kind.
+/// Parse a Feature id into a reference.
 ///
 /// The registry form is recognised by having a dotted (or `localhost`) first segment, which is
 /// how the OCI spec itself distinguishes a registry host from a Docker Hub shorthand. `am`
 /// deliberately does *not* accept the shorthand: a Feature id without a registry is not a
 /// thing the devcontainer spec produces, and silently defaulting to Docker Hub would turn a
-/// typo into a confusing network error.
-pub fn parse_ref(id: &str) -> FeatureSource {
+/// typo into a confusing network error — so a bare name is read as a local path instead, which
+/// is what it is.
+pub fn parse_ref(id: &str) -> FeatureRef {
+    let local = |id: &str| FeatureRef {
+        kind: FeatureKind::Local,
+        registry: String::new(),
+        repository: id.to_string(),
+        tag: String::new(),
+        raw: id.to_string(),
+    };
+
     if id.starts_with("./") || id.starts_with("../") {
-        return FeatureSource::Local(id.to_string());
+        return local(id);
     }
     if id.starts_with("https://") || id.starts_with("http://") {
-        return FeatureSource::Tarball(id.to_string());
+        return FeatureRef {
+            kind: FeatureKind::Tarball,
+            registry: String::new(),
+            repository: id.to_string(),
+            tag: String::new(),
+            raw: id.to_string(),
+        };
     }
 
     // Split the tag off first, but only from the last segment — a registry may carry a port
@@ -84,15 +114,16 @@ pub fn parse_ref(id: &str) -> FeatureSource {
         Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
             (host.to_string(), rest.to_string())
         }
-        _ => return FeatureSource::Local(id.to_string()),
+        _ => return local(id),
     };
 
-    FeatureSource::Registry(FeatureRef {
+    FeatureRef {
+        kind: FeatureKind::Registry,
         registry,
         repository,
         tag,
         raw: id.to_string(),
-    })
+    }
 }
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
@@ -275,6 +306,44 @@ pub fn fetch_layer(feature: &FeatureRef, layer: &Layer, cache_root: &Path) -> Re
     Ok(dir)
 }
 
+/// Download and unpack a Feature published as a plain tarball, returning its directory and the
+/// digest of the bytes fetched.
+///
+/// The spec keys equality for these on the tarball's own hash rather than on the URL, so the
+/// digest is computed here and returned rather than derived from the address — two URLs serving
+/// identical bytes are one Feature.
+///
+/// Unlike a registry layer this cannot be cached before it is fetched: a URL is mutable, so
+/// there is no immutable name to look up first. The download therefore happens every build, and
+/// only the unpacking is skipped on a hit.
+pub fn fetch_tarball(feature: &FeatureRef, cache_root: &Path) -> Result<(PathBuf, String)> {
+    let body = get_with_auth(&feature.raw, None)
+        .with_context(|| format!("downloading {}", feature.raw))?;
+
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let sum = Sha256::digest(&body);
+        format!("sha256:{}", sum.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    };
+    let dir = cache_root.join(digest.replace(':', "-"));
+    let marker = dir.join(".am-complete");
+    if marker.is_file() {
+        return Ok((dir, digest));
+    }
+
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("clearing stale feature cache {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating feature cache {}", dir.display()))?;
+    unpack(&body, &dir)
+        .with_context(|| format!("unpacking {} into {}", feature.raw, dir.display()))?;
+    std::fs::write(&marker, b"")
+        .with_context(|| format!("marking {} complete", dir.display()))?;
+    Ok((dir, digest))
+}
+
 /// Unpack a Feature layer, which is a tar that may or may not be gzipped.
 ///
 /// The `.tgz` in the layer's title annotation is not reliable — ghcr serves the
@@ -306,9 +375,8 @@ mod tests {
 
     #[test]
     fn parses_a_tagged_registry_ref() {
-        let FeatureSource::Registry(r) = parse_ref("ghcr.io/devcontainers/features/git:1") else {
-            panic!("expected a registry ref");
-        };
+        let r = parse_ref("ghcr.io/devcontainers/features/git:1");
+        assert_eq!(r.kind, FeatureKind::Registry);
         assert_eq!(r.registry, "ghcr.io");
         assert_eq!(r.repository, "devcontainers/features/git");
         assert_eq!(r.tag, "1");
@@ -318,9 +386,7 @@ mod tests {
 
     #[test]
     fn untagged_ref_defaults_to_latest() {
-        let FeatureSource::Registry(r) = parse_ref("ghcr.io/devcontainers/features/git") else {
-            panic!("expected a registry ref");
-        };
+        let r = parse_ref("ghcr.io/devcontainers/features/git");
         assert_eq!(r.tag, "latest");
         // The label must echo what the user wrote, not the normalised form.
         assert_eq!(r.raw, "ghcr.io/devcontainers/features/git");
@@ -328,9 +394,7 @@ mod tests {
 
     #[test]
     fn registry_port_is_not_mistaken_for_a_tag() {
-        let FeatureSource::Registry(r) = parse_ref("localhost:5000/my/feature:2") else {
-            panic!("expected a registry ref");
-        };
+        let r = parse_ref("localhost:5000/my/feature:2");
         assert_eq!(r.registry, "localhost:5000");
         assert_eq!(r.repository, "my/feature");
         assert_eq!(r.tag, "2");
@@ -338,21 +402,26 @@ mod tests {
 
     #[test]
     fn recognises_local_and_tarball_sources() {
-        assert_eq!(
-            parse_ref("./my-feature"),
-            FeatureSource::Local("./my-feature".to_string())
-        );
-        assert_eq!(
-            parse_ref("https://example.com/f.tgz"),
-            FeatureSource::Tarball("https://example.com/f.tgz".to_string())
-        );
+        let local = parse_ref("./my-feature");
+        assert_eq!(local.kind, FeatureKind::Local);
+        // Both compare as written: neither has a tag to strip.
+        assert_eq!(local.untagged(), "./my-feature");
+        assert_eq!(local.name(), "my-feature");
+
+        let tarball = parse_ref("https://example.com/devcontainer-feature-f.tgz");
+        assert_eq!(tarball.kind, FeatureKind::Tarball);
+        assert_eq!(tarball.untagged(), "https://example.com/devcontainer-feature-f.tgz");
+        // A tarball has no short alias — the reference CLI lists none for one — so it can only
+        // be named in full in an overrideFeatureInstallOrder.
+        assert_eq!(tarball.name(), "");
     }
 
     #[test]
     fn a_bare_name_is_not_treated_as_docker_hub() {
-        // No dot in the first segment, so this cannot be a registry host. Falling through to
-        // Local means the caller falls back to the CLI instead of pulling from Docker Hub.
-        assert!(matches!(parse_ref("some/feature"), FeatureSource::Local(_)));
+        // No dot in the first segment, so this cannot be a registry host. Reading it as a
+        // local path means a typo surfaces as a missing directory rather than as a confusing
+        // pull from Docker Hub.
+        assert_eq!(parse_ref("some/feature").kind, FeatureKind::Local);
     }
 
     #[test]

@@ -556,9 +556,10 @@ Follow-ups the native builder left behind:
       independent `installsAfter` chains — that is, most real configs. `installsAfter` is in
       nearly every published Feature and `dependsOn` in almost none (15 popular Features
       checked, none used it), so the incidental fix is worth more than the feature.
-- [ ] **`dependsOn` is not differentially tested.** No Feature in the common registries
-      declares it, so the recursive-fetch path is never checked against the reference
-      implementation. Needs a Feature published for the purpose.
+- [ ] **`dependsOn` is not differentially tested.** The recursive walk now has offline unit
+      tests via local Features — transitive pull-in, diamond dedup, cycle termination — but
+      no Feature in the common registries declares `dependsOn`, so the two implementations
+      have never been compared on one. Needs a Feature published for the purpose.
 - [ ] **Registry auth is anonymous only.** Private Feature registries need `docker
       config.json` credentials and credential helpers. This one does not degrade gracefully:
       a private ref is still a registry ref, so it is never handed to the CLI and instead
@@ -567,8 +568,16 @@ Follow-ups the native builder left behind:
       top of the round machinery `dependsOn` added. It is a priority rather than an order:
       it cannot make a Feature jump a dependency, and raising one Feature *splits* its round
       and defers its round-mates. Both behaviours are pinned against the reference CLI.
-- [ ] **Features referenced by local path or tarball URL.** The remaining fallback besides
-      compose, named in the message rather than failing mysteriously.
+- [x] **Features referenced by local path or tarball URL.** Done 2026-08-15. All three
+      sources the spec defines now work; `dockerComposeFile` is the only fallback left. They
+      differ only in where the bytes come from — once a Feature's directory exists, options,
+      ordering, staging and the label are the same code. Identity follows the spec per
+      source: layer digest for a registry Feature, the resolved path for a local one (the
+      spec says every local Feature is distinct), and a hash of the bytes for a tarball.
+- [ ] **Tarball Features are not differentially tested.** The CLI's resolver accepts one from
+      a local TLS server but its build path will not fetch from one, so no reference label
+      can be produced locally. Unpacking has unit tests and everything after the fetch is
+      shared with the other two sources; the HTTP fetch itself is untested.
 - [ ] **A typo'd `overrideFeatureInstallOrder` entry is ignored, not an error.** The CLI
       resolves every entry and fails if it cannot; `am` only matches against the Features
       being installed. No effect on the label, so it is a diagnostics gap rather than a
