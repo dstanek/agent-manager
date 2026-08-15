@@ -353,6 +353,14 @@ impl AmWorld {
                  touch \"$MOCK_IMAGE_MARKER\"\n\
                  exit 0\n\
              fi\n\
+             if [ \"$1\" = \"compose\" ]; then\n\
+                 case \"$*\" in\n\
+                     *\" config \"*|*\" config --format json\"*)\n\
+                         echo '{\"services\":{\"app\":{\"image\":\"debian:bookworm\"}}}'\n\
+                         exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n\
+             fi\n\
              exit 0\n",
         )
         .expect("write mock podman");
@@ -421,6 +429,21 @@ impl AmWorld {
             ],
             &project,
         );
+    }
+
+    /// A devcontainer config plus the compose file it names.
+    ///
+    /// The compose file has to exist and be committed: `am` hands it to the runtime to resolve,
+    /// and the session runs from a worktree, so an uncommitted file would not be there.
+    fn write_compose_project(&mut self, body: &str) {
+        let dir = self.project_path().join(".devcontainer");
+        fs::create_dir_all(&dir).expect("create .devcontainer");
+        fs::write(
+            dir.join("docker-compose.yml"),
+            "services:\n  app:\n    image: debian:bookworm\n    command: sleep infinity\n",
+        )
+        .expect("write docker-compose.yml");
+        self.write_devcontainer_config(body);
     }
 
     /// Run the `am` binary with `args`, capturing stdout + stderr.
@@ -889,8 +912,16 @@ async fn given_baseless_config(world: &mut AmWorld) {
 
 #[given("the repo has a devcontainer config using docker compose")]
 async fn given_compose_config(world: &mut AmWorld) {
-    world.write_devcontainer_config(
+    world.write_compose_project(
         "{\"name\":\"test\",\"dockerComposeFile\":\"docker-compose.yml\",\"service\":\"app\"}",
+    );
+}
+
+/// A compose config that never says which service the agent belongs in.
+#[given("the repo has a devcontainer config using docker compose with no service")]
+async fn given_compose_config_without_service(world: &mut AmWorld) {
+    world.write_compose_project(
+        "{\"name\":\"test\",\"dockerComposeFile\":\"docker-compose.yml\"}",
     );
 }
 

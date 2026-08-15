@@ -221,11 +221,11 @@ pub fn detect_runtime(preference: RuntimePreference) -> Result<ContainerRuntime>
 
 // ── SELinux label ─────────────────────────────────────────────────────────────
 
-fn use_selinux_labels(runtime: &ContainerRuntime) -> bool {
+pub(crate) fn use_selinux_labels(runtime: &ContainerRuntime) -> bool {
     cfg!(target_os = "linux") && runtime.kind == RuntimeKind::Podman
 }
 
-fn mount_str(host: &Path, container: &str, mode: MountMode, selinux: bool) -> String {
+pub(crate) fn mount_str(host: &Path, container: &str, mode: MountMode, selinux: bool) -> String {
     let mode_str = match mode {
         MountMode::ReadOnly => "ro",
         MountMode::ReadWrite => "rw",
@@ -616,7 +616,7 @@ pub fn credentials_hint(agent: KnownAgent) -> &'static str {
 // ── Command building ──────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn get_host_uid_gid() -> Option<(u32, u32)> {
+pub(crate) fn get_host_uid_gid() -> Option<(u32, u32)> {
     extern "C" {
         fn getuid() -> u32;
         fn getgid() -> u32;
@@ -656,7 +656,7 @@ fn read_gitconfig_value(path: &Path, key: &str) -> Option<String> {
 ///
 /// Returns nothing unless *both* values are present — a half-populated identity would
 /// produce the same unpushable commit while looking like it had been configured.
-fn jj_identity_env(gitconfig: &Path) -> Vec<(String, String)> {
+pub(crate) fn jj_identity_env(gitconfig: &Path) -> Vec<(String, String)> {
     if !gitconfig.exists() {
         return Vec::new();
     }

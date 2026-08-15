@@ -514,8 +514,12 @@ image, and the split is what made replacing the build half a contained change.
 - [ ] **Phase 2.** `userEnvProbe` and `forwardPorts`. Vendoring the CLI bundle was the third
       item here; the native builder removed the friction that was meant to relieve, so it is
       only worth revisiting if the remaining fallbacks turn out to be common in practice.
-- [ ] **Phase 3.** Docker Compose configs (`dockerComposeFile`), if worth owning. Still a
-      CLI fallback under both builders.
+- [x] **Phase 3 — compose.** Done 2026-08-15. `dockerComposeFile` configs now bring their
+      project up, run the agent in the named `service`, and go down on `am destroy`. The build
+      half was nearly free — the service's image with Features baked in, same label; the run
+      half is a second run model beside `build_run_command`. `am` parses no YAML: the resolved
+      model comes from `compose config --format json`, and the override it contributes is
+      written as JSON, which compose accepts because JSON is valid YAML.
 
 Prerequisites this surfaced, both now done and both a fix in their own right:
 
@@ -574,6 +578,15 @@ Follow-ups the native builder left behind:
       ordering, staging and the label are the same code. Identity follows the spec per
       source: layer digest for a registry Feature, the resolved path for a local one (the
       spec says every local Feature is distinct), and a hash of the bytes for a tarball.
+- [ ] **Compose sessions are only tested against a mock runtime.** The build half has a
+      differential test against the reference CLI, and the generated override is validated
+      against real `docker compose config`, but no test brings a real project up and execs an
+      agent into it — that needs a runtime, a tmux session and a live agent at once.
+- [ ] **`podman compose` is untested.** The code shells out to `<runtime> compose`, which
+      podman 4+ provides, but the dev container has no podman to check it against.
+- [ ] **Compose lifecycle gaps.** `forwardPorts` is still unapplied, which bites harder here
+      (a compose project is exactly where published ports are expected), and a session whose
+      service exits leaves the project up until `am destroy`.
 - [ ] **Tarball Features are not differentially tested.** The CLI's resolver accepts one from
       a local TLS server but its build path will not fetch from one, so no reference label
       can be produced locally. Unpacking has unit tests and everything after the fetch is

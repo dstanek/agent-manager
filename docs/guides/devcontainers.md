@@ -15,11 +15,25 @@ Features work whether they come from a registry, from a directory in your repo
 (`./my-feature`), or from a tarball URL — and whether your config names them directly or
 another Feature pulls them in through its `dependsOn`.
 
-One config shape still needs the reference CLI, and `am` falls back to it automatically:
+Compose projects work too. `am` builds the service your `devcontainer.json` names, brings the
+whole project up, and runs the agent inside that service — so the database or cache the project
+depends on is there, the way it would be in any other editor. `am destroy` takes the project
+down again.
 
-- `dockerComposeFile`
+Three things to know about compose sessions:
 
-If you hit one, `am` tells you which construct caused it, and the CLI needs Node 20+:
+- The config **must** name a `service`. Without it there is nothing to say which container the
+  agent belongs in.
+- Keeping that service alive is the compose file's job, not `am`'s. The devcontainer convention
+  is `command: sleep infinity`; a service that exits immediately leaves the session with nowhere
+  to run.
+- `container.network = "none"` cannot apply, because compose services reach each other over the
+  project network. `am` refuses rather than quietly ignoring it.
+
+`am` reaches for the reference CLI only for a config it can find no base image in at all — no
+`image`, no `build.dockerfile`, and no `dockerComposeFile`.
+
+If you hit that, `am` says so, and the CLI needs Node 20+:
 
 ```sh
 npm install -g @devcontainers/cli
@@ -169,7 +183,6 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 
 | Construct | Status |
 |---|---|
-| `dockerComposeFile` | Rejected with a pointer to `container.mode = "image"` |
 | `userEnvProbe` | Parsed, not applied — interactive panes get the login environment anyway |
 | `forwardPorts` | Parsed, not applied |
 | `postAttachCommand` | Not run (see above) |

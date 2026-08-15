@@ -261,6 +261,8 @@ pub struct DevcontainerJson {
     pub workspace_mount: Option<String>,
     pub initialize_command: Option<LifecycleCommand>,
     pub docker_compose_file: Option<ComposeFile>,
+    /// The compose service the agent runs in. Required alongside `dockerComposeFile`.
+    pub service: Option<String>,
     pub image: Option<String>,
     pub build: Option<BuildSection>,
 }
@@ -946,16 +948,34 @@ pub fn dockerfile_path(config_path: &Path, json: &DevcontainerJson) -> Option<Pa
 
 /// Reject configs that use constructs `am` does not implement yet, with a message that
 /// says what to do instead rather than just naming the unsupported key.
+///
+/// Compose used to be rejected here. It is now supported (see [`crate::compose`]), but it does
+/// require `service` — without it there is no way to know which container the agent belongs in,
+/// and guessing would put it somewhere arbitrary.
 pub fn check_supported(json: &DevcontainerJson) -> Result<()> {
-    if json.docker_compose_file.is_some() {
+    if json.docker_compose_file.is_some() && json.service.is_none() {
         return Err(AmError::ConfigError(
-            "this devcontainer uses dockerComposeFile, which am does not support yet\n\
-             Set container.mode = \"image\" in .am/config.toml to use an am-managed image instead"
+            "this devcontainer sets dockerComposeFile but no service, so am cannot tell which \
+             container the agent belongs in\n\
+             Add \"service\": \"<name>\" to the devcontainer.json"
                 .to_string(),
         )
         .into());
     }
     Ok(())
+}
+
+/// The compose files a config names, resolved against the directory holding it.
+///
+/// Order matters and is preserved: compose layers later files over earlier ones, and `am` adds
+/// its own override after all of them.
+pub fn compose_files(config_path: &Path, json: &DevcontainerJson) -> Vec<PathBuf> {
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    match &json.docker_compose_file {
+        Some(ComposeFile::One(one)) => vec![base.join(one)],
+        Some(ComposeFile::Many(many)) => many.iter().map(|f| base.join(f)).collect(),
+        None => Vec::new(),
+    }
 }
 
 // ── Lifecycle hooks ───────────────────────────────────────────────────────────
@@ -1893,17 +1913,41 @@ echo '{{"outcome":"success","imageName":"am-dc-abc123"}}'"#,
     // ── Unsupported constructs ────────────────────────────────────────────────
 
     #[test]
-    fn compose_configs_are_rejected_with_a_way_out() {
-        let json = parse_config_str(r#"{"dockerComposeFile":"docker-compose.yml"}"#).unwrap();
-        let err = check_supported(&json).unwrap_err().to_string();
-        assert!(err.contains("dockerComposeFile"));
-        assert!(err.contains("container.mode"));
+    fn a_compose_config_naming_its_service_is_supported() {
+        let json =
+            parse_config_str(r#"{"dockerComposeFile":"docker-compose.yml","service":"app"}"#)
+                .unwrap();
+        assert!(check_supported(&json).is_ok());
     }
 
     #[test]
-    fn compose_array_form_is_also_rejected() {
-        let json = parse_config_str(r#"{"dockerComposeFile":["a.yml","b.yml"]}"#).unwrap();
-        assert!(check_supported(&json).is_err());
+    fn a_compose_config_without_a_service_says_what_to_add() {
+        // Without it there is no way to know which container the agent belongs in, and
+        // guessing would put it somewhere arbitrary.
+        let json = parse_config_str(r#"{"dockerComposeFile":"docker-compose.yml"}"#).unwrap();
+        let err = check_supported(&json).unwrap_err().to_string();
+        assert!(err.contains("service"), "must name the missing key: {err}");
+    }
+
+    #[test]
+    fn compose_files_resolve_against_the_config_directory() {
+        let json =
+            parse_config_str(r#"{"dockerComposeFile":["a.yml","b.yml"],"service":"app"}"#).unwrap();
+        let files = compose_files(Path::new("/repo/.devcontainer/devcontainer.json"), &json);
+        // Order is preserved: compose layers later files over earlier ones.
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("/repo/.devcontainer/a.yml"),
+                PathBuf::from("/repo/.devcontainer/b.yml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_compose_file_yields_no_compose_files() {
+        let json = parse_config_str(r#"{"image":"debian"}"#).unwrap();
+        assert!(compose_files(Path::new("/repo/.devcontainer/devcontainer.json"), &json).is_empty());
     }
 
     #[test]

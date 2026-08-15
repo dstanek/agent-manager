@@ -99,7 +99,7 @@ am doctor
 
 In dev container mode the Environment section additionally reports the discovered
 config, the `devcontainer` CLI and its version, Node 20+, whether the built image is
-current for the config hash, and any construct `am` will refuse (`dockerComposeFile`) or
+current for the config hash, and any construct `am` will refuse or
 drop (`initializeCommand`, `runArgs`).
 
 **Output**

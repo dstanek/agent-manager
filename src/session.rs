@@ -53,6 +53,11 @@ pub struct SessionContainer {
     /// Which create-time lifecycle hooks have already run, so they run exactly once.
     #[serde(default)]
     pub lifecycle_done: Vec<String>,
+    /// Set when the environment is a compose project rather than a single container. Carries
+    /// what `am destroy` and `am attach` need to reach it again without re-reading a
+    /// `devcontainer.json` that may have changed underneath them.
+    #[serde(default)]
+    pub compose: Option<crate::compose::SessionCompose>,
 }
 
 impl SessionContainer {
@@ -68,6 +73,7 @@ impl SessionContainer {
             config_hash: None,
             remote_user: None,
             lifecycle_done: Vec::new(),
+            compose: None,
         }
     }
 }
@@ -482,6 +488,7 @@ mod tests {
             config_hash: Some("abc123".to_string()),
             remote_user: Some("vscode".to_string()),
             lifecycle_done: vec!["postCreateCommand".to_string()],
+            compose: None,
         });
         add_session_global(s).unwrap();
 

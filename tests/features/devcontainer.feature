@@ -61,14 +61,34 @@ Feature: Dev container sessions
     And the output contains "no devcontainer.json was found"
     And the worktree ".am/worktrees/my-feature" does not exist
 
-  Scenario: compose-based configs are rejected with a way forward
-    Given I am using a mock devcontainer CLI
+  # A compose config is a whole project, so am brings it up and execs the agent into the
+  # named service rather than running one container.
+  Scenario: a compose config starts its project and runs the agent in the named service
+    Given I am using am's own devcontainer builder with no fallback
     And the repo has a devcontainer config using docker compose
     When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock podman log contains "compose"
+    And the mock podman log contains "up -d"
+    And the mock devcontainer CLI was called 0 times
+    And the session file contains "my-feature"
+
+  # Without it there is nothing to say which container the agent belongs in.
+  Scenario: a compose config with no service says what to add
+    Given I am using a mock devcontainer CLI
+    And the repo has a devcontainer config using docker compose with no service
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
     Then the command fails
-    And the output contains "dockerComposeFile"
-    And the output contains "container.mode"
+    And the output contains "service"
     And the worktree ".am/worktrees/my-feature" does not exist
+
+  Scenario: destroying a compose session takes the whole project down
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config using docker compose
+    And a session "my-feature" has been started
+    When I run "am destroy my-feature --force"
+    Then the command succeeds
+    And the mock podman log contains "down -v"
 
   # initializeCommand runs on the host, outside every boundary am provides.
   Scenario: initializeCommand is refused by default
