@@ -216,6 +216,48 @@ pub struct MetadataSnippet {
     pub forward_ports: Vec<serde_json::Value>,
 }
 
+/// How to derive the environment the agent runs with.
+///
+/// A devcontainer's toolchain is frequently installed by something that appends to `PATH` in a
+/// dotfile — nvm, rbenv, sdkman, a Feature's own `.bashrc` line. A process started directly in
+/// the container never sources those, so the agent would not see tools that are plainly there in
+/// an editor terminal. This is the spec's answer: run the user's shell, capture the environment
+/// it ends up with, and apply it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserEnvProbe {
+    /// Start the agent with exactly the environment `am` and the image provide.
+    #[default]
+    None,
+    InteractiveShell,
+    LoginShell,
+    LoginInteractiveShell,
+}
+
+impl UserEnvProbe {
+    /// Parse the config value. The spec's default when the key is absent is
+    /// `loginInteractiveShell`, which is what an unrecognised value falls back to as well.
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("none") => UserEnvProbe::None,
+            Some("interactiveShell") => UserEnvProbe::InteractiveShell,
+            Some("loginShell") => UserEnvProbe::LoginShell,
+            _ => UserEnvProbe::LoginInteractiveShell,
+        }
+    }
+
+    /// The flags the probe shell is invoked with, or `None` for no probe at all.
+    ///
+    /// Taken from the reference CLI, which runs `<shell> -lic 'cat /proc/self/environ'`.
+    pub fn shell_flags(&self) -> Option<&'static str> {
+        match self {
+            UserEnvProbe::None => None,
+            UserEnvProbe::InteractiveShell => Some("-ic"),
+            UserEnvProbe::LoginShell => Some("-lc"),
+            UserEnvProbe::LoginInteractiveShell => Some("-lic"),
+        }
+    }
+}
+
 /// A port a devcontainer asked to be reachable from the machine running `am`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForwardedPort {
@@ -1141,6 +1183,10 @@ pub fn apply_trust(
         run_args: Vec::new(),
         workdir: resolved.workspace_folder.clone(),
         entrypoints: resolved.entrypoints.clone(),
+        // The spec's default when the key is absent is loginInteractiveShell, so a devcontainer
+        // that says nothing still gets the environment its dotfiles set up — which is the whole
+        // reason the property exists.
+        user_env_probe: UserEnvProbe::parse(resolved.user_env_probe.as_deref()),
         ports: resolved.forward_ports.clone(),
         user: resolved
             .remote_user

@@ -951,6 +951,21 @@ async fn given_local_feature_config(world: &mut AmWorld) {
 }
 
 
+/// `userEnvProbe` reaches the run path through the image's metadata label, not by re-reading
+/// the config — so disabling it means writing it where `am` actually looks.
+#[given("the repo has a devcontainer config that disables the user env probe")]
+async fn given_no_user_env_probe_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm","userEnvProbe":"none"}"#,
+    );
+    let label = world
+        .mock_label_file
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    fs::write(label, r#"[{"remoteUser":"vscode","userEnvProbe":"none"}]"#)
+        .expect("write label file");
+}
+
 #[given("the repo has a devcontainer config with an initializeCommand")]
 async fn given_initialize_command_config(world: &mut AmWorld) {
     world.write_devcontainer_config(

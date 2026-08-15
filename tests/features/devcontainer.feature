@@ -130,6 +130,23 @@ Feature: Dev container sessions
     And the mock devcontainer CLI was called 0 times
     And the session file contains "my-feature"
 
+  # userEnvProbe defaults to loginInteractiveShell, so a devcontainer that says nothing still
+  # gets the environment its dotfiles set up — which is where a devcontainer's toolchain
+  # frequently lives.
+  Scenario: the agent inherits the shell environment a devcontainer sets up
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "-lic"
+
+  Scenario: userEnvProbe none leaves the environment alone
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config that disables the user env probe
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log does not contain "-lic"
+
   # An unchanged config must skip the build regardless of which builder produced the image.
   Scenario: a second session on an unchanged config does not rebuild
     Given I am using am's own devcontainer builder

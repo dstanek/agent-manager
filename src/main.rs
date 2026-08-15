@@ -1157,6 +1157,8 @@ fn plan_devcontainer(
     let agent_cmd = container::compose_entrypoint_command(
         &chain,
         &agent_command(agent_name, agent, auto, resume),
+        trusted.user_env_probe,
+        &container::protected_env_names(&mounts, &cfg.container.env, &agent_auth.env, &trusted),
     );
 
     // A compose config is a whole project rather than one container, so it takes the other run

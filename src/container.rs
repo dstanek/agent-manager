@@ -150,6 +150,8 @@ pub struct DevcontainerRuntime {
     pub workdir: Option<String>,
     /// Feature entrypoint scripts, composed ahead of the agent command.
     pub entrypoints: Vec<String>,
+    /// How to derive the agent's environment, from `userEnvProbe`.
+    pub user_env_probe: crate::devcontainer::UserEnvProbe,
     /// Ports to publish on the host, from `forwardPorts`.
     pub ports: Vec<crate::devcontainer::ForwardedPort>,
     /// The user to run as, from `remoteUser`/`containerUser`.
@@ -912,20 +914,120 @@ pub fn build_run_command(
 ///
 /// `exec` on the last element matters: it makes the agent PID 1's direct child, so signals
 /// and exit codes propagate instead of being swallowed by an intermediate shell.
-pub fn compose_entrypoint_command(entrypoints: &[String], agent_cmd: &[String]) -> Vec<String> {
-    if entrypoints.is_empty() {
+///
+/// `probe` runs `userEnvProbe` ahead of the agent; `protected` names the variables `am` set
+/// deliberately, which the probe must not overwrite.
+pub fn compose_entrypoint_command(
+    entrypoints: &[String],
+    agent_cmd: &[String],
+    probe: crate::devcontainer::UserEnvProbe,
+    protected: &[String],
+) -> Vec<String> {
+    let probe_script = user_env_probe_script(probe, protected);
+    if entrypoints.is_empty() && probe_script.is_none() {
         return agent_cmd.to_vec();
     }
-    let mut script = entrypoints.join(" && ");
+
+    // Entrypoints stay `&&`-chained through to the agent: a Feature's init script failing must
+    // stop the session rather than launch an agent into a half-built container. The probe is
+    // joined with a newline instead, because finding no variables is not a failure.
+    let mut tail = entrypoints.join(" && ");
     if !agent_cmd.is_empty() {
         let quoted = agent_cmd
             .iter()
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
-        script.push_str(&format!(" && exec {quoted}"));
+        if tail.is_empty() {
+            tail = format!("exec {quoted}");
+        } else {
+            tail.push_str(&format!(" && exec {quoted}"));
+        }
     }
+
+    let script = match probe_script {
+        Some(probe) if tail.is_empty() => probe,
+        Some(probe) => format!("{probe}\n{tail}"),
+        None => tail,
+    };
     vec!["sh".to_string(), "-c".to_string(), script]
+}
+
+/// The environment variables `am` sets deliberately, which `userEnvProbe` must not overwrite.
+///
+/// Derived from the same inputs [`build_run_command`] emits `-e` flags for, so the two cannot
+/// drift: a variable added there without being added here would become one a dotfile can
+/// silently override.
+pub fn protected_env_names(
+    mounts: &ContainerMounts,
+    env_passthrough: &[String],
+    extra_env: &[(String, String)],
+    dc: &DevcontainerRuntime,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        let name = name.to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    if mounts.ssh_agent_sock.as_ref().is_some_and(|s| s.exists()) {
+        push("SSH_AUTH_SOCK");
+    }
+    for (key, _) in jj_identity_env(&mounts.gitconfig_host) {
+        push(&key);
+    }
+    for (key, _) in extra_env {
+        push(key);
+    }
+    for (key, _) in &dc.env {
+        push(key);
+    }
+    for var in env_passthrough {
+        push(var.split_once('=').map_or(var.as_str(), |(k, _)| k));
+    }
+    names
+}
+
+/// The shell snippet that runs `userEnvProbe` and applies what it finds.
+///
+/// Mirrors the reference CLI: resolve the user's login shell, run it with the mode's flags, and
+/// read `/proc/self/environ` — NUL-separated, so a value containing a newline survives the trip
+/// out of the shell even though the loop below is line-based.
+///
+/// Two deliberate differences from a naive "run the agent under a login shell". The probe is a
+/// throwaway process, so a `.bashrc` that prints a banner or starts a job-control message does
+/// not end up in the agent's own process tree. And variables `am` set on purpose —
+/// `containerEnv`, `remoteEnv`, agent credentials, the jj identity — are skipped, so a dotfile
+/// cannot quietly undo the session's configuration.
+fn user_env_probe_script(
+    probe: crate::devcontainer::UserEnvProbe,
+    protected: &[String],
+) -> Option<String> {
+    let flags = probe.shell_flags()?;
+    // A `case` pattern rather than a loop: it is one comparison per variable in the generated
+    // script instead of one per protected name.
+    let guard = if protected.is_empty() {
+        String::new()
+    } else {
+        let names = protected
+            .iter()
+            .map(|n| format!("{n}=*"))
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("    case \"$_am_line\" in {names}) continue ;; esac\n")
+    };
+    Some(format!(
+        "_am_shell=$(getent passwd \"$(id -u)\" 2>/dev/null | cut -d: -f7)\n\
+         [ -x \"$_am_shell\" ] || _am_shell=/bin/sh\n\
+         _am_env=$(\"$_am_shell\" {flags} 'cat /proc/self/environ' 2>/dev/null | tr '\\0' '\\n')\n\
+         _am_ifs=$IFS; IFS='\n'\n\
+         for _am_line in $_am_env; do\n\
+         {guard}\
+         \x20   case \"$_am_line\" in *=*) export \"$_am_line\" ;; esac\n\
+         done\n\
+         IFS=$_am_ifs; unset _am_shell _am_env _am_ifs _am_line"
+    ))
 }
 
 
@@ -1889,15 +1991,25 @@ mod tests {
 
     // ── Entrypoint composition ────────────────────────────────────────────────
 
+    use crate::devcontainer::UserEnvProbe;
+
+    /// The common case in these tests: no userEnvProbe, so the script is only the chain.
+    fn compose_entrypoint_command_no_probe(
+        entrypoints: &[String],
+        agent_cmd: &[String],
+    ) -> Vec<String> {
+        compose_entrypoint_command(entrypoints, agent_cmd, UserEnvProbe::None, &[])
+    }
+
     #[test]
     fn no_entrypoints_leaves_the_agent_command_alone() {
         let agent = vec!["claude".to_string()];
-        assert_eq!(compose_entrypoint_command(&[], &agent), agent);
+        assert_eq!(compose_entrypoint_command(&[], &agent, UserEnvProbe::None, &[]), agent);
     }
 
     #[test]
     fn entrypoints_are_chained_before_the_agent() {
-        let cmd = compose_entrypoint_command(
+        let cmd = compose_entrypoint_command_no_probe(
             &[
                 "/usr/local/share/docker-init.sh".to_string(),
                 "/usr/local/share/ssh-init.sh".to_string(),
@@ -1914,13 +2026,130 @@ mod tests {
 
     #[test]
     fn entrypoints_run_even_without_an_agent_command() {
-        let cmd = compose_entrypoint_command(&["/init.sh".to_string()], &[]);
+        let cmd = compose_entrypoint_command_no_probe(&["/init.sh".to_string()], &[]);
         assert_eq!(cmd[2], "/init.sh");
     }
 
     #[test]
-    fn agent_flags_are_quoted_in_the_composed_script() {
+    fn a_probe_runs_before_the_agent_and_does_not_gate_it() {
         let cmd = compose_entrypoint_command(
+            &[],
+            &["claude".to_string()],
+            UserEnvProbe::LoginInteractiveShell,
+            &[],
+        );
+        let script = &cmd[2];
+        assert!(script.contains("-lic 'cat /proc/self/environ'"), "got: {script}");
+        // Newline, not `&&`: a probe that finds nothing is not a failure, and must not swallow
+        // the agent the way a failed entrypoint deliberately does.
+        assert!(script.contains("\nexec claude"), "got: {script}");
+        assert!(!script.contains("&& exec claude"), "got: {script}");
+    }
+
+    #[test]
+    fn a_failing_entrypoint_still_gates_the_agent_when_probing() {
+        let cmd = compose_entrypoint_command(
+            &["/init.sh".to_string()],
+            &["claude".to_string()],
+            UserEnvProbe::LoginShell,
+            &[],
+        );
+        assert!(cmd[2].contains("/init.sh && exec claude"), "got: {}", cmd[2]);
+    }
+
+    #[test]
+    fn each_probe_mode_maps_to_the_shell_flags_the_cli_uses() {
+        let flags = |p: UserEnvProbe| {
+            compose_entrypoint_command(&[], &["a".to_string()], p, &[]).join(" ")
+        };
+        assert!(flags(UserEnvProbe::LoginInteractiveShell).contains(" -lic "));
+        assert!(flags(UserEnvProbe::LoginShell).contains(" -lc "));
+        assert!(flags(UserEnvProbe::InteractiveShell).contains(" -ic "));
+        // `none` must leave the command completely alone — no shell wrapper at all.
+        assert_eq!(
+            compose_entrypoint_command(&[], &["a".to_string()], UserEnvProbe::None, &[]),
+            vec!["a".to_string()]
+        );
+    }
+
+    /// The generated snippet is shell, so the only real check is running it.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_script_applies_what_it_finds_and_respects_protected_names() {
+        let cmd = compose_entrypoint_command(
+            &[],
+            &["env".to_string()],
+            UserEnvProbe::LoginShell,
+            &["AM_KEEP".to_string()],
+        );
+        // Stand in for the container's login shell: it "sources a dotfile" that sets one new
+        // variable and tries to clobber one am set on purpose.
+        let tmp = TempDir::new().unwrap();
+        let fake = tmp.path().join("fakeshell");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nAM_FROM_DOTFILE=yes AM_KEEP=clobbered /usr/bin/env -0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // `getent` resolves the real user's shell, so point the script at the fake one instead.
+        let script = cmd[2].replace(
+            "_am_shell=$(getent passwd \"$(id -u)\" 2>/dev/null | cut -d: -f7)",
+            &format!("_am_shell={}", fake.display()),
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("AM_KEEP", "original")
+            .output()
+            .expect("running the generated script");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let env = String::from_utf8_lossy(&out.stdout);
+
+        assert!(env.contains("AM_FROM_DOTFILE=yes"), "probed variable missing: {env}");
+        assert!(
+            env.contains("AM_KEEP=original"),
+            "the probe overwrote a variable am set deliberately: {env}"
+        );
+    }
+
+    #[test]
+    fn protected_names_cover_every_source_the_run_command_sets() {
+        let tmp = TempDir::new().unwrap();
+        let mut mounts = make_mounts(tmp.path());
+        std::fs::write(&mounts.gitconfig_host, "[user]\n\tname = T\n\temail = t@e.com\n").unwrap();
+        let sock = tmp.path().join("agent.sock");
+        std::fs::write(&sock, "").unwrap();
+        mounts.ssh_agent_sock = Some(sock);
+
+        let dc = DevcontainerRuntime {
+            env: vec![("FROM_CONFIG".to_string(), "1".to_string())],
+            ..DevcontainerRuntime::default()
+        };
+        let names = protected_env_names(
+            &mounts,
+            &["PASSED_THROUGH".to_string(), "WITH=value".to_string()],
+            &[("AGENT_TOKEN".to_string(), "x".to_string())],
+            &dc,
+        );
+        for expected in [
+            "SSH_AUTH_SOCK",
+            "JJ_USER",
+            "JJ_EMAIL",
+            "AGENT_TOKEN",
+            "FROM_CONFIG",
+            "PASSED_THROUGH",
+            "WITH",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "{expected} missing from {names:?}");
+        }
+    }
+
+    #[test]
+    fn agent_flags_are_quoted_in_the_composed_script() {
+        let cmd = compose_entrypoint_command_no_probe(
             &["/init.sh".to_string()],
             &[
                 "claude".to_string(),
