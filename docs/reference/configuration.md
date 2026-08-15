@@ -270,7 +270,6 @@ falls back to the reference CLI — which requires `npm install -g @devcontainer
 Node 20+ — only for constructs it does not implement:
 
 - `dockerComposeFile`
-- `overrideFeatureInstallOrder`
 - Features referenced by local path (`./my-feature`) or direct tarball URL, including one a
   Feature pulls in through its own `dependsOn`
 

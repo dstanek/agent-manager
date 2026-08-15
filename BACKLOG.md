@@ -563,10 +563,16 @@ Follow-ups the native builder left behind:
       config.json` credentials and credential helpers. This one does not degrade gracefully:
       a private ref is still a registry ref, so it is never handed to the CLI and instead
       fails with the registry's own 401 text.
-- [ ] **`overrideFeatureInstallOrder`, plus Features referenced by local path or tarball
-      URL.** Each is named in the fallback message rather than failing mysteriously.
-      `overrideFeatureInstallOrder` is now the cheap one: it is the spec's `roundPriority`,
-      and the round machinery it needs already exists.
+- [x] **`overrideFeatureInstallOrder`.** Done 2026-08-15, as the spec's `roundPriority` on
+      top of the round machinery `dependsOn` added. It is a priority rather than an order:
+      it cannot make a Feature jump a dependency, and raising one Feature *splits* its round
+      and defers its round-mates. Both behaviours are pinned against the reference CLI.
+- [ ] **Features referenced by local path or tarball URL.** The remaining fallback besides
+      compose, named in the message rather than failing mysteriously.
+- [ ] **A typo'd `overrideFeatureInstallOrder` entry is ignored, not an error.** The CLI
+      resolves every entry and fails if it cannot; `am` only matches against the Features
+      being installed. No effect on the label, so it is a diagnostics gap rather than a
+      correctness one — closing it costs a network round trip per entry.
 
 ---
 

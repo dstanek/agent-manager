@@ -237,9 +237,15 @@ fn stringify(value: &Value) -> String {
 /// Hard dependencies (`dependsOn`) are always part of the set, since the resolver pulled them
 /// in. Soft ones (`installsAfter`) constrain only Features that happen to be present.
 ///
-/// `overrideFeatureInstallOrder` is the spec's `roundPriority`, which would slot in here as a
-/// filter on each round; the caller still rejects configs using it.
-pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeature>> {
+/// `override_order` is `overrideFeatureInstallOrder` from the `devcontainer.json`. It does not
+/// place Features directly: it raises their `roundPriority`, and a round commits only its
+/// highest-priority members, returning the rest to the worklist. So an override can reorder
+/// Features that were free to go in either order, but it cannot make one jump a dependency —
+/// eligibility is decided before priority is looked at.
+pub fn install_order(
+    features: Vec<ResolvedFeature>,
+    override_order: &[String],
+) -> Result<Vec<ResolvedFeature>> {
     let present: Vec<String> = features.iter().map(|f| f.reference.untagged()).collect();
     let mut worklist = features;
     let mut ordered: Vec<ResolvedFeature> = Vec::with_capacity(worklist.len());
@@ -250,7 +256,7 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
         // Eligibility is judged against what was placed in *previous* rounds, so two Features
         // that could order either way both land in this round rather than one waiting on the
         // other.
-        let (mut round, rest): (Vec<_>, Vec<_>) = worklist.into_iter().partition(|f| {
+        let (eligible, mut rest): (Vec<_>, Vec<_>) = worklist.into_iter().partition(|f| {
             let hard = f.hard_deps.iter().all(|k| placed_keys.iter().any(|p| p == k));
             let soft = f.metadata.installs_after.iter().all(|dep| {
                 let dep = dep.split(':').next().unwrap_or(dep);
@@ -261,7 +267,7 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
             hard && soft
         });
 
-        if round.is_empty() {
+        if eligible.is_empty() {
             let cycle = rest
                 .iter()
                 .map(|f| f.reference.raw.as_str())
@@ -273,6 +279,18 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
             .into());
         }
 
+        // Only the highest-priority eligible Features commit; the others go back and compete
+        // again next round. `max` is always attained, so a round is never empty here.
+        let top = eligible
+            .iter()
+            .map(|f| round_priority(f, override_order))
+            .max()
+            .unwrap_or(0);
+        let (mut round, deferred): (Vec<_>, Vec<_>) = eligible
+            .into_iter()
+            .partition(|f| round_priority(f, override_order) == top);
+        rest.extend(deferred);
+
         round.sort_by(round_stable_sort);
         placed_keys.extend(round.iter().map(ResolvedFeature::key));
         placed_ids.extend(round.iter().map(|f| f.reference.untagged()));
@@ -280,6 +298,31 @@ pub fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeatu
         worklist = rest;
     }
     Ok(ordered)
+}
+
+/// A Feature's `roundPriority`: `n - idx` for the `overrideFeatureInstallOrder` entry naming it,
+/// and 0 for everything the list does not mention.
+///
+/// An entry matches either the fully qualified name without its tag, or the Feature's short
+/// alias (`git` for `ghcr.io/devcontainers/features/git`) — the reference CLI accepts both, and
+/// the short form is what people actually write. An entry matching nothing being installed is
+/// ignored; the CLI instead resolves every entry and errors if it cannot, but since such an
+/// entry changes no ordering, the resulting label — the thing that is actually the contract —
+/// is identical either way.
+fn round_priority(feature: &ResolvedFeature, override_order: &[String]) -> i64 {
+    let untagged = feature.reference.untagged();
+    let alias = feature.reference.name();
+    override_order
+        .iter()
+        .position(|entry| {
+            let entry = entry.rsplit_once(':').map_or(entry.as_str(), |(head, tail)| {
+                // Only a trailing tag, not the port in `localhost:5000/…`.
+                if tail.contains('/') { entry } else { head }
+            });
+            entry == untagged || entry == alias
+        })
+        .map(|idx| (override_order.len() - idx) as i64)
+        .unwrap_or(0)
 }
 
 /// The spec's "Round Stable Sort": the tie-break among Features committed in the same round.
@@ -364,6 +407,12 @@ mod tests {
 
     fn ids(features: &[ResolvedFeature]) -> Vec<String> {
         features.iter().map(|f| f.reference.raw.clone()).collect()
+    }
+
+    /// Ordering without an `overrideFeatureInstallOrder`, which is the overwhelmingly common
+    /// case. Shadows the real one so the tests about priority have to name it explicitly.
+    fn install_order(features: Vec<ResolvedFeature>) -> Result<Vec<ResolvedFeature>> {
+        super::install_order(features, &[])
     }
 
     #[test]
@@ -543,6 +592,108 @@ mod tests {
                 "ghcr.io/devcontainers-extra/features/act:1",
                 "ghcr.io/devcontainers/features/git:1",
             ]
+        );
+    }
+
+    /// The four Features of the two-chains fixture, whose natural order is
+    /// `gh-release, common-utils, act, git`.
+    fn two_chains() -> Vec<ResolvedFeature> {
+        vec![
+            feature(
+                "ghcr.io/devcontainers-extra/features/act:1",
+                &["ghcr.io/devcontainers-extra/features/gh-release"],
+            ),
+            feature("ghcr.io/devcontainers-extra/features/gh-release:1", &[]),
+            feature(
+                "ghcr.io/devcontainers/features/git:1",
+                &["ghcr.io/devcontainers/features/common-utils"],
+            ),
+            feature("ghcr.io/devcontainers/features/common-utils:2", &[]),
+        ]
+    }
+
+    #[test]
+    fn an_override_reorders_within_a_round_but_cannot_jump_a_dependency() {
+        // Pinned against `devcontainer features resolve-dependencies` for this exact config.
+        // `git` is raised, but still waits for `common-utils` — priority is only consulted
+        // among Features that are already eligible. What it does change is that `git` now
+        // outranks `act` in the second round, where the natural order put `act` first.
+        let ordered = super::install_order(
+            two_chains(),
+            &["ghcr.io/devcontainers/features/git".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec![
+                "ghcr.io/devcontainers-extra/features/gh-release:1",
+                "ghcr.io/devcontainers/features/common-utils:2",
+                "ghcr.io/devcontainers/features/git:1",
+                "ghcr.io/devcontainers-extra/features/act:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_override_can_split_a_round_and_defer_the_rest() {
+        // Also pinned against the reference CLI. Raising `common-utils` takes round one alone,
+        // sending `gh-release` back to the worklist to compete again — which is the part of
+        // the algorithm that a "sort by priority" shortcut would get wrong.
+        let ordered = super::install_order(
+            two_chains(),
+            &["ghcr.io/devcontainers/features/common-utils".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec![
+                "ghcr.io/devcontainers/features/common-utils:2",
+                "ghcr.io/devcontainers-extra/features/gh-release:1",
+                "ghcr.io/devcontainers/features/git:1",
+                "ghcr.io/devcontainers-extra/features/act:1",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_override_entry_may_be_the_short_alias() {
+        // The CLI accepts `git` for `ghcr.io/devcontainers/features/git`, and the short form is
+        // what people write.
+        let long = super::install_order(
+            two_chains(),
+            &["ghcr.io/devcontainers/features/git".to_string()],
+        )
+        .unwrap();
+        let short = super::install_order(two_chains(), &["git".to_string()]).unwrap();
+        assert_eq!(ids(&long), ids(&short));
+    }
+
+    #[test]
+    fn an_override_entry_matching_nothing_changes_no_order() {
+        let plain = install_order(two_chains()).unwrap();
+        let bogus = super::install_order(
+            two_chains(),
+            &["ghcr.io/nobody/features/absent".to_string()],
+        )
+        .unwrap();
+        assert_eq!(ids(&plain), ids(&bogus));
+    }
+
+    #[test]
+    fn earlier_override_entries_outrank_later_ones() {
+        // Priority is `n - idx`, so the list reads first-installed to last-installed. Both are
+        // eligible in the same round, so the list alone decides.
+        let ordered = super::install_order(
+            vec![
+                feature("ghcr.io/x/features/apple:1", &[]),
+                feature("ghcr.io/x/features/zebra:1", &[]),
+            ],
+            &["ghcr.io/x/features/zebra".to_string(), "ghcr.io/x/features/apple".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec!["ghcr.io/x/features/zebra:1", "ghcr.io/x/features/apple:1"]
         );
     }
 
