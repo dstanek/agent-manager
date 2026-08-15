@@ -501,14 +501,14 @@ that has to survive Docker's variable expansion to be substituted later by the r
 ## Scope
 
 Implemented natively: a base `image` or `build.dockerfile`, and Features pulled from an OCI
-registry, ordered by the spec's round-based algorithm over both `dependsOn` (hard, resolved
-recursively) and `installsAfter` (soft, ordering only).
+registry, ordered by the spec's round-based algorithm over `dependsOn` (hard, resolved
+recursively), `installsAfter` (soft, ordering only), and `overrideFeatureInstallOrder`
+(`roundPriority`).
 
-Falls back to the CLI, naming the construct: `dockerComposeFile`,
-`overrideFeatureInstallOrder`, and Features referenced by local path or tarball URL — including
-one reached through another Feature's `dependsOn`. `devcontainer.builder = "native"` turns the
-fallback into an error, for users who want a guarantee that no config silently reintroduces
-Node.
+Falls back to the CLI, naming the construct: `dockerComposeFile`, and Features referenced by
+local path or tarball URL — including one reached through another Feature's `dependsOn`.
+`devcontainer.builder = "native"` turns the fallback into an error, for users who want a
+guarantee that no config silently reintroduces Node.
 
 ## `dependsOn`, and the ordering bug it uncovered
 
@@ -540,6 +540,26 @@ same digest with the same options are one install; the same id with different op
 `am` keys identity on the layer digest, which is what makes a diamond collapse and a
 `dependsOn` cycle terminate during resolution rather than during sorting.
 
+## `overrideFeatureInstallOrder` is a priority, not an order
+
+It reads like a list of Features to install in that sequence. It is not. Each entry raises the
+named Feature's `roundPriority` to `n - idx`, and a round commits only its highest-priority
+members, returning the rest to the worklist. Two consequences, both verified against the CLI:
+
+- **It cannot jump a dependency.** Eligibility is decided first and priority only breaks ties
+  among Features already ready to install. Raising `git` above `common-utils` does not move
+  `git` first; `git` still waits, and the override only decides that it beats its round-mates.
+- **It splits rounds.** Raising a Feature that shares a round with others takes that round
+  alone and sends the rest back to compete again. A "sort the round by priority" shortcut
+  produces the same answer in easy cases and the wrong one here, which is why
+  `override-order-devcontainer.json` raises `common-utils` specifically.
+
+Entries match either the fully qualified name without its tag or the Feature's short alias
+(`git`); the CLI accepts both. One deliberate divergence: an entry that matches nothing being
+installed is ignored, where the CLI resolves every entry and errors if it cannot fetch it. Such
+an entry cannot change any ordering, so the label is identical either way — and the label is
+the contract.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The ordering algorithm and the graph resolver are
@@ -547,10 +567,10 @@ same digest with the same options are one install; the same id with different op
   in the common registries declares `dependsOn` (15 popular ones were checked, none did), so
   the recursive-fetch path is never exercised against the reference implementation. Closing
   this needs a Feature published for the purpose.
-- **`overrideFeatureInstallOrder` is now cheap.** It is the spec's `roundPriority`: commit only
-  the maximum-priority nodes of each round and return the rest to the worklist. The round
-  machinery it needs is in place, so this is a small change rather than the structural one it
-  used to be.
+- **A typo'd `overrideFeatureInstallOrder` entry is silently ignored** rather than being the
+  error the CLI raises. Harmless for the label, but it does mean a misspelled entry quietly
+  does nothing. Closing it means resolving every entry against the registry — a network round
+  trip spent purely on validation.
 - **Registry auth is anonymous only.** Private Feature registries need `docker config.json`
   credentials and credential helpers; today they fall back to the CLI only if the ref happens
   to be non-registry, otherwise they fail with the registry's own 401 text.

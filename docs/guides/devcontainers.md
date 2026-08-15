@@ -15,7 +15,6 @@ Some configs still need the reference CLI, and `am` falls back to it automatical
 sees one:
 
 - `dockerComposeFile`
-- `overrideFeatureInstallOrder`
 - a Feature referenced by local path (`./my-feature`) or by tarball URL — including one
   reached through another Feature's `dependsOn`
 

@@ -29,7 +29,6 @@ use crate::error::AmError;
 pub enum Unsupported {
     Compose,
     NoBase,
-    OverrideInstallOrder,
     LocalFeature(String),
     TarballFeature(String),
 }
@@ -40,9 +39,6 @@ impl std::fmt::Display for Unsupported {
             Unsupported::Compose => write!(f, "the config uses dockerComposeFile"),
             Unsupported::NoBase => {
                 write!(f, "the config has neither an 'image' nor a 'build.dockerfile'")
-            }
-            Unsupported::OverrideInstallOrder => {
-                write!(f, "the config sets overrideFeatureInstallOrder")
             }
             Unsupported::LocalFeature(id) => {
                 write!(f, "Feature '{id}' is a local path rather than a registry reference")
@@ -72,9 +68,6 @@ pub fn check_static(json: &DevcontainerJson, raw: &Value) -> Result<(), Unsuppor
     if json.image.is_none() && json.build.as_ref().and_then(|b| b.dockerfile.as_ref()).is_none() {
         return Err(Unsupported::NoBase);
     }
-    if raw.get("overrideFeatureInstallOrder").is_some() {
-        return Err(Unsupported::OverrideInstallOrder);
-    }
     for id in requested_ids(raw) {
         match oci::parse_ref(&id) {
             oci::FeatureSource::Registry(_) => {}
@@ -83,6 +76,17 @@ pub fn check_static(json: &DevcontainerJson, raw: &Value) -> Result<(), Unsuppor
         }
     }
     Ok(())
+}
+
+/// `overrideFeatureInstallOrder`, or empty. Non-string entries are dropped rather than rejected:
+/// the property is advisory, and a malformed entry cannot match a Feature anyway.
+fn override_install_order(raw: &Value) -> Vec<String> {
+    raw.get("overrideFeatureInstallOrder")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries.iter().filter_map(Value::as_str).map(str::to_string).collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The Feature ids a `devcontainer.json` asks for, in declaration order.
@@ -427,7 +431,10 @@ pub fn build(
         .iter()
         .map(|(f, layer)| (f.reference.raw.clone(), layer.clone()))
         .collect();
-    let ordered = feature::install_order(resolved.into_iter().map(|(f, _)| f).collect())?;
+    let ordered = feature::install_order(
+        resolved.into_iter().map(|(f, _)| f).collect(),
+        &override_install_order(raw_config),
+    )?;
 
     let base = resolve_base(req, runtime_bin)?;
     let base_elements = base_label_elements(runtime_bin, &base)?;
@@ -586,11 +593,18 @@ mod tests {
     }
 
     #[test]
-    fn override_install_order_falls_back() {
+    fn override_install_order_is_supported() {
         let (typed, raw) = json(
             r#"{"image":"debian","overrideFeatureInstallOrder":["ghcr.io/devcontainers/features/git"]}"#,
         );
-        assert_eq!(check_static(&typed, &raw), Err(Unsupported::OverrideInstallOrder));
+        assert_eq!(check_static(&typed, &raw), Ok(()));
+        assert_eq!(override_install_order(&raw), vec!["ghcr.io/devcontainers/features/git"]);
+    }
+
+    #[test]
+    fn a_config_without_an_override_list_yields_no_priorities() {
+        let (_, raw) = json(r#"{"image":"debian"}"#);
+        assert!(override_install_order(&raw).is_empty());
     }
 
     #[test]
@@ -752,10 +766,26 @@ mod tests {
     #[test]
     #[ignore = "needs the reference CLI and network access"]
     fn install_order_matches_the_reference_cli_resolver() {
-        let config_text = include_str!(
+        assert_order_matches_reference(include_str!(
             "../../../tests/fixtures/devcontainer/native/two-chains-devcontainer.json"
-        );
+        ));
+    }
 
+    /// The same four Features with an `overrideFeatureInstallOrder` that raises one of them.
+    ///
+    /// Worth its own case because the override does two separable things: it reorders Features
+    /// inside a round, and it *splits* a round — deferring lower-priority Features that were
+    /// otherwise ready. This fixture raises `common-utils`, which is the splitting case.
+    #[test]
+    #[ignore = "needs the reference CLI and network access"]
+    fn override_install_order_matches_the_reference_cli_resolver() {
+        assert_order_matches_reference(include_str!(
+            "../../../tests/fixtures/devcontainer/native/override-order-devcontainer.json"
+        ));
+    }
+
+    /// Resolve `config_text` both ways and assert the install orders agree.
+    fn assert_order_matches_reference(config_text: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".devcontainer");
         std::fs::create_dir_all(&dir).unwrap();
@@ -782,8 +812,11 @@ mod tests {
 
         let raw: Value = serde_json_lenient::from_str(config_text).unwrap();
         let resolved = resolve_graph(collect_features(&raw, &[])).unwrap().unwrap();
-        let ordered =
-            feature::install_order(resolved.into_iter().map(|(f, _)| f).collect()).unwrap();
+        let ordered = feature::install_order(
+            resolved.into_iter().map(|(f, _)| f).collect(),
+            &override_install_order(&raw),
+        )
+        .unwrap();
         let actual: Vec<String> = ordered.iter().map(|f| f.reference.untagged()).collect();
 
         assert_eq!(actual, expected, "install order diverged from the reference CLI");

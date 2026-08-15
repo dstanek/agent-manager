@@ -72,6 +72,7 @@ our reading of the spec.
 | `cli-Dockerfile.buildContent` | Its throwaway `FROM scratch` content image |
 | `cli-builtin.env`, `cli-git_0-features.env`, `cli-git_0-install-wrapper.sh` | The Feature install contract: the env files and the generated wrapper that sources them |
 | `two-chains-devcontainer.json` | Input: four Features forming *two independent* `installsAfter` chains — the shape that tells the round-based install order apart from a one-at-a-time one |
+| `override-order-devcontainer.json` | The same four, with an `overrideFeatureInstallOrder` raising `common-utils` — chosen because it makes the override *split* a round rather than merely reorder one |
 
 ### What these catch
 
