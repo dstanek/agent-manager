@@ -270,8 +270,9 @@ falls back to the reference CLI — which requires `npm install -g @devcontainer
 Node 20+ — only for constructs it does not implement:
 
 - `dockerComposeFile`
-- `overrideFeatureInstallOrder`, and Features using `dependsOn`
-- Features referenced by local path (`./my-feature`) or direct tarball URL
+- `overrideFeatureInstallOrder`
+- Features referenced by local path (`./my-feature`) or direct tarball URL, including one a
+  Feature pulls in through its own `dependsOn`
 
 When it falls back, `am` prints the reason. Set `builder = "native"` to turn those cases into
 errors instead, so no config can silently reintroduce the Node dependency.

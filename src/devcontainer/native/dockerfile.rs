@@ -240,6 +240,9 @@ mod tests {
             metadata,
             raw,
             options,
+            supplied: BTreeMap::new(),
+            digest: "sha256:test".to_string(),
+            hard_deps: Vec::new(),
         }
     }
 

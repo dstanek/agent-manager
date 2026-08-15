@@ -15,8 +15,9 @@ Some configs still need the reference CLI, and `am` falls back to it automatical
 sees one:
 
 - `dockerComposeFile`
-- `overrideFeatureInstallOrder`, or a Feature that uses `dependsOn`
-- a Feature referenced by local path (`./my-feature`) or by tarball URL
+- `overrideFeatureInstallOrder`
+- a Feature referenced by local path (`./my-feature`) or by tarball URL — including one
+  reached through another Feature's `dependsOn`
 
 If you hit one, `am` tells you which construct caused it, and the CLI needs Node 20+:
 

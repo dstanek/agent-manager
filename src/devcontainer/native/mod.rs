@@ -29,7 +29,6 @@ use crate::error::AmError;
 pub enum Unsupported {
     Compose,
     NoBase,
-    DependsOn(String),
     OverrideInstallOrder,
     LocalFeature(String),
     TarballFeature(String),
@@ -41,9 +40,6 @@ impl std::fmt::Display for Unsupported {
             Unsupported::Compose => write!(f, "the config uses dockerComposeFile"),
             Unsupported::NoBase => {
                 write!(f, "the config has neither an 'image' nor a 'build.dockerfile'")
-            }
-            Unsupported::DependsOn(id) => {
-                write!(f, "Feature '{id}' uses dependsOn, which needs round-trip resolution")
             }
             Unsupported::OverrideInstallOrder => {
                 write!(f, "the config sets overrideFeatureInstallOrder")
@@ -127,6 +123,117 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
         push(&f.id, as_option_map(&parsed), &mut seen);
     }
     out
+}
+
+/// Resolve every Feature that will be installed: the requested set, plus everything their
+/// `dependsOn` pulls in, transitively.
+///
+/// Manifests come first and layers are downloaded later, which is what makes the round trip
+/// cheap: a manifest carries the whole `devcontainer-feature.json` in an annotation, so walking
+/// the dependency graph costs one small GET per node and downloads nothing.
+///
+/// Two Features are the same node when their contents and options match, so a diamond — two
+/// Features depending on the same third — installs it once, and a `dependsOn` cycle terminates
+/// instead of looping. The same Feature requested with *different* options is genuinely two
+/// nodes, and the spec says to install both.
+fn resolve_graph(
+    requested: Vec<RequestedFeature>,
+) -> Result<Result<Vec<(feature::ResolvedFeature, oci::Layer)>, Unsupported>> {
+    let mut worklist: std::collections::VecDeque<RequestedFeature> = requested.into();
+    let mut nodes: Vec<(feature::ResolvedFeature, oci::Layer)> = Vec::new();
+    // What a caller asked for → the node it got. A parent links to its dependencies through
+    // this, so linking never needs to re-derive a digest it already fetched.
+    let mut by_request: BTreeMap<String, usize> = BTreeMap::new();
+    // Contents + options → node, the spec's Feature-equality rule.
+    let mut by_identity: BTreeMap<String, usize> = BTreeMap::new();
+    // Deferred because a dependency may still be in the worklist when its parent is resolved.
+    let mut pending_links: Vec<(usize, Vec<String>)> = Vec::new();
+
+    while let Some(item) = worklist.pop_front() {
+        let request = feature::request_key(&item.reference.raw, &item.options);
+        if by_request.contains_key(&request) {
+            continue;
+        }
+
+        let manifest = oci::fetch_manifest(&item.reference)?;
+        let metadata_text = manifest.feature_metadata().ok_or_else(|| {
+            AmError::DevcontainerBuildFailed(format!(
+                "{} is not a devcontainer Feature (its manifest carries no metadata)",
+                item.reference.raw
+            ))
+        })?;
+        let (metadata, raw) = feature::parse_metadata(metadata_text)?;
+        let layer = manifest
+            .feature_layer()
+            .ok_or_else(|| {
+                AmError::DevcontainerBuildFailed(format!(
+                    "{} has no layer to install",
+                    item.reference.raw
+                ))
+            })?
+            .clone();
+
+        let identity = feature::request_key(&layer.digest, &item.options);
+        if let Some(&existing) = by_identity.get(&identity) {
+            // A different id for contents already staged — a moving tag and its pinned version,
+            // say. One install, and both requests point at it.
+            by_request.insert(request, existing);
+            continue;
+        }
+
+        let mut deps = Vec::new();
+        for (id, options) in depends_on_entries(&metadata) {
+            match oci::parse_ref(&id) {
+                oci::FeatureSource::Registry(reference) => {
+                    deps.push(feature::request_key(&id, &options));
+                    worklist.push_back(RequestedFeature { reference, options });
+                }
+                // A dependency can drag in a construct the config itself never named, so these
+                // are reachable even though check_static passed.
+                oci::FeatureSource::Local(id) => return Ok(Err(Unsupported::LocalFeature(id))),
+                oci::FeatureSource::Tarball(id) => return Ok(Err(Unsupported::TarballFeature(id))),
+            }
+        }
+
+        let index = nodes.len();
+        by_request.insert(request, index);
+        by_identity.insert(identity, index);
+        if !deps.is_empty() {
+            pending_links.push((index, deps));
+        }
+        nodes.push((
+            feature::ResolvedFeature {
+                reference: item.reference.clone(),
+                options: feature::resolve_options(&metadata, &item.options),
+                metadata,
+                raw,
+                supplied: item.options,
+                digest: layer.digest.clone(),
+                hard_deps: Vec::new(),
+            },
+            layer,
+        ));
+    }
+
+    for (index, deps) in pending_links {
+        let keys = deps
+            .iter()
+            .filter_map(|request| by_request.get(request))
+            .map(|&i| nodes[i].0.key())
+            .collect();
+        nodes[index].0.hard_deps = keys;
+    }
+    Ok(Ok(nodes))
+}
+
+/// The `dependsOn` map as (id, options) pairs. Absent, null, or non-object all mean none.
+fn depends_on_entries(metadata: &feature::FeatureMetadata) -> Vec<(String, BTreeMap<String, Value>)> {
+    metadata
+        .depends_on
+        .as_ref()
+        .and_then(Value::as_object)
+        .map(|map| map.iter().map(|(id, o)| (id.clone(), as_option_map(o))).collect())
+        .unwrap_or_default()
 }
 
 /// Feature options are an object, but `{}` and a bare `"latest"` shorthand both appear.
@@ -309,42 +416,10 @@ pub fn build(
     }
 
     let requested = collect_features(raw_config, req.injected);
-
-    // Manifests first: they carry each Feature's metadata, so ordering and options resolve
-    // before any layer is downloaded — and a dependsOn fallback costs three small GETs.
-    let mut resolved = Vec::with_capacity(requested.len());
-    for item in &requested {
-        let manifest = oci::fetch_manifest(&item.reference)?;
-        let metadata_text = manifest.feature_metadata().ok_or_else(|| {
-            AmError::DevcontainerBuildFailed(format!(
-                "{} is not a devcontainer Feature (its manifest carries no metadata)",
-                item.reference.raw
-            ))
-        })?;
-        let (metadata, raw) = feature::parse_metadata(metadata_text)?;
-        if metadata.depends_on.is_some() {
-            return Ok(Err(Unsupported::DependsOn(item.reference.raw.clone())));
-        }
-        let options = feature::resolve_options(&metadata, &item.options);
-        let layer = manifest
-            .feature_layer()
-            .ok_or_else(|| {
-                AmError::DevcontainerBuildFailed(format!(
-                    "{} has no layer to install",
-                    item.reference.raw
-                ))
-            })?
-            .clone();
-        resolved.push((
-            feature::ResolvedFeature {
-                reference: item.reference.clone(),
-                metadata,
-                raw,
-                options,
-            },
-            layer,
-        ));
-    }
+    let resolved = match resolve_graph(requested)? {
+        Ok(nodes) => nodes,
+        Err(reason) => return Ok(Err(reason)),
+    };
 
     // Ordering moves the Features around, so the layer to download is looked up by id
     // afterwards rather than carried along positionally.
@@ -540,9 +615,9 @@ mod tests {
     #[test]
     fn fallback_reasons_name_the_offending_construct() {
         // These strings are printed to the user, so they must identify what to look at.
-        assert!(Unsupported::DependsOn("ghcr.io/x/y:1".into())
+        assert!(Unsupported::LocalFeature("./vendored/thing".into())
             .to_string()
-            .contains("ghcr.io/x/y:1"));
+            .contains("./vendored/thing"));
         assert!(Unsupported::Compose.to_string().contains("dockerComposeFile"));
     }
 
@@ -660,6 +735,58 @@ mod tests {
             "am-dc-native-difftest-features",
             None,
         );
+    }
+
+    /// Differential check of the *resolver* against the reference CLI.
+    ///
+    /// Much cheaper than the two above — `devcontainer features resolve-dependencies` walks the
+    /// graph and prints the install order without building anything, so this costs a handful of
+    /// manifest GETs rather than minutes of image build. It is also the sharper test of
+    /// ordering: the label pins the order too, but only for the Features a build fixture
+    /// happens to contain.
+    ///
+    /// The config is deliberately two *independent* `installsAfter` chains, which is what
+    /// separates the spec's round-based algorithm from committing one eligible Feature at a
+    /// time. Ordering is compared by resource name, since the CLI reports manifest digests here
+    /// while `am` carries layer digests.
+    #[test]
+    #[ignore = "needs the reference CLI and network access"]
+    fn install_order_matches_the_reference_cli_resolver() {
+        let config_text = include_str!(
+            "../../../tests/fixtures/devcontainer/native/two-chains-devcontainer.json"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devcontainer.json"), config_text).unwrap();
+
+        let cli = std::env::var("AM_DEVCONTAINER_BIN").unwrap_or_else(|_| "devcontainer".into());
+        let out = std::process::Command::new(&cli)
+            .args(["features", "resolve-dependencies", "--workspace-folder"])
+            .arg(tmp.path())
+            .output()
+            .expect("running the reference CLI");
+        assert!(out.status.success(), "CLI failed: {}", String::from_utf8_lossy(&out.stderr));
+
+        // A mermaid flowchart precedes the JSON on stdout.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let json_start = stdout.find('{').expect("no JSON in CLI output");
+        let reported: Value = serde_json::from_str(&stdout[json_start..]).unwrap();
+        let expected: Vec<String> = reported["installOrder"]
+            .as_array()
+            .expect("installOrder")
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().split('@').next().unwrap().to_string())
+            .collect();
+
+        let raw: Value = serde_json_lenient::from_str(config_text).unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[])).unwrap().unwrap();
+        let ordered =
+            feature::install_order(resolved.into_iter().map(|(f, _)| f).collect()).unwrap();
+        let actual: Vec<String> = ordered.iter().map(|f| f.reference.untagged()).collect();
+
+        assert_eq!(actual, expected, "install order diverged from the reference CLI");
     }
 
     /// Build `config_text` with `am`'s own builder and assert the resulting metadata label is
