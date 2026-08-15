@@ -210,6 +210,48 @@ pub struct MetadataSnippet {
     pub post_create_command: Option<LifecycleCommand>,
     pub post_start_command: Option<LifecycleCommand>,
     pub post_attach_command: Option<LifecycleCommand>,
+    /// Ports the config asked to be reachable. Kept as raw values because the entries are a
+    /// union of numbers and `"<service>:<port>"` strings; [`ForwardedPort::parse`] sorts them out.
+    #[serde(default)]
+    pub forward_ports: Vec<serde_json::Value>,
+}
+
+/// A port a devcontainer asked to be reachable from the machine running `am`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardedPort {
+    /// A port on the container the agent runs in.
+    Own(u16),
+    /// `"<service>:<port>"` — a port on another compose service. Meaningless outside a compose
+    /// project, where there is only one container to publish from.
+    Service { service: String, port: u16 },
+}
+
+impl ForwardedPort {
+    /// Read one `forwardPorts` entry. Anything unparseable yields `None` rather than an error:
+    /// the property is a convenience, and refusing to start a session over a malformed port
+    /// would be a worse outcome than not publishing it.
+    pub fn parse(value: &serde_json::Value) -> Option<Self> {
+        match value {
+            serde_json::Value::Number(n) => n.as_u64()?.try_into().ok().map(ForwardedPort::Own),
+            serde_json::Value::String(s) => match s.rsplit_once(':') {
+                Some((service, port)) if !service.is_empty() => Some(ForwardedPort::Service {
+                    service: service.to_string(),
+                    port: port.parse().ok()?,
+                }),
+                _ => s.parse().ok().map(ForwardedPort::Own),
+            },
+            _ => None,
+        }
+    }
+
+    /// The compose/`-p` publish spec for this port.
+    ///
+    /// Bound to loopback, which is both what the reference CLI does for a bare `appPort` and the
+    /// conservative reading of "forward this to me": a session container is not something to put
+    /// on the network by default.
+    pub fn publish_spec(port: u16) -> String {
+        format!("127.0.0.1:{port}:{port}")
+    }
 }
 
 /// The label is an array of snippets, but the schema also permits a bare object.
@@ -466,6 +508,8 @@ pub struct ResolvedConfig {
     pub post_create: Vec<Command>,
     pub post_start: Vec<Command>,
     pub post_attach: Vec<Command>,
+    /// Ports to publish, in contribution order and de-duplicated.
+    pub forward_ports: Vec<ForwardedPort>,
     /// From `devcontainer.json` only — the label drops these.
     pub run_args: Vec<String>,
     pub workspace_folder: Option<String>,
@@ -532,6 +576,15 @@ pub fn merge(snippets: &[MetadataSnippet]) -> Result<ResolvedConfig> {
         collect(&mut out.post_create, &snippet.post_create_command);
         collect(&mut out.post_start, &snippet.post_start_command);
         collect(&mut out.post_attach, &snippet.post_attach_command);
+        // A union rather than last-writer-wins: forwardPorts is a list of things that should be
+        // reachable, so a later snippet asking for one more must not drop the earlier ones.
+        for value in &snippet.forward_ports {
+            if let Some(port) = ForwardedPort::parse(value) {
+                if !out.forward_ports.contains(&port) {
+                    out.forward_ports.push(port);
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -1088,6 +1141,7 @@ pub fn apply_trust(
         run_args: Vec::new(),
         workdir: resolved.workspace_folder.clone(),
         entrypoints: resolved.entrypoints.clone(),
+        ports: resolved.forward_ports.clone(),
         user: resolved
             .remote_user
             .clone()
@@ -1911,6 +1965,48 @@ echo '{{"outcome":"success","imageName":"am-dc-abc123"}}'"#,
     }
 
     // ── Unsupported constructs ────────────────────────────────────────────────
+
+    #[test]
+    fn forward_ports_accepts_every_form_the_spec_allows() {
+        use serde_json::json;
+        assert_eq!(ForwardedPort::parse(&json!(3000)), Some(ForwardedPort::Own(3000)));
+        assert_eq!(ForwardedPort::parse(&json!("3000")), Some(ForwardedPort::Own(3000)));
+        assert_eq!(
+            ForwardedPort::parse(&json!("db:5432")),
+            Some(ForwardedPort::Service { service: "db".into(), port: 5432 })
+        );
+        // Not a port at all. Skipped rather than fatal: publishing is a convenience, and
+        // refusing to start a session over a malformed entry would be the worse outcome.
+        assert_eq!(ForwardedPort::parse(&json!("not-a-port")), None);
+        assert_eq!(ForwardedPort::parse(&json!(99999)), None, "outside the u16 range");
+        assert_eq!(ForwardedPort::parse(&json!(true)), None);
+    }
+
+    #[test]
+    fn forwarded_ports_publish_on_loopback() {
+        // Not 0.0.0.0: a session container is not something to put on the network by default,
+        // and this is what the reference CLI does for a bare appPort.
+        assert_eq!(ForwardedPort::publish_spec(3000), "127.0.0.1:3000:3000");
+    }
+
+    #[test]
+    fn forward_ports_merge_as_a_union_across_snippets() {
+        // Two contributors each asking for a port must not cancel each other out, and a port
+        // asked for twice is published once.
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"forwardPorts":[3000,"db:5432"]},{"forwardPorts":[3000,8080]}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+        assert_eq!(
+            merged.forward_ports,
+            vec![
+                ForwardedPort::Own(3000),
+                ForwardedPort::Service { service: "db".into(), port: 5432 },
+                ForwardedPort::Own(8080),
+            ]
+        );
+    }
 
     #[test]
     fn a_compose_config_naming_its_service_is_supported() {

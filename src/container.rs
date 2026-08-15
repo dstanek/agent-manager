@@ -150,6 +150,8 @@ pub struct DevcontainerRuntime {
     pub workdir: Option<String>,
     /// Feature entrypoint scripts, composed ahead of the agent command.
     pub entrypoints: Vec<String>,
+    /// Ports to publish on the host, from `forwardPorts`.
+    pub ports: Vec<crate::devcontainer::ForwardedPort>,
     /// The user to run as, from `remoteUser`/`containerUser`.
     ///
     /// Without this the container runs as the image's default user — root for most
@@ -869,6 +871,20 @@ pub fn build_run_command(
         cmd.push(opt.clone());
     }
 
+    // forwardPorts. The reference CLI leaves these to an editor and publishes nothing; am has
+    // no editor, so publishing is the only way the key means anything here. Loopback-bound,
+    // which is the conservative reading of "forward this to me" and matches what the CLI does
+    // for a bare `appPort`.
+    //
+    // A `"<service>:<port>"` entry names another compose service, so it has no meaning for a
+    // single container and is skipped rather than guessed at.
+    for port in &dc.ports {
+        if let crate::devcontainer::ForwardedPort::Own(p) = port {
+            cmd.push("-p".to_string());
+            cmd.push(crate::devcontainer::ForwardedPort::publish_spec(*p));
+        }
+    }
+
     // Network. Applied after runArgs would be, so am's own setting stays authoritative
     // over a config that tries to widen it.
     cmd.extend(dc.run_args.iter().cloned());
@@ -1244,6 +1260,33 @@ mod tests {
         assert_eq!(mounts.colocated_git_host, None);
 
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn build_run_command_publishes_forwarded_ports_on_loopback() {
+        use crate::devcontainer::ForwardedPort;
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            ports: vec![
+                ForwardedPort::Own(3000),
+                // Names another compose service, so it has no meaning for a single container.
+                ForwardedPort::Service { service: "db".into(), port: 5432 },
+            ],
+            ..DevcontainerRuntime::default()
+        };
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        let joined = cmd.join(" ");
+        assert!(joined.contains("-p 127.0.0.1:3000:3000"), "got: {joined}");
+        assert!(!joined.contains("5432"), "a service port cannot be published here: {joined}");
     }
 
     #[test]

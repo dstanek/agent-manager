@@ -18,34 +18,56 @@ use serde_json::Value;
 use super::oci::FeatureRef;
 use crate::error::AmError;
 
-/// The properties that survive from a Feature or a `devcontainer.json` into the
-/// `devcontainer.metadata` image label.
+/// The properties that survive into the `devcontainer.metadata` image label, per source.
 ///
-/// Taken from the devcontainer image-metadata schema. Anything absent here is a build-time or
-/// editor-only concern (`options`, `installsAfter`, `image`, `features`, `name`, …) and is
-/// dropped — which is exactly what the reference CLI does, and what the captured fixture
-/// `cli-git-label.json` pins.
-const METADATA_KEYS: &[&str] = &[
+/// Anything absent from both lists is a build-time or editor-only concern (`options`,
+/// `installsAfter`, `image`, `features`, `name`, …) and is dropped — which is what the reference
+/// CLI does, and what the captured fixtures pin.
+///
+/// What a **Feature** contributes, in the order the reference CLI emits it.
+///
+/// Narrower than a config's: a Feature declaring `containerEnv`, `forwardPorts` or
+/// `hostRequirements` has those dropped, which is the CLI's behaviour and not an omission here.
+const FEATURE_METADATA_KEYS: &[&str] = &[
     "init",
     "privileged",
     "capAdd",
     "securityOpt",
     "entrypoint",
     "mounts",
-    "containerEnv",
-    "remoteEnv",
-    "containerUser",
-    "remoteUser",
-    "updateRemoteUserUID",
-    "userEnvProbe",
-    "overrideCommand",
-    "waitFor",
+    "customizations",
+];
+
+/// What a **`devcontainer.json`** contributes, in the order the reference CLI emits it.
+///
+/// A different list *and a different order* from the Feature one — the two were conflated here
+/// originally, which is a divergence any config setting both `customizations` and one of
+/// `init`/`mounts`/`containerEnv` would have hit: the CLI emits `customizations` seventh, while
+/// the Feature order puts it last. `entrypoint` is absent because `devcontainer.json` has no
+/// such property; only Features contribute entrypoints.
+const CONFIG_METADATA_KEYS: &[&str] = &[
     "onCreateCommand",
     "updateContentCommand",
     "postCreateCommand",
     "postStartCommand",
     "postAttachCommand",
+    "waitFor",
     "customizations",
+    "mounts",
+    "containerEnv",
+    "containerUser",
+    "init",
+    "privileged",
+    "capAdd",
+    "securityOpt",
+    "remoteUser",
+    "userEnvProbe",
+    "remoteEnv",
+    "overrideCommand",
+    "portsAttributes",
+    "otherPortsAttributes",
+    "forwardPorts",
+    "updateRemoteUserUID",
     "hostRequirements",
 ];
 
@@ -157,7 +179,7 @@ impl ResolvedFeature {
         // `id` leads, then the Feature's own properties in the order it declared them —
         // which is what the reference CLI emits, and what makes the label byte-comparable.
         out.insert("id".to_string(), Value::String(self.reference.raw.clone()));
-        out.extend(metadata_properties(&self.raw));
+        out.extend(metadata_properties(&self.raw, FEATURE_METADATA_KEYS));
         Value::Object(out)
     }
 }
@@ -175,20 +197,26 @@ pub fn parse_metadata(text: &str) -> Result<(FeatureMetadata, Value)> {
 ///
 /// This is the final element of the label, so it carries the highest precedence in the merge.
 pub fn config_label_snippet(raw: &Value) -> Value {
-    Value::Object(metadata_properties(raw).collect())
+    Value::Object(metadata_properties(raw, CONFIG_METADATA_KEYS).collect())
 }
 
 /// The image-metadata properties of an object, in **schema** order.
 ///
-/// Walking [`METADATA_KEYS`] rather than the source object's own key order is what matches the
+/// Walking a fixed key list rather than the source object's own key order is what matches the
 /// reference CLI: it emits properties in the order its metadata type declares them, not the
 /// order the author wrote them. A `devcontainer.json` saying `remoteUser` before `containerEnv`
 /// still produces `containerEnv` first — which the differential test pins.
 ///
+/// Which list depends on where the object came from; see [`FEATURE_METADATA_KEYS`] and
+/// [`CONFIG_METADATA_KEYS`], which differ in both membership and order.
+///
 /// This ordering only exists to keep the label byte-comparable. Nothing downstream depends on
 /// it: [`crate::devcontainer::merge`] reads properties by name.
-fn metadata_properties(raw: &Value) -> impl Iterator<Item = (String, Value)> + '_ {
-    METADATA_KEYS.iter().filter_map(move |key| {
+fn metadata_properties<'a>(
+    raw: &'a Value,
+    keys: &'a [&'a str],
+) -> impl Iterator<Item = (String, Value)> + 'a {
+    keys.iter().filter_map(move |key| {
         raw.get(*key).map(|value| ((*key).to_string(), value.clone()))
     })
 }
@@ -491,6 +519,48 @@ mod tests {
         for dropped in ["options", "installsAfter", "version", "name", "description"] {
             assert!(!obj.contains_key(dropped), "{dropped} should not reach the label");
         }
+    }
+
+    #[test]
+    fn a_config_emits_metadata_in_the_config_schema_order() {
+        // Pinned against a real `devcontainer build`. The order is *not* the Feature order —
+        // the CLI puts `customizations` seventh for a config and last for a Feature — and the
+        // two were the same list here originally, so any config setting `customizations`
+        // alongside `init` or `mounts` produced a label the CLI would not have written.
+        let raw: Value = serde_json_lenient::from_str(
+            r#"{"init":true,"customizations":{"vscode":{}},"forwardPorts":[3000],
+                "mounts":[],"remoteUser":"root","postCreateCommand":"echo hi"}"#,
+        )
+        .unwrap();
+        let snippet = config_label_snippet(&raw);
+        let keys: Vec<&String> = snippet.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "postCreateCommand",
+                "customizations",
+                "mounts",
+                "init",
+                "remoteUser",
+                "forwardPorts"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_feature_emits_metadata_in_the_feature_schema_order() {
+        // Narrower than a config's, and a different order. `containerEnv` and `forwardPorts`
+        // are dropped from a Feature entirely — verified against the reference CLI, which does
+        // the same.
+        let raw: Value = serde_json_lenient::from_str(
+            r#"{"customizations":{"vscode":{}},"mounts":[],"entrypoint":"/e.sh",
+                "capAdd":["SYS_PTRACE"],"init":true,"containerEnv":{"A":"1"},
+                "forwardPorts":[3000]}"#,
+        )
+        .unwrap();
+        let keys: Vec<String> =
+            metadata_properties(&raw, FEATURE_METADATA_KEYS).map(|(k, _)| k).collect();
+        assert_eq!(keys, ["init", "capAdd", "entrypoint", "mounts", "customizations"]);
     }
 
     #[test]

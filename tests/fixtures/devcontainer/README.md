@@ -72,6 +72,8 @@ our reading of the spec.
 | `cli-Dockerfile.buildContent` | Its throwaway `FROM scratch` content image |
 | `cli-builtin.env`, `cli-git_0-features.env`, `cli-git_0-install-wrapper.sh` | The Feature install contract: the env files and the generated wrapper that sources them |
 | `two-chains-devcontainer.json` | Input: four Features forming *two independent* `installsAfter` chains — the shape that tells the round-based install order apart from a one-at-a-time one |
+| `ports-devcontainer.json` | Input: seven config-level metadata properties at once, including `forwardPorts` and `portsAttributes` |
+| `cli-ports-label.json` | Its label — the authority on the **config** metadata order, which differs from the Feature one |
 | `override-order-devcontainer.json` | The same four, with an `overrideFeatureInstallOrder` raising `common-utils` — chosen because it makes the override *split* a round rather than merely reorder one |
 
 ### What these catch
@@ -82,8 +84,9 @@ our reading of the spec.
   They need Docker and network access to ghcr.io, which is why they are not in `cargo test`.
 - **Key order is part of the comparison.** The CLI emits metadata properties in *schema* order,
   not the order the config declares them — a `devcontainer.json` writing `remoteUser` before
-  `containerEnv` still yields `containerEnv` first. `METADATA_KEYS` in `native/feature.rs`
-  encodes that order, and `cli-features-label.json` is what pins it.
+  `containerEnv` still yields `containerEnv` first. `FEATURE_METADATA_KEYS` and
+  `CONFIG_METADATA_KEYS` in `native/feature.rs` encode the two orders — they are genuinely
+  different lists — and `cli-ports-label.json` is what pins the config one.
 - **`two-chains-devcontainer.json`** is fed to `devcontainer features resolve-dependencies`,
   which prints the CLI's install order without building anything — so that differential test
   costs a few manifest GETs rather than minutes. Prefer it when the question is about ordering;
@@ -91,6 +94,11 @@ our reading of the spec.
   Features are chosen so the two orderings differ: one-at-a-time selection gives
   `gh-release, act, common-utils, git`, the spec's rounds give `gh-release, common-utils, act,
   git`.
+- **`cli-ports-label.json`** is what stops the two metadata key lists being merged back into
+  one. Features and configs use different schemas *in different orders* — a Feature emits
+  `customizations` last, a config emits it seventh — and the other label fixtures each exercise
+  too few keys to tell the two apart, so they agreed with the CLI by luck. This one exercises
+  seven properties at once and fails loudly.
 - **`cli-Dockerfile.extended`** documents the install contract `am` reproduces: where Features
   are copied, the `_CONTAINER_USER`/`_REMOTE_USER` env files, and the `getent` home probe.
   `am` deliberately generates a *simpler* Dockerfile (one stage, not three) — this fixture is

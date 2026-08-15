@@ -511,9 +511,10 @@ image, and the split is what made replacing the build half a contained change.
       Node. Correctness is pinned by `#[ignore]`d differential tests that build the same
       config both ways and compare the resulting label. Not its own crate yet — crates.io
       still has no devcontainer runtime — but the seam is there if extracting it is worth it.
-- [ ] **Phase 2.** `userEnvProbe` and `forwardPorts`. Vendoring the CLI bundle was the third
-      item here; the native builder removed the friction that was meant to relieve, so it is
-      only worth revisiting if the remaining fallbacks turn out to be common in practice.
+- [ ] **Phase 2.** `userEnvProbe`. `forwardPorts` is done (2026-08-15): each port is published
+      on `127.0.0.1`, which is a deliberate divergence — the reference CLI publishes nothing and
+      leaves forwarding to an editor, and `am` has none. Vendoring the CLI bundle was the third
+      item here; the native builder removed the friction that was meant to relieve.
 - [x] **Phase 3 — compose.** Done 2026-08-15. `dockerComposeFile` configs now bring their
       project up, run the agent in the named `service`, and go down on `am destroy`. The build
       half was nearly free — the service's image with Features baked in, same label; the run
@@ -584,9 +585,10 @@ Follow-ups the native builder left behind:
       agent into it — that needs a runtime, a tmux session and a live agent at once.
 - [ ] **`podman compose` is untested.** The code shells out to `<runtime> compose`, which
       podman 4+ provides, but the dev container has no podman to check it against.
-- [ ] **Compose lifecycle gaps.** `forwardPorts` is still unapplied, which bites harder here
-      (a compose project is exactly where published ports are expected), and a session whose
-      service exits leaves the project up until `am destroy`.
+- [ ] **A compose session whose service exits** leaves the project up until `am destroy`.
+- [ ] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
+      They describe a port to an editor; `am` has no equivalent behaviour to apply.
+- [ ] **A forwarded port that is already bound fails at session start**, not in preflight.
 - [ ] **Tarball Features are not differentially tested.** The CLI's resolver accepts one from
       a local TLS server but its build path will not fetch from one, so no reference label
       can be produced locally. Unpacking has unit tests and everything after the fetch is

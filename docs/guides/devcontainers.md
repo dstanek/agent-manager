@@ -116,6 +116,24 @@ To add one for an agent that gains a Feature later:
 devcontainer_feature = "ghcr.io/someone/gemini:1"
 ```
 
+## Ports
+
+`forwardPorts` publishes each port on `127.0.0.1`, so a server started inside the session is
+reachable at the same port on your machine.
+
+This is a deliberate difference from the reference CLI, which publishes nothing for
+`forwardPorts` and leaves the forwarding to an editor. `am` has no editor, so the alternative
+would be for the key to do nothing at all. Loopback rather than every interface, because a
+session container is not something to put on the network by default.
+
+In a compose project, a bare port is published on the agent's service and a
+`"<service>:<port>"` entry on the service it names — the one case where `am` writes an override
+for a service it does not run the agent in. Outside compose, `"<service>:<port>"` has nothing to
+refer to and is skipped.
+
+A port that is already taken on your machine will fail the session start, the same as any other
+publish conflict.
+
 ## Trust
 
 A `devcontainer.json` is code, it lives in the repo, and it arrives with a `git pull` — while
@@ -184,7 +202,7 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 | Construct | Status |
 |---|---|
 | `userEnvProbe` | Parsed, not applied — interactive panes get the login environment anyway |
-| `forwardPorts` | Parsed, not applied |
+| `portsAttributes` | Carried in the label, not acted on — it describes ports to an editor |
 | `postAttachCommand` | Not run (see above) |
 
 ## Troubleshooting
