@@ -1113,6 +1113,21 @@ pub fn startup_commands(resolved: &ResolvedConfig, skip: bool) -> (Vec<String>, 
     (snippets, ran)
 }
 
+/// `postAttachCommand`, as shell snippets.
+///
+/// Separate from [`startup_commands`] because it is the one hook that is not tied to creating or
+/// starting the container: the spec runs it every time a tool attaches. `am` therefore reaches it
+/// from two places — chained ahead of the agent when a session is started or its container
+/// recreated, and `exec`'d into an already-running container when `am attach` finds one. Keeping
+/// it out of the startup list is also what stops it being recorded in `lifecycle_done`, which
+/// tracks hooks that are meant to run once per container.
+pub fn attach_commands(resolved: &ResolvedConfig, skip: bool) -> Vec<String> {
+    if skip {
+        return Vec::new();
+    }
+    resolved.post_attach.iter().map(Command::to_shell).collect()
+}
+
 impl Command {
     /// Render as a snippet suitable for `sh -c`.
     pub fn to_shell(&self) -> String {
@@ -2203,12 +2218,45 @@ echo '{{"outcome":"success","imageName":"am-dc-abc123"}}'"#,
     }
 
     #[test]
-    fn post_attach_is_not_run() {
-        // `am attach` moves tmux focus; it never attaches to the container, so there is
-        // no attach event to hang this off.
+    fn post_attach_is_kept_out_of_the_startup_hooks() {
+        // Not because it never runs — it does, both chained after these and `exec`'d into an
+        // already-running container by `am attach`. It is separate because it is the one hook
+        // that is not once-per-container, so recording it in `lifecycle_done` alongside the
+        // create-time hooks would be a lie.
         let (snippets, names) = startup_commands(&with_hooks(), false);
         assert!(!snippets.iter().any(|s| s.contains("attach")));
         assert!(!names.iter().any(|n| n == "postAttachCommand"));
+    }
+
+    #[test]
+    fn attach_commands_are_the_post_attach_hook() {
+        assert_eq!(attach_commands(&with_hooks(), false), vec!["echo attach"]);
+    }
+
+    #[test]
+    fn skip_lifecycle_suppresses_the_attach_hook_too() {
+        assert!(attach_commands(&with_hooks(), true).is_empty());
+    }
+
+    #[test]
+    fn a_config_with_no_post_attach_has_nothing_to_run() {
+        // The common case, and the one that decides whether `am attach` execs into the
+        // container at all.
+        assert!(attach_commands(&ResolvedConfig::default(), false).is_empty());
+    }
+
+    #[test]
+    fn every_post_attach_contributor_runs_in_order() {
+        // Features and the config can each contribute one; the merge keeps them all.
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"postAttachCommand":"echo from-feature"},{"postAttachCommand":["echo","from-config"]}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+        assert_eq!(
+            attach_commands(&merged, false),
+            vec!["echo from-feature", "echo from-config"]
+        );
     }
 
     #[test]

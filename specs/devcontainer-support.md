@@ -669,6 +669,31 @@ The spec's default is `loginInteractiveShell`, so this applies to every devconta
 unless the config opts out — a behaviour change, and the point of the property. Image-mode
 sessions have no config to ask for a probe and are untouched.
 
+## postAttachCommand needs an exec, which is why it waited
+
+Every other lifecycle hook runs against a container `am` is in the middle of creating, so it can
+be chained into the command. `postAttachCommand` is the exception: the spec runs it every time a
+tool attaches, and `am attach` frequently attaches to a session that is already live, where the
+only thing it does is move tmux focus. There is no new container command to chain anything into.
+
+So the hook is reached two ways:
+
+- **Chained**, when a container is being created — `am start`, and the `am attach` paths that
+  recreate a gone container. Starting a session is also attaching to it.
+- **`exec`'d into the running container**, when `am attach` finds one already up.
+
+The hooks for the second route come from the **image's metadata label**, not from re-reading the
+`devcontainer.json`. The label describes the container that is actually running; a config edited
+since the session started describes one that does not exist yet. This is the same reason the run
+path reads everything else from the label.
+
+It stays out of `startup_commands` and therefore out of `lifecycle_done`, which tracks hooks
+meant to run once per container. This one is meant to run every time.
+
+The exec is best-effort and never fails the attach: it runs on the path whose entire job is
+switching to a window that already works. A config with no `postAttachCommand` execs nothing, so
+the common case costs no extra process at all.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -683,6 +708,9 @@ sessions have no config to ask for a probe and are untouched.
   plain and gzipped archives and everything after the fetch is shared with the other two
   sources, but the HTTP fetch itself, and the end-to-end comparison that backs everything else
   here, are untested for this case.
+- **`postAttachCommand` runs once per `am attach`, not once per human attach.** tmux has no
+  event for "the user looked at this window", so re-running `am attach` on a live session runs
+  the hook again. Idempotent hooks are unaffected; an appending one is not.
 - **The probe's variable list is line-based.** `/proc/self/environ` is read NUL-separated and
   converted to lines, so a value containing a literal newline is truncated at it. The reference
   CLI parses the NUL stream directly and does not have this limit.

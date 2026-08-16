@@ -186,6 +186,35 @@ Feature: Dev container sessions
     Then the command succeeds
     And the mock devcontainer CLI was called 0 times
 
+  # The case the old "postAttachCommand is never run" note was about: the session is live, so
+  # am only moves tmux focus — but attaching is still attaching, and the hook is due. It is the
+  # one lifecycle hook that cannot be chained into a container command, because there is no new
+  # container to chain it into.
+  Scenario: attaching to a live session runs postAttachCommand in the container
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config with a postAttachCommand
+    And a session "my-feature" has been started
+    And the agent pane reports "podman" as its current command
+    When I run "am attach my-feature"
+    Then the command succeeds
+    And the output contains "Attached to session"
+    And the mock podman log contains "exec"
+    And the mock podman log contains "echo attached"
+    # And starting the session ran it too, chained into the container command — starting is
+    # also attaching, so both routes to the hook are covered by this one scenario.
+    And the mock tmux log contains "echo attached"
+
+  # No hook means no reason to exec into anything, on a path whose whole job is switching to a
+  # window that already works.
+  Scenario: attaching to a live session with no postAttachCommand execs nothing
+    Given I am using am's own devcontainer builder with no fallback
+    And the repo has a devcontainer config
+    And a session "my-feature" has been started
+    And the agent pane reports "podman" as its current command
+    When I run "am attach my-feature"
+    Then the command succeeds
+    And the mock podman log does not contain "exec"
+
   Scenario: image mode ignores a devcontainer config entirely
     Given I am using a mock devcontainer CLI
     And the repo has a devcontainer config

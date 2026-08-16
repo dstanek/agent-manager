@@ -401,6 +401,20 @@ pub fn down(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
         .with_context(|| "stopping the compose project")
 }
 
+/// Run a shell snippet inside the agent's service, for `postAttachCommand`.
+pub fn exec_script(runtime_bin: &Path, compose: &SessionCompose, script: &str) -> Result<()> {
+    let mut args = compose_args(runtime_bin, &all_files(compose), &compose.project);
+    args.extend([
+        "exec".to_string(),
+        compose.service.clone(),
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+    ]);
+    run_built_command(command(&args), AmError::ContainerError)
+        .with_context(|| "running postAttachCommand in the compose service")
+}
+
 /// The command that runs the agent inside the service, for the tmux pane.
 pub fn exec_command(
     runtime_bin: &Path,

@@ -536,13 +536,13 @@ Prerequisites this surfaced, both now done and both a fix in their own right:
 
 Follow-ups phase 1 left behind:
 
-- [ ] `postAttachCommand` is never run — `am attach` moves tmux focus rather than attaching
-      to the container, so there is no attach event to hang it off. Needs a real
-      "exec into the running container" attach path.
-      ([Restore the Agent on `am attach`](#restore-the-agent-on-am-attach) makes `am attach`
-      recreate a container that is genuinely gone — rerunning its create-time lifecycle hooks
-      via the same `lifecycle_done` bookkeeping `am start` uses — but that is not the same as
-      attaching to one that is already running; this gap is still open.)
+- [x] `postAttachCommand`. Done 2026-08-16. Reached two ways, because it is the one hook that
+      is not tied to creating a container: chained into the command when one is being created
+      (`am start`, and the attach paths that recreate a gone container), and `exec`'d into the
+      running container when `am attach` finds a live session. The hooks for the second route
+      come from the image's metadata label rather than a re-read of the config, since the label
+      is what describes the container that is actually running. Best-effort: it never turns an
+      attach to a working window into a failure, and a config without the hook execs nothing.
 - [ ] Create-time lifecycle hooks re-run on every `am start` because containers are `--rm`.
       Correct given ephemeral containers, but a persistent-container mode would make the
       spec's once-per-container semantics achievable; `lifecycle_done` already records what
@@ -589,6 +589,8 @@ Follow-ups the native builder left behind:
 - [ ] **`podman compose` is untested.** The code shells out to `<runtime> compose`, which
       podman 4+ provides, but the dev container has no podman to check it against.
 - [ ] **A compose session whose service exits** leaves the project up until `am destroy`.
+- [ ] **`postAttachCommand` runs once per `am attach` invocation**, not once per human attach —
+      tmux has no "user looked at this window" event. Idempotent hooks are unaffected.
 - [ ] **The env probe truncates a variable whose value contains a newline.** It converts the
       NUL-separated `/proc/self/environ` to lines; the reference CLI parses the NUL stream.
 - [ ] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
