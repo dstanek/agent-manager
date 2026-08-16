@@ -611,6 +611,27 @@ fn check_devcontainer_mode(
         }
     };
 
+    // A compose config needs a Compose that `am` can drive, and `<runtime> compose` is not a
+    // given: podman only grew the subcommand in 4.7. Checking here turns "unknown shorthand
+    // flag: 'f'" during a session start into something to act on beforehand.
+    if json.docker_compose_file.is_some() {
+        match runtime.map(|r| crate::compose::provider(&r.bin)) {
+            Some(Ok(_)) => report.checks.push(Check::ok(
+                ENVIRONMENT,
+                "compose",
+                "a Docker Compose v2 is available".to_string(),
+            )),
+            Some(Err(e)) => report.checks.push(Check::fail(
+                ENVIRONMENT,
+                "compose",
+                first_line(&e.to_string()),
+                "install Docker Compose v2 (podman provides `podman compose` from 4.7)",
+            )),
+            // No runtime at all is already reported by the runtime check.
+            None => {}
+        }
+    }
+
     if let Err(e) = devcontainer::check_supported(&json) {
         report.checks.push(Check::fail(
             ENVIRONMENT,

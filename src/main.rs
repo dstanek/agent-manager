@@ -1272,7 +1272,7 @@ fn plan_compose(
         override_path,
     };
     compose::up(&runtime.bin, &project)?;
-    let cmd = compose::exec_command(&runtime.bin, &project, agent_cmd);
+    let cmd = compose::exec_command(&runtime.bin, &project, agent_cmd)?;
     Ok((cmd, project))
 }
 

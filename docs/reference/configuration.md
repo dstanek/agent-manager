@@ -318,6 +318,10 @@ service's image, brings the project up, runs the agent inside it, and takes the 
 `command: sleep infinity`. `container.network = "none"` is refused for compose sessions rather
 than silently ignored, since the services need the project network to reach each other.
 
+**Compose.** `am` drives `<runtime> compose` when the runtime has it (podman from 4.7),
+otherwise a standalone `docker-compose` binary — pointed at podman's socket when podman is the
+runtime. `podman-compose` is not supported: it has no `config` command.
+
 **Registry credentials.** `am` reads `docker`/`podman` auth files (`$REGISTRY_AUTH_FILE`,
 `$DOCKER_CONFIG/config.json`, `~/.docker/config.json`,
 `$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json`) and their credential

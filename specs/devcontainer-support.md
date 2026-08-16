@@ -794,6 +794,23 @@ Two details worth keeping:
 
 Nothing is logged. A credential in an error message is a credential in a terminal scrollback.
 
+## `<runtime> compose` is not a given
+
+Docker ships Compose as a plugin and podman grew the subcommand in **4.7**. podman 4.3 — what
+Debian 12 and Ubuntu 22.04 ship — has none, and answers `am`'s invocation with `unknown
+shorthand flag: 'f'`, which is a baffling way to say "your podman is too old".
+
+`am` resolves a provider instead of assuming one: `<runtime> compose` if it answers `version`,
+else a standalone `docker-compose`. That is the same binary `podman compose` delegates to
+internally, so the fallback is what a newer podman would have done anyway — including pointing it
+at podman's socket via `DOCKER_HOST`, which `am` fills in from `podman info` rather than guessing
+a path that varies between rootless, root, and machine setups.
+
+`podman-compose` is deliberately excluded. It is a separate implementation, and version 1.0.3 has
+no `config` subcommand at all — `config --format json` being exactly what lets `am` read a
+compose file without carrying a YAML parser. Selecting it would fail later and less clearly, so
+the error names it and says it will not do.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
