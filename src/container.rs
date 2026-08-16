@@ -915,9 +915,9 @@ pub fn build_run_command(
     // A `"<service>:<port>"` entry names another compose service, so it has no meaning for a
     // single container and is skipped rather than guessed at.
     for port in &dc.ports {
-        if let crate::devcontainer::ForwardedPort::Own(p) = port {
+        if let Some(spec) = port.spec() {
             cmd.push("-p".to_string());
-            cmd.push(crate::devcontainer::ForwardedPort::publish_spec(*p));
+            cmd.push(spec);
         }
     }
 

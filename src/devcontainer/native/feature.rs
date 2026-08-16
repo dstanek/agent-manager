@@ -113,6 +113,10 @@ pub struct FeatureMetadata {
     /// Never pulls anything in, and carries no options — unlike [`Self::depends_on`].
     #[serde(default)]
     pub installs_after: Vec<String>,
+    /// Ids this Feature used to be published under. An `installsAfter` naming an old id still
+    /// refers to this Feature, so ordering has to resolve through them.
+    #[serde(default)]
+    pub legacy_ids: Vec<String>,
     /// Hard dependencies, same shape as the `features` object in a `devcontainer.json`: a map
     /// of Feature id to its options. Resolved recursively, so a dependency can pull in Features
     /// the config never named.
@@ -321,7 +325,15 @@ pub fn install_order(
     features: Vec<ResolvedFeature>,
     override_order: &[String],
 ) -> Result<Vec<ResolvedFeature>> {
-    let present: Vec<String> = features.iter().map(|f| f.reference.untagged()).collect();
+    // Every name a Feature answers to: its own id and any it was previously published under,
+    // lower-cased because ids are case-insensitive. A rename must not silently drop an ordering
+    // constraint that still names the old id.
+    let names = |f: &ResolvedFeature| {
+        let mut out = vec![f.reference.untagged().to_lowercase()];
+        out.extend(f.metadata.legacy_ids.iter().map(|id| id.to_lowercase()));
+        out
+    };
+    let present: Vec<String> = features.iter().flat_map(&names).collect();
     let mut worklist = features;
     let mut ordered: Vec<ResolvedFeature> = Vec::with_capacity(worklist.len());
     let mut placed_keys: Vec<String> = Vec::new();
@@ -334,10 +346,10 @@ pub fn install_order(
         let (eligible, mut rest): (Vec<_>, Vec<_>) = worklist.into_iter().partition(|f| {
             let hard = f.hard_deps.iter().all(|k| placed_keys.iter().any(|p| p == k));
             let soft = f.metadata.installs_after.iter().all(|dep| {
-                let dep = dep.split(':').next().unwrap_or(dep);
+                let dep = dep.split(':').next().unwrap_or(dep).to_lowercase();
                 // A soft dependency on a Feature that is not part of this build is satisfied
                 // by definition — installsAfter is an ordering hint, not a requirement.
-                !present.iter().any(|p| p == dep) || placed_ids.iter().any(|p| p == dep)
+                !present.iter().any(|p| p == &dep) || placed_ids.iter().any(|p| p == &dep)
             });
             hard && soft
         });
@@ -368,7 +380,7 @@ pub fn install_order(
 
         round.sort_by(round_stable_sort);
         placed_keys.extend(round.iter().map(ResolvedFeature::key));
-        placed_ids.extend(round.iter().map(|f| f.reference.untagged()));
+        placed_ids.extend(round.iter().flat_map(&names));
         ordered.extend(round);
         worklist = rest;
     }
@@ -753,6 +765,37 @@ mod tests {
         // `apple` sorts first but must wait for `zebra`.
         let ordered = install_order(vec![
             feature("ghcr.io/x/features/apple:1", &["ghcr.io/x/features/zebra"]),
+            feature("ghcr.io/x/features/zebra:1", &[]),
+        ])
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec!["ghcr.io/x/features/zebra:1", "ghcr.io/x/features/apple:1"]
+        );
+    }
+
+    #[test]
+    fn installs_after_resolves_a_renamed_features_old_id() {
+        // A Feature that was republished under a new name keeps its old ones in `legacyIds`.
+        // An `installsAfter` still naming the old id refers to it, so matching literally drops
+        // an ordering constraint that is very much still there.
+        let mut renamed = feature("ghcr.io/x/features/new-name:1", &[]);
+        renamed.metadata.legacy_ids = vec!["ghcr.io/x/features/old-name".to_string()];
+        let ordered = install_order(vec![
+            feature("ghcr.io/x/features/apple:1", &["ghcr.io/x/features/old-name"]),
+            renamed,
+        ])
+        .unwrap();
+        assert_eq!(
+            ids(&ordered),
+            vec!["ghcr.io/x/features/new-name:1", "ghcr.io/x/features/apple:1"]
+        );
+    }
+
+    #[test]
+    fn installs_after_matches_regardless_of_case() {
+        let ordered = install_order(vec![
+            feature("ghcr.io/x/features/apple:1", &["GHCR.io/X/Features/Zebra"]),
             feature("ghcr.io/x/features/zebra:1", &[]),
         ])
         .unwrap();

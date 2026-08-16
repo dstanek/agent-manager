@@ -141,8 +141,12 @@ pub fn parse_ref(id: &str) -> FeatureRef {
 
     FeatureRef {
         kind: FeatureKind::Registry,
-        registry,
-        repository,
+        // Lower-cased because the spec says Feature ids are case-insensitive and OCI repository
+        // names must be lowercase anyway: `ghcr.io/Devcontainers/features/git:1` works in an
+        // editor and 404s otherwise. The tag is left alone — it is not part of that rule — and
+        // `raw` keeps the user's spelling, since that is what the label echoes back.
+        registry: registry.to_lowercase(),
+        repository: repository.to_lowercase(),
         tag,
         digest,
         raw: id.to_string(),
@@ -525,6 +529,15 @@ mod tests {
         // A tarball has no short alias — the reference CLI lists none for one — so it can only
         // be named in full in an overrideFeatureInstallOrder.
         assert_eq!(tarball.name(), "");
+    }
+
+    #[test]
+    fn a_feature_id_is_case_insensitive() {
+        let r = parse_ref("GHCR.io/Devcontainers/Features/Git:1");
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.repository, "devcontainers/features/git");
+        // The label echoes what the user wrote, so `raw` is untouched.
+        assert_eq!(r.raw, "GHCR.io/Devcontainers/Features/Git:1");
     }
 
     #[test]

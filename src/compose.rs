@@ -441,6 +441,8 @@ pub fn override_document(
     for port in &dc.ports {
         match port {
             ForwardedPort::Own(p) => own_ports.push(ForwardedPort::publish_spec(*p)),
+            // Already rendered, from `appPort`.
+            ForwardedPort::Published(spec) => own_ports.push(spec.clone()),
             ForwardedPort::Service { service: other, port } => {
                 let entry = services
                     .entry(other.clone())

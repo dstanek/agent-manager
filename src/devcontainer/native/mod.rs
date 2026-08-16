@@ -73,23 +73,30 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
     let mut out: Vec<RequestedFeature> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    let mut push = |id: &str, options: BTreeMap<String, Value>, seen: &mut Vec<String>| {
-        let reference = oci::parse_ref(id);
-        if seen.iter().any(|s| s == &reference.untagged()) {
-            return;
-        }
-        seen.push(reference.untagged());
-        out.push(RequestedFeature { reference, options });
-    };
-
+    // The config's own Features are taken as written. Two *tags* of one Feature are two
+    // Features per the spec's equality rule — `{"…/node:18": {}, "…/node:20": {}}` asks for
+    // both — so deduplication here is by the full id, not by the untagged name.
     if let Some(map) = raw.get("features").and_then(Value::as_object) {
         for (id, options) in map {
-            push(id, as_option_map(options), &mut seen);
+            let reference = oci::parse_ref(id);
+            if seen.iter().any(|s| s == id) {
+                continue;
+            }
+            seen.push(id.clone());
+            out.push(RequestedFeature { reference, options: as_option_map(options) });
         }
     }
+
+    // An injected Feature defers to the config on the *untagged* name: a project that pinned
+    // its own version of what `am` injects meant that version, whichever tag it chose.
     for f in injected {
+        let reference = oci::parse_ref(&f.id);
+        let untagged = reference.untagged();
+        if out.iter().any(|r| r.reference.untagged() == untagged) {
+            continue;
+        }
         let parsed: Value = serde_json_lenient::from_str(&f.options).unwrap_or(Value::Null);
-        push(&f.id, as_option_map(&parsed), &mut seen);
+        out.push(RequestedFeature { reference, options: as_option_map(&parsed) });
     }
     out
 }
@@ -914,6 +921,20 @@ mod tests {
         )];
         let collected = collect_features(&raw, &injected);
         assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn two_tags_of_one_feature_are_two_features() {
+        // Per the spec's equality rule these are distinct — different contents, so both
+        // install. Deduplicating on the untagged name silently dropped the second.
+        let (_, raw) = json(
+            r#"{"image":"debian","features":{
+                "ghcr.io/devcontainers/features/node:18":{},
+                "ghcr.io/devcontainers/features/node:20":{}
+            }}"#,
+        );
+        let collected = collect_features(&raw, &[]);
+        assert_eq!(collected.len(), 2, "both tags were asked for");
     }
 
     #[test]
