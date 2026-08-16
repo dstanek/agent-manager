@@ -218,8 +218,7 @@ fn fetch_feature(
                     ))
                 })?
                 .clone();
-            let digest = layer.digest.clone();
-            Ok((metadata, raw, digest, Content::Layer(layer)))
+            Ok((metadata, raw, manifest.digest.clone(), Content::Layer(layer)))
         }
         oci::FeatureKind::Local => {
             // Relative to the directory holding the devcontainer.json, which is what the
@@ -314,14 +313,30 @@ fn resolve_base(req: &BuildRequest, runtime_bin: &Path) -> Result<String> {
         tag.clone(),
     ];
     if let Some(build) = &req.json.build {
+        // Build args are substituted: the spec allows `${localWorkspaceFolder}` and friends
+        // here, and passing one through literally bakes the unexpanded string into the image.
+        let ctx = super::SubstitutionContext::new(
+            req.worktree,
+            &req.json
+                .workspace_folder
+                .clone()
+                .unwrap_or_else(|| req.worktree.to_string_lossy().into_owned()),
+        );
         for (key, value) in &build.args {
             args.push("--build-arg".to_string());
-            args.push(format!("{key}={}", render_build_arg(value)));
+            args.push(format!("{key}={}", ctx.substitute(&render_build_arg(value))));
         }
         if let Some(target) = &build.target {
             args.push("--target".to_string());
             args.push(target.clone());
         }
+        for image in build.cache_from.images() {
+            args.push("--cache-from".to_string());
+            args.push(image);
+        }
+        // Passed through verbatim, which is the point of the property: it is the escape hatch
+        // for a runtime flag `am` does not model.
+        args.extend(build.options.iter().cloned());
     }
     if req.no_cache {
         args.push("--no-cache".to_string());

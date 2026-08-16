@@ -99,12 +99,17 @@ pub enum Mount {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MountObject {
-    #[serde(default)]
+    // `src`/`dst` are the short spellings the string form allows, and the image-metadata
+    // schema permits them on the object form too. Without the aliases a perfectly valid
+    // `{"type":"bind","src":"x","dst":"/x"}` fails to deserialize and takes the whole label
+    // parse with it.
+    #[serde(default, alias = "src")]
     pub source: Option<String>,
+    #[serde(alias = "dst", alias = "destination")]
     pub target: String,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "read-only")]
     pub readonly: Option<bool>,
 }
 
@@ -362,6 +367,33 @@ pub struct BuildSection {
     #[serde(default)]
     pub args: BTreeMap<String, serde_json::Value>,
     pub target: Option<String>,
+    /// Extra flags passed to the build command verbatim. Part of the spec, and the only way
+    /// to reach a runtime feature `am` does not model.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Images to consider as cache sources.
+    #[serde(default)]
+    pub cache_from: CacheFrom,
+}
+
+/// `cacheFrom` is a string or an array of them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+pub enum CacheFrom {
+    #[default]
+    None,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl CacheFrom {
+    pub fn images(&self) -> Vec<String> {
+        match self {
+            CacheFrom::None => Vec::new(),
+            CacheFrom::One(s) => vec![s.clone()],
+            CacheFrom::Many(v) => v.clone(),
+        }
+    }
 }
 
 /// Parse a `devcontainer.json`. The file is JSONC — comments and trailing commas are
@@ -747,6 +779,17 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
         }
     }
 
+    // A Feature vendored in the repo is build input like the Dockerfile is: editing its
+    // install.sh must produce a different image, or `am start` reuses a stale one and the edit
+    // appears to do nothing. Registry and tarball Features are *not* covered — resolving those
+    // means a network round trip, and doing one per `am start` would undo the whole point of
+    // hashing. `--rebuild` remains the answer when a moving tag has moved.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    for id in local_feature_ids(&String::from_utf8_lossy(&bytes)) {
+        hasher.update(id.as_bytes());
+        hash_dir(&mut hasher, &base.join(&id));
+    }
+
     // Sorted so that config ordering, which carries no meaning, cannot change the name.
     let mut features = injected.to_vec();
     features.sort();
@@ -757,6 +800,51 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
 
     let digest = hasher.finalize();
     Ok(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+}
+
+/// The `./path` Feature ids a config names, in sorted order.
+///
+/// Read from the raw JSON because `features` is deliberately not modelled — the builder passes
+/// the whole object through, so there is no typed field to read here.
+fn local_feature_ids(text: &str) -> Vec<String> {
+    let Ok(raw) = serde_json_lenient::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = raw
+        .get("features")
+        .and_then(serde_json::Value::as_object)
+        .map(|m| {
+            m.keys()
+                .filter(|id| id.starts_with("./") || id.starts_with("../"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Fold a directory's contents into `hasher`, deterministically.
+///
+/// Names as well as bytes, so deleting a file changes the hash. A path that cannot be read is
+/// folded in as its name: a missing local Feature is the build step's error to report clearly,
+/// not this function's to raise obscurely.
+fn hash_dir(hasher: &mut sha2::Sha256, dir: &Path) {
+    use sha2::Digest;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        hasher.update(dir.to_string_lossy().as_bytes());
+        return;
+    };
+    let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        hasher.update(path.file_name().unwrap_or_default().as_encoded_bytes());
+        if path.is_dir() {
+            hash_dir(hasher, &path);
+        } else if let Ok(content) = std::fs::read(&path) {
+            hasher.update(&content);
+        }
+    }
 }
 
 // ── Build step ────────────────────────────────────────────────────────────────
@@ -1445,7 +1533,94 @@ mod tests {
         assert!(err.contains("devcontainer.path"));
     }
 
+    #[test]
+    fn an_object_mount_accepts_the_short_spellings() {
+        // The image-metadata schema permits src/dst on the object form, and a Feature that
+        // uses them would otherwise fail the whole label parse rather than one mount.
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"mounts":[{"type":"bind","src":"/host","dst":"/in"}]}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+        assert_eq!(merged.mounts.len(), 1);
+        assert_eq!(merged.mounts[0].source.as_deref(), Some("/host"));
+        assert_eq!(merged.mounts[0].target, "/in");
+    }
+
+    #[test]
+    fn build_options_and_cache_from_are_parsed() {
+        let json = parse_config_str(
+            r#"{"build":{"dockerfile":"Dockerfile","options":["--pull"],
+                "cacheFrom":"ghcr.io/x/cache"}}"#,
+        )
+        .unwrap();
+        let build = json.build.unwrap();
+        assert_eq!(build.options, vec!["--pull"]);
+        assert_eq!(build.cache_from.images(), vec!["ghcr.io/x/cache"]);
+    }
+
+    #[test]
+    fn cache_from_accepts_an_array_too() {
+        let json = parse_config_str(
+            r#"{"build":{"dockerfile":"Dockerfile","cacheFrom":["a","b"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(json.build.unwrap().cache_from.images(), vec!["a", "b"]);
+    }
+
     // ── Hashing ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn editing_a_vendored_feature_changes_the_image_name() {
+        // Otherwise `am start` reuses the image built from the old install.sh and the edit
+        // appears to do nothing — the same failure the Dockerfile is hashed to avoid.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(dir.join("vendored")).unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(&config, r#"{"image":"debian","features":{"./vendored":{}}}"#).unwrap();
+        std::fs::write(
+            dir.join("vendored/devcontainer-feature.json"),
+            r#"{"id":"vendored","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let install = dir.join("vendored/install.sh");
+        std::fs::write(&install, "#!/bin/sh\necho one\n").unwrap();
+
+        let before = config_hash(&config, &[]).unwrap();
+        std::fs::write(&install, "#!/bin/sh\necho two\n").unwrap();
+        assert_ne!(before, config_hash(&config, &[]).unwrap());
+    }
+
+    #[test]
+    fn adding_a_file_to_a_vendored_feature_changes_the_image_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(dir.join("vendored")).unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(&config, r#"{"image":"debian","features":{"./vendored":{}}}"#).unwrap();
+        std::fs::write(dir.join("vendored/install.sh"), "#!/bin/sh\n").unwrap();
+
+        let before = config_hash(&config, &[]).unwrap();
+        std::fs::write(dir.join("vendored/helper.sh"), "#!/bin/sh\n").unwrap();
+        assert_ne!(before, config_hash(&config, &[]).unwrap(), "file names count too");
+    }
+
+    #[test]
+    fn a_registry_feature_does_not_make_the_hash_unstable() {
+        // Only local Features are hashed by content. A registry one must not vary run to run,
+        // since resolving it would mean a network round trip per `am start`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(
+            &config,
+            r#"{"image":"debian","features":{"ghcr.io/devcontainers/features/git:1":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(config_hash(&config, &[]).unwrap(), config_hash(&config, &[]).unwrap());
+    }
 
     #[test]
     fn image_name_is_stable_for_identical_config() {
