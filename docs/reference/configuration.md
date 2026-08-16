@@ -318,6 +318,11 @@ service's image, brings the project up, runs the agent inside it, and takes the 
 `command: sleep infinity`. `container.network = "none"` is refused for compose sessions rather
 than silently ignored, since the services need the project network to reach each other.
 
+**Lockfile.** `am` reads and writes `.devcontainer/devcontainer-lock.json` in the reference
+format. Registry Features are fetched at the digest it records, tarball downloads are checked
+against its `integrity` hash, and the file is folded into the image hash so a moved pin rebuilds.
+Local Features are excluded per the spec; their files are hashed directly instead.
+
 **Ports.** `forwardPorts` publishes each port on `127.0.0.1`. The reference CLI publishes
 nothing here and leaves forwarding to an editor; `am` has none, so publishing is what makes the
 key mean anything. In a compose project a bare port lands on the agent's service and a

@@ -611,11 +611,14 @@ Follow-ups the native builder left behind:
 - [ ] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
       They describe a port to an editor; `am` has no equivalent behaviour to apply.
 - [ ] **A forwarded port that is already bound fails at session start**, not in preflight.
-- [ ] **The image hash does not cover registry or tarball Features.** Local ones are hashed by
-      content as of 2026-08-16, so editing a vendored Feature rebuilds. A moving tag or a
-      changed tarball still needs `--rebuild`: detecting either means a network round trip per
-      `am start`, which is what the reference implementation's `devcontainer-lock.json` avoids.
-      Adopting a lockfile is the real fix.
+- [x] **Registry and tarball Features participate in rebuild detection.** Done 2026-08-16 by
+      adopting `devcontainer-lock.json` in the reference format: `am` reads it to pin fetches
+      to a recorded digest, verifies tarball downloads against its `integrity` hash, folds it
+      into the image hash so a moved pin rebuilds, and writes it back after resolving. Local
+      Features stay excluded per the spec — their files are hashed directly. Adopting a
+      lockfile renames the image once, which is a layer-cache hit in practice.
+- [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
+      until `am` writes one on its first build. Self-correcting, but worth knowing.
 - [ ] **Tarball Features are not differentially tested.** The CLI's resolver accepts one from
       a local TLS server but its build path will not fetch from one, so no reference label
       can be produced locally. Unpacking has unit tests and everything after the fetch is

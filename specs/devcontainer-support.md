@@ -737,6 +737,40 @@ the label is the contract between builders, so anything that does not change the
   classifying `http://` as anything else leaves it read as a registry reference with the host
   `http:`, and "no such host" is a worse answer than naming the real problem.
 
+## The lockfile closes the staleness gap without a network round trip
+
+`am` names an image by hashing its inputs and skips the build when that image exists. A Feature
+from a registry has no input to hash: resolving `…/git:1` means asking the registry, and doing
+that per `am start` would undo the caching the hash exists to provide.
+
+`devcontainer-lock.json` is the ecosystem's answer, and `am` now reads and writes it in the
+reference format. It records the digest each id resolved to; hashing *that file* stands in for
+hashing the Features. A moved tag changes the lockfile, which changes the image name, which
+rebuilds — and the fast path fetches nothing.
+
+The same file solves reproducibility, which is what it was designed for: a registry Feature is
+fetched at its recorded digest rather than its tag, so two people building the same config get
+the same Feature.
+
+Details worth keeping:
+
+- **`integrity` is the manifest digest** for a registry Feature, which is the same value the
+  identity fix above keys on — the two are the same question. For a tarball it is the hash of the
+  downloaded bytes, and a mismatch is an **error**: it is the only way to detect that a mutable
+  URL changed, and installing different code than the file records would make it worse than
+  useless.
+- **Local Features are excluded**, per the spec. `am` hashes their files directly instead, which
+  is cheaper and exact.
+- **Adopting a lockfile renames the image once.** A repo that had none gets a different hash on
+  the next start and rebuilds — a one-time cost, mostly a layer-cache hit.
+- **The write happens during a build, not on every start**, since the builder only runs when the
+  image is missing.
+
+The format is pinned against the reference implementation two ways: the resolver differential
+test compares `am`'s resolved `repo@digest` strings to the CLI's, and a test asserts `am`'s
+rendering of *this repo's own committed lockfile* is byte-identical — so `am` writing it does
+not produce a spurious diff.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -760,12 +794,9 @@ the label is the contract between builders, so anything that does not change the
 - **`portsAttributes` and `otherPortsAttributes` are carried but not acted on.** They exist to
   tell an editor how to treat a forwarded port — a label, whether to open a browser — and `am`
   has no equivalent. They now reach the label, which is what a downstream reader needs.
-- **The image hash covers local Features but not registry or tarball ones.** Editing a vendored
-  Feature now changes the image name, because its files are build input exactly as the Dockerfile
-  is. A moving registry tag or a changed tarball still does not: detecting either means a network
-  round trip, and doing one per `am start` would undo the point of hashing. This is what
-  `devcontainer-lock.json` exists for in the reference implementation; `--rebuild` is the answer
-  until `am` has an equivalent.
+- **A repo with no lockfile still cannot detect a moved tag.** Hashing the lockfile is what
+  makes registry Features participate; without one there is nothing to hash, and `--rebuild`
+  remains the answer. `am` writes the file on its first build, so this self-corrects.
 - **A port conflict surfaces as a runtime failure**, not a preflight one. `am` does not check
   whether a forwarded port is already bound before starting the session.
 - **A typo'd `overrideFeatureInstallOrder` entry is silently ignored** rather than being the

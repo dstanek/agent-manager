@@ -107,6 +107,8 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
 fn resolve_graph(
     requested: Vec<RequestedFeature>,
     config_dir: &Path,
+    lock: &super::lock::Lockfile,
+    resolved_lock: &mut super::lock::Lockfile,
 ) -> Result<Vec<(feature::ResolvedFeature, Content)>> {
     let cache_root = oci::cache_root();
     let mut worklist: std::collections::VecDeque<RequestedFeature> = requested.into();
@@ -126,7 +128,8 @@ fn resolve_graph(
         }
 
         let (metadata, raw, digest, content) =
-            fetch_feature(&item.reference, config_dir, &cache_root)?;
+            fetch_feature(&item.reference, config_dir, &cache_root, lock)?;
+        record_in_lock(resolved_lock, &item.reference, &metadata, &digest);
 
         let identity = feature::request_key(&digest, &item.options);
         if let Some(&existing) = by_identity.get(&identity) {
@@ -198,9 +201,17 @@ fn fetch_feature(
     reference: &oci::FeatureRef,
     config_dir: &Path,
     cache_root: &Path,
+    lock: &super::lock::Lockfile,
 ) -> Result<(feature::FeatureMetadata, Value, String, Content)> {
     match reference.kind {
         oci::FeatureKind::Registry => {
+            // A pinned digest wins over the written tag: that is the whole point of the
+            // lockfile, and it is why two people building the same config get the same Feature.
+            let pinned = lock.digest_for(&reference.raw).map(|digest| oci::FeatureRef {
+                digest: Some(digest.to_string()),
+                ..reference.clone()
+            });
+            let reference = pinned.as_ref().unwrap_or(reference);
             let manifest = oci::fetch_manifest(reference)?;
             let text = manifest.feature_metadata().ok_or_else(|| {
                 AmError::DevcontainerBuildFailed(format!(
@@ -235,10 +246,57 @@ fn fetch_feature(
         }
         oci::FeatureKind::Tarball => {
             let (dir, digest) = oci::fetch_tarball(reference, cache_root)?;
+            // A tarball URL is mutable and carries no digest of its own, so the lockfile's
+            // integrity hash is the only thing that can tell you the bytes changed underneath
+            // you. Refusing is the point: silently installing different code than the lockfile
+            // records would make the file worse than useless.
+            if let Some(expected) = lock.integrity_for(&reference.raw) {
+                if expected != digest {
+                    return Err(AmError::DevcontainerBuildFailed(format!(
+                        "Feature '{}' does not match the lockfile\n\
+                         expected {expected}, got {digest}\n\
+                         The tarball changed at its URL. Delete its devcontainer-lock.json \
+                         entry to accept the new contents.",
+                        reference.raw
+                    ))
+                    .into());
+                }
+            }
             let (metadata, raw) = read_feature_dir(&dir, &reference.raw)?;
             Ok((metadata, raw, digest, Content::Directory(dir)))
         }
     }
+}
+
+/// Record what a Feature resolved to, for the lockfile `am` writes back.
+///
+/// Local Features are skipped: the spec excludes them, and `am` hashes their files directly,
+/// which is both cheaper and exact.
+fn record_in_lock(
+    lock: &mut super::lock::Lockfile,
+    reference: &oci::FeatureRef,
+    metadata: &feature::FeatureMetadata,
+    digest: &str,
+) {
+    let resolved = match reference.kind {
+        oci::FeatureKind::Registry => format!("{}@{digest}", reference.untagged()),
+        oci::FeatureKind::Tarball => reference.raw.clone(),
+        oci::FeatureKind::Local => return,
+    };
+    let mut depends_on: Vec<String> = depends_on_entries(metadata)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    depends_on.sort();
+    lock.insert(
+        &reference.raw,
+        super::lock::LockEntry {
+            version: metadata.version.clone(),
+            resolved,
+            integrity: digest.to_string(),
+            depends_on,
+        },
+    );
 }
 
 /// Read the `devcontainer-feature.json` out of an unpacked Feature directory.
@@ -497,7 +555,12 @@ pub fn build(
 
     let requested = collect_features(raw_config, req.injected);
     let config_dir = req.config_path.parent().unwrap_or(req.worktree);
-    let resolved = resolve_graph(requested, config_dir)?;
+    let lock = super::lock::load(req.config_path);
+    let mut resolved_lock = super::lock::Lockfile::default();
+    let resolved = resolve_graph(requested, config_dir, &lock, &mut resolved_lock)?;
+    // Written after resolution, before the build: the build is the slow part, and a lockfile
+    // that records what was fetched is worth having even if installing it then fails.
+    super::lock::save(req.config_path, &resolved_lock)?;
 
     // Ordering moves the Features around, so each one's content is looked up by id afterwards
     // rather than carried along positionally.
@@ -734,6 +797,17 @@ mod tests {
         assert!(kinds.contains(&oci::FeatureKind::Tarball));
     }
 
+    /// Resolve with no lockfile involved, which is what the local-Feature tests want: the spec
+    /// excludes local Features from the lockfile entirely.
+    fn resolve_unlocked(
+        requested: Vec<RequestedFeature>,
+        config_dir: &Path,
+    ) -> Result<Vec<(feature::ResolvedFeature, Content)>> {
+        let empty = super::super::lock::Lockfile::default();
+        let mut written = super::super::lock::Lockfile::default();
+        resolve_graph(requested, config_dir, &empty, &mut written)
+    }
+
     /// Write a local Feature into `dir`, optionally hard-depending on other local Features.
     fn write_local_feature(root: &Path, name: &str, depends_on: &[&str]) {
         let dir = root.join(name);
@@ -774,7 +848,7 @@ mod tests {
             r#"{"image":"debian","features":{"./top":{}}}"#,
         )
         .unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
+        let resolved = resolve_unlocked(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 3, "transitive dependencies must be pulled in");
 
         let ordered =
@@ -798,7 +872,7 @@ mod tests {
             r#"{"image":"debian","features":{"./left":{},"./right":{}}}"#,
         )
         .unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
+        let resolved = resolve_unlocked(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 3, "the shared dependency must not be installed twice");
     }
 
@@ -812,7 +886,7 @@ mod tests {
         let raw: Value =
             serde_json_lenient::from_str(r#"{"image":"debian","features":{"./a":{}}}"#).unwrap();
         // Resolution itself must finish — identity dedup is what stops the walk.
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
+        let resolved = resolve_unlocked(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 2);
         // The cycle is then reported by ordering, which is where the spec puts it.
         let err = feature::install_order(resolved.into_iter().map(|(f, _)| f).collect(), &[])
@@ -826,7 +900,7 @@ mod tests {
         let raw: Value =
             serde_json_lenient::from_str(r#"{"image":"debian","features":{"./missing":{}}}"#)
                 .unwrap();
-        let err = resolve_graph(collect_features(&raw, &[]), tmp.path()).unwrap_err();
+        let err = resolve_unlocked(collect_features(&raw, &[]), tmp.path()).unwrap_err();
         // The message has to name the path, since "no such file" alone would not say which.
         assert!(err.to_string().contains("./missing"), "got: {err}");
     }
@@ -996,8 +1070,12 @@ mod tests {
     ///
     /// The config is deliberately two *independent* `installsAfter` chains, which is what
     /// separates the spec's round-based algorithm from committing one eligible Feature at a
-    /// time. Ordering is compared by resource name, since the CLI reports manifest digests here
-    /// while `am` carries layer digests.
+    /// time.
+    ///
+    /// The **digests** are compared too, not just the order. The CLI reports each Feature as
+    /// `repo@sha256:…`, and that is the same manifest digest `am` keys identity on and writes
+    /// into the lockfile — so this is what proves the two agree on what a Feature *is*, which
+    /// no label comparison can show.
     #[test]
     #[ignore = "needs the reference CLI and network access"]
     fn install_order_matches_the_reference_cli_resolver() {
@@ -1038,23 +1116,43 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let json_start = stdout.find('{').expect("no JSON in CLI output");
         let reported: Value = serde_json::from_str(&stdout[json_start..]).unwrap();
+        // Kept whole: `repo@sha256:…`, so both the order and the resolved digest are compared.
         let expected: Vec<String> = reported["installOrder"]
             .as_array()
             .expect("installOrder")
             .iter()
-            .map(|e| e["id"].as_str().unwrap().split('@').next().unwrap().to_string())
+            .map(|e| e["id"].as_str().unwrap().to_string())
             .collect();
 
         let raw: Value = serde_json_lenient::from_str(config_text).unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), &dir).unwrap();
+        let empty = super::super::lock::Lockfile::default();
+        let mut written = super::super::lock::Lockfile::default();
+        let resolved =
+            resolve_graph(collect_features(&raw, &[]), &dir, &empty, &mut written).unwrap();
         let ordered = feature::install_order(
             resolved.into_iter().map(|(f, _)| f).collect(),
             &override_install_order(&raw),
         )
         .unwrap();
-        let actual: Vec<String> = ordered.iter().map(|f| f.reference.untagged()).collect();
 
-        assert_eq!(actual, expected, "install order diverged from the reference CLI");
+        // The lockfile `am` would write records `repo@digest` for each Feature — the same
+        // string the CLI reports as a resolved id. Comparing them pins the format against the
+        // reference implementation rather than against our own reading of the lockfile spec.
+        let mut locked: Vec<String> =
+            written.features.values().map(|e| e.resolved.clone()).collect();
+        locked.sort();
+        let mut reported_ids = expected.clone();
+        reported_ids.sort();
+        assert_eq!(locked, reported_ids, "lockfile entries diverged from the reference CLI");
+        let actual: Vec<String> = ordered
+            .iter()
+            .map(|f| format!("{}@{}", f.reference.untagged(), f.digest))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "install order or resolved digest diverged from the reference CLI"
+        );
     }
 
     /// Build `config_text` with `am`'s own builder and assert the resulting metadata label is
