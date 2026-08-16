@@ -553,6 +553,11 @@ Follow-ups phase 1 left behind:
       hash of tracked files under it, but the fix belongs to both builders, so it stayed out
       of that change.
 
+**The Node dependency is gone.** As of 2026-08-16 there is no config shape that sends `am` to
+`@devcontainers/cli`. The last one was not a construct at all — it was a config naming nothing
+to build from, which the reference CLI rejects too, so it became an error instead of a
+delegation. `builder = "cli"` survives as an escape hatch nothing selects automatically.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

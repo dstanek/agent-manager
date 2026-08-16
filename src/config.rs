@@ -174,13 +174,15 @@ impl Default for ContainerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Builder {
-    /// `am`'s own builder when it can handle the config, the reference CLI otherwise.
+    /// `am`'s own builder. Nothing sends it to the reference CLI: a config it cannot build is
+    /// one the reference CLI rejects too, and is reported as an error rather than delegated.
     #[default]
     Auto,
-    /// `am`'s own builder; error rather than fall back, so an unsupported construct is
-    /// visible instead of silently costing a Node dependency.
+    /// The same builder. Kept as a synonym for `Auto` because it was the way to say "never
+    /// silently reintroduce Node", which is now simply the behaviour.
     Native,
-    /// Always shell out to `@devcontainers/cli`.
+    /// Shell out to `@devcontainers/cli`. The only way to reach it — an escape hatch for a
+    /// config `am`'s builder gets wrong, not a fallback anything selects on its own.
     Cli,
 }
 
@@ -703,17 +705,15 @@ ssh_agent = true       # forward the host's SSH_AUTH_SOCK, so a passphrase-prote
 # path = ""                    # explicit devcontainer.json, relative to the session worktree;
                                # default is to discover .devcontainer/devcontainer.json
 builder = "auto"               # which builder turns devcontainer.json into an image:
-                               #   "auto"   — am's own builder, falling back to the CLI for
-                               #              constructs it does not implement (dependsOn,
-                               #              overrideFeatureInstallOrder, local/tarball
-                               #              Features, docker compose)
-                               #   "native" — am's own builder only; error instead of falling
-                               #              back, so no config silently needs Node
-                               #   "cli"    — always use @devcontainers/cli
+                               #   "auto"   — am's own builder. Never delegates: a config it
+                               #              cannot build is one the CLI rejects too
+                               #   "native" — a synonym for "auto"
+                               #   "cli"    — use @devcontainers/cli instead. An escape hatch
+                               #              for a config am gets wrong; nothing selects it
+                               #              automatically
 cli = "devcontainer"           # CLI binary name or path (AM_DEVCONTAINER_BIN overrides).
-                               # Only needed when a build actually falls back to it;
-                               # installing it takes `npm install -g @devcontainers/cli`
-                               # and Node 20+.
+                               # Only used when builder = "cli"; installing it takes
+                               # `npm install -g @devcontainers/cli` and Node 20+.
 agent_install = "auto"         # how the agent gets into the image:
                                #   "feature"   — inject the agent's devcontainer Feature at build
                                #   "bootstrap" — install into a shared volume at run time

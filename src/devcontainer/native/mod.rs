@@ -1,10 +1,10 @@
 //! `am`'s own devcontainer image builder.
 //!
-//! Covers a base `image` or `build.dockerfile`, plus Features from all three sources the spec
-//! defines — an OCI registry, a path in the repo, or a tarball URL — ordered by `dependsOn`,
-//! `installsAfter`, and `overrideFeatureInstallOrder`. What is left is reported as
-//! [`Unsupported`] so the caller can fall back to the reference CLI rather than build something
-//! subtly wrong.
+//! Covers every shape the spec defines: a base `image`, a `build.dockerfile`, or a
+//! `dockerComposeFile`, plus Features from an OCI registry, a path in the repo, or a tarball
+//! URL — ordered by `dependsOn`, `installsAfter`, and `overrideFeatureInstallOrder`. There is no
+//! construct left that sends `am` to the reference CLI; a config this cannot build is one the
+//! reference CLI rejects too, and it is reported as the error it is.
 //!
 //! The contract with the rest of `am` is exactly one artifact: an image tagged `am-dc-<hash>`
 //! carrying a `devcontainer.metadata` label. Everything downstream — [`super::merge`],
@@ -24,25 +24,6 @@ use serde_json::Value;
 use super::{BuildRequest, DevcontainerJson};
 use crate::error::AmError;
 
-/// A construct this builder does not implement. Carries its own explanation because the
-/// message is user-facing: it is the line printed when `am` falls back to the CLI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unsupported {
-    NoBase,
-}
-
-impl std::fmt::Display for Unsupported {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Unsupported::NoBase => write!(
-                f,
-                "the config has no 'image', 'build.dockerfile', or 'dockerComposeFile' to \
-                 build from"
-            ),
-        }
-    }
-}
-
 /// Everything the builder needs about one requested Feature before its manifest is fetched.
 struct RequestedFeature {
     reference: oci::FeatureRef,
@@ -51,17 +32,23 @@ struct RequestedFeature {
 
 /// Check the parts of a config that can be judged without touching the network.
 ///
-/// Feature-level problems (`dependsOn`) can only be found after fetching manifests; those
-/// surface later, from [`build`]. Cheap checks run first so an unsupported config falls back
-/// before doing any I/O.
-pub fn check_static(json: &DevcontainerJson) -> Result<(), Unsupported> {
+/// There is exactly one: whether the config says what to build at all. This is not a limitation
+/// of `am`'s builder — the reference CLI rejects the same configs with "No image information
+/// specified in devcontainer.json", and `build.dockerfile` has no default there either — so it
+/// is an error rather than a reason to go asking a second tool the same unanswerable question.
+pub fn check_static(json: &DevcontainerJson) -> Result<()> {
     let has_base = json.image.is_some()
         || json.build.as_ref().and_then(|b| b.dockerfile.as_ref()).is_some()
         // A compose config's base is the agent service's own image or build section, which
         // only the runtime can resolve — so this cannot be judged any further from here.
         || json.docker_compose_file.is_some();
     if !has_base {
-        return Err(Unsupported::NoBase);
+        return Err(AmError::ConfigError(
+            "this devcontainer.json has nothing to build from\n\
+             Add an \"image\", a \"build\" with a \"dockerfile\", or a \"dockerComposeFile\""
+                .to_string(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -120,7 +107,7 @@ fn collect_features(raw: &Value, injected: &[super::InjectedFeature]) -> Vec<Req
 fn resolve_graph(
     requested: Vec<RequestedFeature>,
     config_dir: &Path,
-) -> Result<Result<Vec<(feature::ResolvedFeature, Content)>, Unsupported>> {
+) -> Result<Vec<(feature::ResolvedFeature, Content)>> {
     let cache_root = oci::cache_root();
     let mut worklist: std::collections::VecDeque<RequestedFeature> = requested.into();
     let mut nodes: Vec<(feature::ResolvedFeature, Content)> = Vec::new();
@@ -186,7 +173,7 @@ fn resolve_graph(
             .collect();
         nodes[index].0.hard_deps = keys;
     }
-    Ok(Ok(nodes))
+    Ok(nodes)
 }
 
 /// Where a resolved Feature's files will come from when the build context is written.
@@ -484,24 +471,18 @@ pub fn compose_label(
 
 /// Build the image, or report why this builder cannot.
 ///
-/// Returns `Ok(Err(unsupported))` when the config is valid but out of scope — a fallback
-/// signal, not a failure. `Err(_)` means the build itself went wrong and falling back would
-/// just repeat it.
+/// Every error here is terminal. There is nothing this builder declines that the reference CLI
+/// would accept, so there is nothing to fall back to.
 pub fn build(
     req: &BuildRequest,
     runtime_bin: &Path,
     raw_config: &Value,
-) -> Result<Result<String, Unsupported>> {
-    if let Err(reason) = check_static(req.json) {
-        return Ok(Err(reason));
-    }
+) -> Result<String> {
+    check_static(req.json)?;
 
     let requested = collect_features(raw_config, req.injected);
     let config_dir = req.config_path.parent().unwrap_or(req.worktree);
-    let resolved = match resolve_graph(requested, config_dir)? {
-        Ok(nodes) => nodes,
-        Err(reason) => return Ok(Err(reason)),
-    };
+    let resolved = resolve_graph(requested, config_dir)?;
 
     // Ordering moves the Features around, so each one's content is looked up by id afterwards
     // rather than carried along positionally.
@@ -572,7 +553,7 @@ pub fn build(
     args.push(context.to_string_lossy().into_owned());
 
     run_build(runtime_bin, &args, "installing devcontainer Features")?;
-    Ok(Ok(req.image.to_string()))
+    Ok(req.image.to_string())
 }
 
 /// Resolve a user property across the precedence chain: base image, then `devcontainer.json`.
@@ -650,7 +631,7 @@ mod tests {
     #[test]
     fn a_plain_image_config_is_supported() {
         let (typed, _) = json(r#"{"image":"debian:bookworm-slim"}"#);
-        assert_eq!(check_static(&typed), Ok(()));
+        assert!(check_static(&typed).is_ok());
     }
 
     #[test]
@@ -658,21 +639,37 @@ mod tests {
         let (typed, _) = json(
             r#"{"image":"debian","features":{"ghcr.io/devcontainers/features/git:1":{}}}"#,
         );
-        assert_eq!(check_static(&typed), Ok(()));
+        assert!(check_static(&typed).is_ok());
     }
 
     #[test]
     fn a_compose_config_is_a_base_the_builder_accepts() {
         // The service's image can only be resolved by asking the runtime, so the static check
-        // must not treat a compose config as baseless and hand it to the CLI.
+        // must not treat a compose config as baseless.
         let (typed, _) = json(r#"{"dockerComposeFile":"docker-compose.yml","service":"app"}"#);
-        assert_eq!(check_static(&typed), Ok(()));
+        assert!(check_static(&typed).is_ok());
     }
 
     #[test]
-    fn a_config_with_no_base_falls_back() {
+    fn a_config_with_nothing_to_build_from_is_an_error_naming_what_to_add() {
+        // Not a fallback: the reference CLI rejects this same config with "No image information
+        // specified in devcontainer.json", so handing it over would only ask a second tool the
+        // same unanswerable question — and, if the CLI is not installed, send the user to
+        // install Node over a typo.
         let (typed, _) = json(r#"{"name":"nothing"}"#);
-        assert_eq!(check_static(&typed), Err(Unsupported::NoBase));
+        let err = check_static(&typed).unwrap_err().to_string();
+        assert!(err.contains("nothing to build from"), "got: {err}");
+        for suggestion in ["image", "dockerfile", "dockerComposeFile"] {
+            assert!(err.contains(suggestion), "must name {suggestion}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_build_section_without_a_dockerfile_is_not_a_base() {
+        // `build.dockerfile` has no default in the reference CLI either — a build section
+        // without it is rejected the same way an empty config is.
+        let (typed, _) = json(r#"{"build":{"context":"."}}"#);
+        assert!(check_static(&typed).is_err());
     }
 
     #[test]
@@ -683,7 +680,7 @@ mod tests {
         let (_, raw) = json(
             r#"{"image":"debian","overrideFeatureInstallOrder":["ghcr.io/devcontainers/features/git"]}"#,
         );
-        assert_eq!(check_static(&typed), Ok(()));
+        assert!(check_static(&typed).is_ok());
         assert_eq!(override_install_order(&raw), vec!["ghcr.io/devcontainers/features/git"]);
     }
 
@@ -696,11 +693,11 @@ mod tests {
     #[test]
     fn local_and_tarball_features_are_supported() {
         let (local, _) = json(r#"{"image":"debian","features":{"./local-feature":{}}}"#);
-        assert_eq!(check_static(&local), Ok(()));
+        assert!(check_static(&local).is_ok());
         let (tarball, _) = json(
             r#"{"image":"debian","features":{"https://example.com/devcontainer-feature-f.tgz":{}}}"#,
         );
-        assert_eq!(check_static(&tarball), Ok(()));
+        assert!(check_static(&tarball).is_ok());
     }
 
     #[test]
@@ -762,7 +759,7 @@ mod tests {
             r#"{"image":"debian","features":{"./top":{}}}"#,
         )
         .unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 3, "transitive dependencies must be pulled in");
 
         let ordered =
@@ -786,7 +783,7 @@ mod tests {
             r#"{"image":"debian","features":{"./left":{},"./right":{}}}"#,
         )
         .unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 3, "the shared dependency must not be installed twice");
     }
 
@@ -800,7 +797,7 @@ mod tests {
         let raw: Value =
             serde_json_lenient::from_str(r#"{"image":"debian","features":{"./a":{}}}"#).unwrap();
         // Resolution itself must finish — identity dedup is what stops the walk.
-        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap().unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), dir).unwrap();
         assert_eq!(resolved.len(), 2);
         // The cycle is then reported by ordering, which is where the spec puts it.
         let err = feature::install_order(resolved.into_iter().map(|(f, _)| f).collect(), &[])
@@ -817,13 +814,6 @@ mod tests {
         let err = resolve_graph(collect_features(&raw, &[]), tmp.path()).unwrap_err();
         // The message has to name the path, since "no such file" alone would not say which.
         assert!(err.to_string().contains("./missing"), "got: {err}");
-    }
-
-    #[test]
-    fn fallback_reasons_name_the_offending_construct() {
-        // These strings are printed to the user, so they must identify what to look at.
-        assert!(Unsupported::NoBase.to_string().contains("build.dockerfile"));
-        assert!(Unsupported::NoBase.to_string().contains("dockerComposeFile"));
     }
 
     #[test]
@@ -1041,7 +1031,7 @@ mod tests {
             .collect();
 
         let raw: Value = serde_json_lenient::from_str(config_text).unwrap();
-        let resolved = resolve_graph(collect_features(&raw, &[]), &dir).unwrap().unwrap();
+        let resolved = resolve_graph(collect_features(&raw, &[]), &dir).unwrap();
         let ordered = feature::install_order(
             resolved.into_iter().map(|(f, _)| f).collect(),
             &override_install_order(&raw),
@@ -1102,8 +1092,7 @@ mod tests {
             &runtime,
             &raw,
         )
-        .expect("build succeeds")
-        .expect("config is supported natively");
+        .expect("build succeeds");
         assert_eq!(built, image);
 
         let ours = String::from_utf8(
