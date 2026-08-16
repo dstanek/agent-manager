@@ -35,6 +35,13 @@ make build-copilot       # Build Copilot Docker image
   a backgrounded forwarder holding stdout makes the script never return, and a `-v` source path
   is resolved against the **host's** filesystem, so the htpasswd file is `cp`ed in rather than
   mounted (a bind mount silently creates a directory there and every request 400s).
+- `scripts/test-live-session.sh` runs one session for real — tmux server, compose project up,
+  `am destroy` — because the ordinary suite mocks the runtime, tmux, and the agent, and that
+  combination is where compose bugs live. It runs inside `am`'s own dev container only because
+  the checkout is mounted at its host path; the scratch repo therefore lives under `target/`, the
+  session gets a scratch `HOME` under it, and assertions read *container* state rather than the
+  bind-mounted worktree, which a sibling container cannot write to under a rootless runtime's
+  user namespace.
 - The tarball Feature fixture is committed and served over GitHub's HTTPS rather than locally:
   `ureq` verifies against a bundled root store, so no locally issued certificate can be trusted,
   and `am` accepts no other scheme. See `tests/fixtures/tarball/README.md`.

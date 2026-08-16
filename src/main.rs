@@ -33,7 +33,10 @@ fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = run(cli) {
-        eprintln!("{} {e}", error_prefix());
+        // `{e:#}` rather than `{e}`: the plain form prints only the outermost context, so an
+        // error carrying "starting the compose project" reported exactly that and dropped the
+        // runtime's own message — the only part that says what went wrong.
+        eprintln!("{} {e:#}", error_prefix());
         std::process::exit(1);
     }
 }
