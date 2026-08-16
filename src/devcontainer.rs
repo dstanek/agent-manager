@@ -100,17 +100,17 @@ pub enum Mount {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MountObject {
-    // `src`/`dst` are the short spellings the string form allows, and the image-metadata
-    // schema permits them on the object form too. Without the aliases a perfectly valid
-    // `{"type":"bind","src":"x","dst":"/x"}` fails to deserialize and takes the whole label
-    // parse with it.
+    // The object form accepts the same field names as the string form below, because the
+    // reference CLI copies a config's mount into the label *verbatim* — a config written as
+    // `{"type":"volume","src":"v","dst":"/v"}` reaches this parser exactly as written, and
+    // without the aliases it fails to deserialize and takes the whole label with it.
     #[serde(default, alias = "src")]
     pub source: Option<String>,
     #[serde(alias = "dst", alias = "destination")]
     pub target: String,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
-    #[serde(default, alias = "read-only")]
+    #[serde(default, alias = "ro")]
     pub readonly: Option<bool>,
 }
 
@@ -1538,6 +1538,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("devcontainer.path"));
+    }
+
+    #[test]
+    fn both_mount_forms_accept_the_same_field_names() {
+        // The object and string parsers are two spellings of one thing, so a name accepted by
+        // one and rejected by the other is a bug waiting for a Feature author to find.
+        let obj: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"mounts":[{"type":"volume","src":"v","dst":"/v"}]}]"#,
+        )
+        .unwrap();
+        let string: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"mounts":["type=volume,src=v,dst=/v"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(merge(&obj).unwrap().mounts, merge(&string).unwrap().mounts);
     }
 
     #[test]

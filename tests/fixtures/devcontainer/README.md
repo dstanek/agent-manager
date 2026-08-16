@@ -69,6 +69,8 @@ our reading of the spec.
 | `cli-Dockerfile.extended` | The Dockerfile the CLI generates to install Features |
 | `cli-Dockerfile.buildContent` | Its throwaway `FROM scratch` content image |
 | `cli-builtin.env`, `cli-git_0-features.env`, `cli-git_0-install-wrapper.sh` | The Feature install contract: the env files and the generated wrapper that sources them |
+| `awkward-devcontainer-feature.json` | A Feature whose option names need normalising (`my-option`, `2fa`, `a--b`, `__dunder`) |
+| `cli-awkward-features.env` | The env file the CLI generated for it — the authority on how an option name becomes a variable |
 | `two-chains-devcontainer.json` | Input: four Features forming *two independent* `installsAfter` chains — the shape that tells the round-based install order apart from a one-at-a-time one |
 | `ports-devcontainer.json` | Input: seven config-level metadata properties at once, including `forwardPorts` and `portsAttributes` |
 | `cli-ports-label.json` | Its label — the authority on the **config** metadata order, which differs from the Feature one |
@@ -92,6 +94,11 @@ our reading of the spec.
   Features are chosen so the two orderings differ: one-at-a-time selection gives
   `gh-release, act, common-utils, git`, the spec's rounds give `gh-release, common-utils, act,
   git`.
+- **`cli-awkward-features.env`** covers a blind spot the label fixtures structurally cannot.
+  The label carries option *values*, never a Feature's option *names*, so no label comparison can
+  see a normalisation bug — and `cli-git_0-features.env` cannot either, since `version` and `ppa`
+  survive naive uppercasing intact. Uppercasing alone yields `MY-OPTION="a"`, which is not a
+  valid shell assignment and fails the whole install when the env file is sourced.
 - **`cli-ports-label.json`** is what stops the two metadata key lists being merged back into
   one. Features and configs use different schemas *in different orders* — a Feature emits
   `customizations` last, a config emits it seventh — and the other label fixtures each exercise
