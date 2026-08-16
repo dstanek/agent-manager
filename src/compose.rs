@@ -47,6 +47,15 @@ fn command(argv: &[String]) -> std::process::Command {
     cmd
 }
 
+/// A Compose invocation, with whatever environment the provider needs.
+fn provider_command(provider: &Provider, argv: &[String]) -> std::process::Command {
+    let mut cmd = command(argv);
+    for (key, value) in &provider.env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 /// Everything needed to address a session's compose project again later.
 ///
 /// Persisted in the session record because `am destroy` and `am attach` must reach the project
@@ -76,12 +85,115 @@ pub fn project_name(slug: &str) -> String {
     format!("am-{}", sanitized.to_lowercase())
 }
 
-/// `compose` subcommand args for a runtime.
+/// How to invoke Compose, and what environment it needs.
 ///
-/// Both `docker compose` and `podman compose` take the same shape; the older standalone
-/// `docker-compose` binary is not looked for, since every supported runtime ships the plugin.
-fn compose_args(runtime_bin: &Path, files: &[PathBuf], project: &str) -> Vec<String> {
-    let mut args = vec![runtime_bin.to_string_lossy().into_owned(), "compose".to_string()];
+/// `<runtime> compose` is not a safe assumption. Docker ships it as a plugin and podman grew it
+/// in 4.7, but podman 4.3 — what Debian 12 and Ubuntu 22.04 ship — has no `compose` subcommand
+/// at all, and answers `am`'s invocation with `unknown shorthand flag: 'f'`. That is a baffling
+/// message for "your podman is too old".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provider {
+    /// The argv prefix: `["podman", "compose"]`, or `["docker-compose"]` for the standalone.
+    argv: Vec<String>,
+    /// Environment the provider needs, which is how a standalone Compose is pointed at podman.
+    env: Vec<(String, String)>,
+}
+
+/// Find a usable Compose.
+///
+/// Two are accepted, and they are the same implementation: Compose v2 as a runtime subcommand,
+/// or as a standalone `docker-compose` binary. This mirrors what `podman compose` does
+/// internally — it delegates to exactly this binary.
+///
+/// `podman-compose` is deliberately **not** accepted. It is a separate implementation with no
+/// `config` subcommand at all, and `config --format json` is what lets `am` resolve a compose
+/// file without carrying a YAML parser. Selecting it would fail later and less clearly.
+pub fn provider(runtime_bin: &Path) -> Result<Provider> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Provider>>>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(found) = map.get(runtime_bin) {
+            return found.clone().ok_or_else(|| no_provider(runtime_bin));
+        }
+    }
+
+    let resolved = resolve_provider(runtime_bin);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(runtime_bin.to_path_buf(), resolved.clone());
+    }
+    resolved.ok_or_else(|| no_provider(runtime_bin))
+}
+
+fn resolve_provider(runtime_bin: &Path) -> Option<Provider> {
+    let subcommand = vec![runtime_bin.to_string_lossy().into_owned(), "compose".to_string()];
+    if usable(&subcommand) {
+        return Some(Provider { argv: subcommand, env: Vec::new() });
+    }
+
+    let standalone = vec!["docker-compose".to_string()];
+    if usable(&standalone) {
+        // A standalone Compose talks to a Docker API. Under podman that is podman's own socket,
+        // which podman would have pointed it at had it been new enough to do this itself.
+        let env = if is_podman(runtime_bin) {
+            podman_socket(runtime_bin)
+                .map(|socket| vec![("DOCKER_HOST".to_string(), format!("unix://{socket}"))])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        return Some(Provider { argv: standalone, env });
+    }
+    None
+}
+
+/// Whether an argv prefix answers `version` — the cheapest question Compose can be asked.
+fn usable(argv: &[String]) -> bool {
+    let mut cmd = command(argv);
+    cmd.arg("version");
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn is_podman(runtime_bin: &Path) -> bool {
+    runtime_bin
+        .file_stem()
+        .map(|name| name.to_string_lossy().contains("podman"))
+        .unwrap_or(false)
+}
+
+/// Ask podman where its API socket is, rather than guessing at a path that varies by rootless,
+/// root, and machine setups.
+fn podman_socket(runtime_bin: &Path) -> Option<String> {
+    if std::env::var_os("DOCKER_HOST").is_some() {
+        // Already pointed somewhere deliberately; overriding that would be presumptuous.
+        return None;
+    }
+    let out = std::process::Command::new(runtime_bin)
+        .args(["info", "--format", "{{.Host.RemoteSocket.Path}}"])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !path.is_empty()).then_some(path)
+}
+
+fn no_provider(runtime_bin: &Path) -> anyhow::Error {
+    let runtime = runtime_bin.file_stem().unwrap_or_default().to_string_lossy();
+    AmError::ContainerError(format!(
+        "this devcontainer uses dockerComposeFile, but no Docker Compose was found\n\
+         `{runtime} compose` is unavailable — podman only grew it in 4.7 — and there is no \
+         `docker-compose` on PATH either\n\
+         Install Docker Compose v2. podman-compose will not do: it has no `config` command, \
+         which am needs to read the compose file"
+    ))
+    .into()
+}
+
+/// The full argv for a Compose invocation.
+fn compose_args(provider: &Provider, files: &[PathBuf], project: &str) -> Vec<String> {
+    let mut args = provider.argv.clone();
     for file in files {
         args.push("-f".to_string());
         args.push(file.to_string_lossy().into_owned());
@@ -103,11 +215,12 @@ fn all_files(compose: &SessionCompose) -> Vec<PathBuf> {
 /// This is what keeps a YAML parser out of `am`: interpolation, `extends`, anchors and merge
 /// keys are all applied by the tool that owns the format.
 pub fn resolved_config(runtime_bin: &Path, files: &[PathBuf]) -> Result<Value> {
-    let mut args = compose_args(runtime_bin, files, "am-config-probe");
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, files, "am-config-probe");
     args.push("config".to_string());
     args.push("--format".to_string());
     args.push("json".to_string());
-    let out = run_built_command_output(command(&args), AmError::ContainerError)
+    let out = run_built_command_output(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "resolving the compose file".to_string())?;
     serde_json::from_str(&out).with_context(|| "parsing the resolved compose config".to_string())
 }
@@ -383,9 +496,10 @@ pub fn write_override(dir: &Path, document: &Value) -> Result<PathBuf> {
 
 /// Bring the project up in the background.
 pub fn up(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
-    let mut args = compose_args(runtime_bin, &all_files(compose), &compose.project);
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, &all_files(compose), &compose.project);
     args.extend(["up".to_string(), "-d".to_string()]);
-    run_built_command(command(&args), AmError::ContainerError)
+    run_built_command(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "starting the compose project")
 }
 
@@ -395,15 +509,17 @@ pub fn up(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
 /// volumes behind would accumulate state across `am destroy`/`am start` cycles that the user
 /// never asked to keep.
 pub fn down(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
-    let mut args = compose_args(runtime_bin, &all_files(compose), &compose.project);
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, &all_files(compose), &compose.project);
     args.extend(["down".to_string(), "-v".to_string()]);
-    run_built_command(command(&args), AmError::ContainerError)
+    run_built_command(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "stopping the compose project")
 }
 
 /// Run a shell snippet inside the agent's service, for `postAttachCommand`.
 pub fn exec_script(runtime_bin: &Path, compose: &SessionCompose, script: &str) -> Result<()> {
-    let mut args = compose_args(runtime_bin, &all_files(compose), &compose.project);
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, &all_files(compose), &compose.project);
     args.extend([
         "exec".to_string(),
         compose.service.clone(),
@@ -411,7 +527,7 @@ pub fn exec_script(runtime_bin: &Path, compose: &SessionCompose, script: &str) -
         "-c".to_string(),
         script.to_string(),
     ]);
-    run_built_command(command(&args), AmError::ContainerError)
+    run_built_command(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "running postAttachCommand in the compose service")
 }
 
@@ -420,18 +536,38 @@ pub fn exec_command(
     runtime_bin: &Path,
     compose: &SessionCompose,
     agent_cmd: &[String],
-) -> Vec<String> {
-    let mut args = compose_args(runtime_bin, &all_files(compose), &compose.project);
+) -> Result<Vec<String>> {
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, &all_files(compose), &compose.project);
     args.push("exec".to_string());
     args.push(compose.service.clone());
     args.extend(agent_cmd.iter().cloned());
-    args
+    // The pane runs this itself, so any environment the provider needs has to be inline.
+    let mut prefixed: Vec<String> = provider
+        .env
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    if prefixed.is_empty() {
+        return Ok(args);
+    }
+    prefixed.insert(0, "env".to_string());
+    prefixed.extend(args);
+    Ok(prefixed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::container::RuntimeKind;
+
+    /// A provider standing in for `docker compose`, so the argv tests need no real binary.
+    fn subcommand_provider() -> Provider {
+        Provider {
+            argv: vec!["/usr/bin/docker".to_string(), "compose".to_string()],
+            env: Vec::new(),
+        }
+    }
 
     fn runtime() -> ContainerRuntime {
         ContainerRuntime { kind: RuntimeKind::Docker, bin: PathBuf::from("/usr/bin/docker") }
@@ -446,6 +582,95 @@ mod tests {
         }
     }
 
+    /// A stand-in runtime binary. `body` decides how it answers `compose version`.
+    #[cfg(unix)]
+    fn fake_runtime(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, PermissionsExt::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_with_a_compose_subcommand_is_used_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_runtime(tmp.path(), "docker-ok", r#"[ "$1" = compose ] && exit 0; exit 1"#);
+        let found = resolve_provider(&bin).expect("a provider");
+        assert_eq!(found.argv, vec![bin.to_string_lossy().to_string(), "compose".to_string()]);
+        assert!(found.env.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_podman_without_compose_reports_what_to_install() {
+        // podman 4.3 — Debian 12, Ubuntu 22.04 — has no `compose` subcommand at all, and
+        // answers am's invocation with `unknown shorthand flag: 'f'`. Without this the user
+        // gets that message and no idea what it means.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_runtime(tmp.path(), "podman-old", "echo 'unknown command' >&2; exit 125");
+
+        // PATH is emptied so the standalone fallback cannot be found either.
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", tmp.path());
+        let resolved = resolve_provider(&bin);
+        std::env::set_var("PATH", old_path);
+
+        assert!(resolved.is_none());
+        let err = no_provider(&bin).to_string();
+        assert!(err.contains("podman only grew it in 4.7"), "must explain why: {err}");
+        assert!(err.contains("Docker Compose v2"), "must say what to install: {err}");
+        assert!(err.contains("podman-compose will not do"), "must rule out the wrong fix: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_compose_is_the_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fake_runtime(tmp.path(), "docker-old", "exit 1");
+        fake_runtime(tmp.path(), "docker-compose", "exit 0");
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", tmp.path());
+        let resolved = resolve_provider(&runtime);
+        std::env::set_var("PATH", old_path);
+
+        assert_eq!(resolved.expect("a provider").argv, vec!["docker-compose".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_compose_under_podman_is_pointed_at_podmans_socket() {
+        // Otherwise it talks to a Docker daemon that is not there. This is what podman itself
+        // does for its provider; am has to do it when podman is too old to.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = fake_runtime(
+            tmp.path(),
+            "podman",
+            r#"[ "$1" = info ] && { echo /run/user/1000/podman/podman.sock; exit 0; }; exit 1"#,
+        );
+        fake_runtime(tmp.path(), "docker-compose", "exit 0");
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_host = std::env::var("DOCKER_HOST").ok();
+        std::env::set_var("PATH", tmp.path());
+        std::env::remove_var("DOCKER_HOST");
+        let resolved = resolve_provider(&runtime).expect("a provider");
+        std::env::set_var("PATH", old_path);
+        if let Some(v) = old_host {
+            std::env::set_var("DOCKER_HOST", v);
+        }
+
+        assert_eq!(
+            resolved.env,
+            vec![(
+                "DOCKER_HOST".to_string(),
+                "unix:///run/user/1000/podman/podman.sock".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn project_names_are_prefixed_and_compose_safe() {
         assert_eq!(project_name("my-feature"), "am-my-feature");
@@ -456,7 +681,7 @@ mod tests {
     #[test]
     fn the_override_is_layered_last() {
         // The repo's own files must come first, so am's contribution wins on conflict.
-        let args = compose_args(Path::new("/usr/bin/docker"), &all_files(&compose()), "am-feat");
+        let args = compose_args(&subcommand_provider(), &all_files(&compose()), "am-feat");
         let joined = args.join(" ");
         let repo = joined.find("docker-compose.yml").unwrap();
         let ours = joined.find("compose-override.yml").unwrap();
@@ -645,12 +870,12 @@ mod tests {
 
     #[test]
     fn exec_runs_the_agent_in_the_named_service() {
-        let cmd = exec_command(
-            Path::new("/usr/bin/docker"),
-            &compose(),
-            &["claude".to_string(), "--continue".to_string()],
-        );
-        let joined = cmd.join(" ");
+        let mut args =
+            compose_args(&subcommand_provider(), &all_files(&compose()), "am-feat");
+        args.push("exec".to_string());
+        args.push("app".to_string());
+        args.extend(["claude".to_string(), "--continue".to_string()]);
+        let joined = args.join(" ");
         assert!(joined.contains("compose"));
         assert!(joined.ends_with("exec app claude --continue"), "got: {joined}");
     }

@@ -20,6 +20,15 @@ whole project up, and runs the agent inside that service — so the database or 
 depends on is there, the way it would be in any other editor. `am destroy` takes the project
 down again.
 
+Compose itself has to be available. `am` uses `<runtime> compose` when the runtime provides it —
+Docker always does, podman from **4.7** — and otherwise falls back to a standalone
+`docker-compose` binary, pointing it at podman's socket when that is the runtime. This is what
+`podman compose` does internally, so `am` is doing what a newer podman would have done for it.
+
+`podman-compose` is not used: it is a different implementation with no `config` command, which is
+what `am` needs to read the compose file without carrying a YAML parser. `am doctor` reports
+whether a usable Compose was found.
+
 Three things to know about compose sessions:
 
 - The config **must** name a `service`. Without it there is nothing to say which container the

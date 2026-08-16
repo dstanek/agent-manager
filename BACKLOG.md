@@ -605,8 +605,13 @@ Follow-ups the native builder left behind:
       differential test against the reference CLI, and the generated override is validated
       against real `docker compose config`, but no test brings a real project up and execs an
       agent into it — that needs a runtime, a tmux session and a live agent at once.
-- [ ] **`podman compose` is untested.** The code shells out to `<runtime> compose`, which
-      podman 4+ provides, but the dev container has no podman to check it against.
+- [x] **podman compose.** Done 2026-08-16, and it was broken rather than merely untested:
+      podman only grew the `compose` subcommand in 4.7, so on the podman Debian 12 and Ubuntu
+      22.04 ship, every compose session failed with `unknown shorthand flag: 'f'`. `am` now
+      resolves a provider — `<runtime> compose`, else a standalone `docker-compose` pointed at
+      podman's socket, which is what `podman compose` does internally. `podman-compose` is
+      excluded: v1.0.3 has no `config` subcommand, which `am` needs to read the compose file.
+      `am doctor` reports whether a usable Compose was found.
 - [ ] **A compose session whose service exits** leaves the project up until `am destroy`.
 - [ ] **`postAttachCommand` runs once per `am attach` invocation**, not once per human attach —
       tmux has no "user looked at this window" event. Idempotent hooks are unaffected.
