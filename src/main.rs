@@ -1168,17 +1168,24 @@ fn plan_devcontainer(
     // the image's own ENTRYPOINT to launch it — so they have to be chained explicitly.
     let (hooks, hooks_ran) =
         devcontainer::startup_commands(&resolved, cfg.devcontainer.skip_lifecycle);
-    let mut chain = trusted.entrypoints.clone();
-    chain.extend(hooks);
-    // Starting a session is also attaching to it, so postAttachCommand belongs at the end of the
-    // chain. `am attach` reaches the same hook a second way — see `run_post_attach` — for the
-    // case where the container is already up and nothing is being recreated.
-    chain.extend(devcontainer::attach_commands(&resolved, cfg.devcontainer.skip_lifecycle));
+    // Two groups, because they run as different users. Feature entrypoints belong to the
+    // container user; the lifecycle hooks belong to `remoteUser`, which is what the reference
+    // CLI does and what `postCreateCommand: sudo …` idioms assume.
+    let mut user_commands = hooks;
+    // Starting a session is also attaching to it, so postAttachCommand belongs at the end.
+    // `am attach` reaches the same hook a second way — see `run_post_attach` — for the case
+    // where the container is already up and nothing is being recreated.
+    user_commands.extend(devcontainer::attach_commands(
+        &resolved,
+        cfg.devcontainer.skip_lifecycle,
+    ));
     let agent_cmd = container::compose_entrypoint_command(
-        &chain,
+        &trusted.entrypoints,
+        &user_commands,
         &agent_command(agent_name, agent, auto, resume),
         trusted.user_env_probe,
         &container::protected_env_names(&mounts, &cfg.container.env, &agent_auth.env, &trusted),
+        trusted.drop_to.as_deref(),
     );
 
     // A compose config is a whole project rather than one container, so it takes the other run

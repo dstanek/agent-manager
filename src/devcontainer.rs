@@ -1223,6 +1223,17 @@ pub fn apply_trust(
         run_args: Vec::new(),
         workdir: resolved.workspace_folder.clone(),
         entrypoints: resolved.entrypoints.clone(),
+        // A Feature entrypoint runs as the container user, so when there is one the container
+        // starts as that user and the agent is dropped to `remoteUser` afterwards. With no
+        // entrypoint there is nothing needing elevation, so the container runs as the remote
+        // user directly — which is observationally the same and keeps the common path simple.
+        drop_to: if resolved.entrypoints.is_empty() {
+            None
+        } else {
+            resolved.remote_user.clone().filter(|remote| {
+                resolved.container_user.as_deref() != Some(remote.as_str())
+            })
+        },
         // Defaults to true per the spec: on Linux the container user's UID/GID follow the
         // host's, which is what keeps a bind-mounted worktree writable.
         update_remote_user_uid: resolved.update_remote_user_uid.unwrap_or(true),
@@ -1231,10 +1242,14 @@ pub fn apply_trust(
         // reason the property exists.
         user_env_probe: UserEnvProbe::parse(resolved.user_env_probe.as_deref()),
         ports: resolved.forward_ports.clone(),
-        user: resolved
-            .remote_user
-            .clone()
-            .or_else(|| resolved.container_user.clone()),
+        // With an entrypoint to run, this is who the *container* starts as — the container
+        // user, or the image's own default when the config names none. Otherwise it is the
+        // remote user, as before.
+        user: if resolved.entrypoints.is_empty() {
+            resolved.remote_user.clone().or_else(|| resolved.container_user.clone())
+        } else {
+            resolved.container_user.clone()
+        },
     };
 
     if allow {
