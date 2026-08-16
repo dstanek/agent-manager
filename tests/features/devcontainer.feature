@@ -184,6 +184,18 @@ Feature: Dev container sessions
     Then the command succeeds
     And the mock podman log does not contain "exec"
 
+  # `onAutoForward: "ignore"` is the one part of portsAttributes that is not about an editor: it
+  # asks that the port not be forwarded, and am's forwarding is publishing it.
+  Scenario: a port portsAttributes asks to ignore is not published
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config that forwards a port it asks to be ignored
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    # The `podman run` line is what tmux is told to run in the agent pane, so that is where the
+    # published ports show up.
+    And the mock tmux log contains "127.0.0.1:8080:8080"
+    And the mock tmux log does not contain "127.0.0.1:3000:3000"
+
   Scenario: image mode ignores a devcontainer config entirely
     Given I am using am's own devcontainer builder
     And the repo has a devcontainer config

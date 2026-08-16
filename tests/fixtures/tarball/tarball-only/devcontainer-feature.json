@@ -1,0 +1,6 @@
+{
+  "id": "tarball-only",
+  "version": "1.0.0",
+  "name": "Tarball Only",
+  "description": "A Feature served as a plain HTTPS tarball rather than from a registry."
+}

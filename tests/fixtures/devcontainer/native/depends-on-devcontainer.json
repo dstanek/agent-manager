@@ -1,0 +1,4 @@
+{
+  "image": "debian:bookworm-slim",
+  "features": { "localhost:5000/amtest/needs-base:1.0.0": {} }
+}

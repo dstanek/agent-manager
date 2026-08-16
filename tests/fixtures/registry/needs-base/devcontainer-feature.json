@@ -1,0 +1,7 @@
+{
+  "id": "needs-base",
+  "version": "1.0.0",
+  "name": "Needs base",
+  "description": "Declares dependsOn, which nothing in the public registries does.",
+  "dependsOn": { "localhost:5000/amtest/base:1.0.0": {} }
+}

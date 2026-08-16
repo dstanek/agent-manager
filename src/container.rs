@@ -940,6 +940,51 @@ pub fn build_run_command(
     cmd
 }
 
+/// Drop published ports whose host binding is already taken, returning what was dropped.
+///
+/// Two sessions on the same repo forward the same ports, because they come from the same
+/// `devcontainer.json` — so the second one hits `bind: address already in use`. Without this the
+/// failure arrives from `podman run`, after the worktree, the image and the tmux window are all
+/// built, and takes the whole session down: a config's *convenience* property stops the agent
+/// from starting at all. Dropping the port and saying so keeps the session, which is what the
+/// user asked for; the port is still reachable in the first session, which is where whatever is
+/// listening on it actually runs.
+///
+/// A spec with no host port (`"8080"` alone, from `appPort`) asks the runtime to pick a free one,
+/// so there is nothing to check and it is kept as-is.
+pub fn drop_busy_ports(ports: &mut Vec<crate::devcontainer::ForwardedPort>) -> Vec<u16> {
+    let mut dropped = Vec::new();
+    ports.retain(|port| {
+        let Some(spec) = port.spec() else { return true };
+        let Some((addr, number)) = host_binding(&spec) else { return true };
+        // Only a genuine collision drops the port. Any other failure — an address this host
+        // cannot bind, a permission error — is something we cannot interpret, and the runtime
+        // deserves the chance to try it rather than am second-guessing the config.
+        match std::net::TcpListener::bind((addr.as_str(), number)) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                dropped.push(number);
+                false
+            }
+            _ => true,
+        }
+    });
+    dropped
+}
+
+/// The host address and port a publish spec binds, or `None` when the runtime picks the port.
+///
+/// `-p` takes `[ip:][hostPort:]containerPort`. Only the host half matters here.
+fn host_binding(spec: &str) -> Option<(String, u16)> {
+    let parts: Vec<&str> = spec.rsplitn(3, ':').collect();
+    match parts.as_slice() {
+        // "containerPort" — the runtime assigns the host port, so nothing can collide.
+        [_] => None,
+        [_, host] => Some(("0.0.0.0".to_string(), host.parse().ok()?)),
+        [_, host, ip] => Some((ip.to_string(), host.parse().ok()?)),
+        _ => None,
+    }
+}
+
 /// Compose feature entrypoints and the agent into a single container command.
 ///
 /// Features contribute entrypoint scripts that must run before the agent — starting a
@@ -990,7 +1035,14 @@ pub fn compose_entrypoint_command(
     // What the *container* user runs: the Feature entrypoints, then a drop to the remote user
     // for everything above. `su` rather than a second `--user`, because there is only one
     // command — and `exec` so the agent keeps the pane's tty and PID 1's signals.
+    // The entrypoints stay `&&`-chained so one failing stops the session. The UID alignment is
+    // a separate statement on its own line: it is best-effort, and chaining it would either
+    // gate the entrypoints on it or rely on `||`/`&&` precedence to avoid doing so.
     let mut script = entrypoints.join(" && ");
+    if let Some(align) = drop_to.and_then(align_uid_script) {
+        script = if script.is_empty() { align } else { format!("{align}\n{script}") };
+    }
+
     let dropped = match drop_to {
         Some(user) if !user_script.is_empty() => {
             format!("exec su {} -s /bin/sh -c {}", shell_quote(user), shell_quote(&user_script))
@@ -1043,11 +1095,44 @@ pub fn protected_env_names(
     names
 }
 
+/// Give the user we are about to drop to the host's UID, when it does not already have it.
+///
+/// Dropping privileges reintroduces the problem `updateRemoteUserUID` exists to solve: the
+/// container has to start as the container user to run a Feature entrypoint, so the numeric
+/// `--user` mapping cannot apply, and `su vscode` lands on whatever UID the image gave that
+/// user — typically 1000. A host user who is not 1000 then cannot write their own worktree.
+///
+/// The reference CLI solves this by *rebuilding the image* with the UID changed. Doing it at
+/// container start instead keeps one image per config rather than one per config-and-user, at
+/// the cost of running on every start — which is cheap, because `usermod -u` rewrites a passwd
+/// entry and re-owns a home directory that holds dotfiles.
+///
+/// Best-effort throughout: an image without `usermod` simply keeps the UID it had, which is the
+/// behaviour this replaces. It must never take down a session that would otherwise have run.
+fn align_uid_script(user: &str) -> Option<String> {
+    let (uid, gid) = get_host_uid_gid()?;
+    let user = shell_quote(user);
+    Some(format!(
+        "{{ [ \"$(id -u {user} 2>/dev/null)\" = {uid} ] \
+         || {{ command -v usermod >/dev/null 2>&1 \
+         && groupmod -g {gid} {user} >/dev/null 2>&1; \
+         usermod -u {uid} -g {gid} {user} >/dev/null 2>&1; }}; }} || true"
+    ))
+}
+
 /// The shell snippet that runs `userEnvProbe` and applies what it finds.
 ///
 /// Mirrors the reference CLI: resolve the user's login shell, run it with the mode's flags, and
-/// read `/proc/self/environ` — NUL-separated, so a value containing a newline survives the trip
-/// out of the shell even though the loop below is line-based.
+/// read `/proc/self/environ`, which is NUL-separated.
+///
+/// The loop that applies the result is line-based, because POSIX `sh` has no way to iterate
+/// NUL-delimited records. So the single `tr` swaps the two delimiters at once: real newlines
+/// inside values become `\001`, and the NULs between variables become newlines. One variable is
+/// then exactly one line no matter what it contains, and the newlines are put back per value
+/// before exporting. Without this a value like a multi-line `LS_COLORS` or a PEM key would be
+/// truncated at its first newline — the remainder, having no `=`, would look like a malformed
+/// entry and be dropped. (A value containing a literal `\001` would be corrupted instead; nothing
+/// puts one in the environment, and losing an SOH beats losing a private key's body.)
 ///
 /// Two deliberate differences from a naive "run the agent under a login shell". The probe is a
 /// throwaway process, so a `.bashrc` that prints a banner or starts a job-control message does
@@ -1074,13 +1159,16 @@ fn user_env_probe_script(
     Some(format!(
         "_am_shell=$(getent passwd \"$(id -u)\" 2>/dev/null | cut -d: -f7)\n\
          [ -x \"$_am_shell\" ] || _am_shell=/bin/sh\n\
-         _am_env=$(\"$_am_shell\" {flags} 'cat /proc/self/environ' 2>/dev/null | tr '\\0' '\\n')\n\
+         _am_env=$(\"$_am_shell\" {flags} 'cat /proc/self/environ' 2>/dev/null \
+         | tr '\\n\\000' '\\001\\n')\n\
          _am_ifs=$IFS; IFS='\n'\n\
          for _am_line in $_am_env; do\n\
          {guard}\
-         \x20   case \"$_am_line\" in *=*) export \"$_am_line\" ;; esac\n\
+         \x20   case \"$_am_line\" in *=*) ;; *) continue ;; esac\n\
+         \x20   _am_val=$(printf '%s' \"${{_am_line#*=}}\" | tr '\\001' '\\n'; printf x)\n\
+         \x20   export \"${{_am_line%%=*}}=${{_am_val%x}}\" 2>/dev/null || true\n\
          done\n\
-         IFS=$_am_ifs; unset _am_shell _am_env _am_ifs _am_line"
+         IFS=$_am_ifs; unset _am_shell _am_env _am_ifs _am_line _am_val"
     ))
 }
 
@@ -1502,6 +1590,52 @@ mod tests {
         let joined = cmd.join(" ");
         assert!(joined.contains("-p 127.0.0.1:3000:3000"), "got: {joined}");
         assert!(!joined.contains("5432"), "a service port cannot be published here: {joined}");
+    }
+
+    /// The collision this exists for: a second session on the same repo forwards the same ports
+    /// as the first, and `podman run` refuses to bind them — after everything else about the
+    /// session has already been built.
+    #[test]
+    fn a_port_already_in_use_is_dropped_rather_than_failing_the_session() {
+        use crate::devcontainer::ForwardedPort;
+        // Stand in for the first session's published port. Bound on loopback, which is where
+        // `forwardPorts` publishes.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let free = {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        let mut ports = vec![
+            ForwardedPort::Own(taken),
+            ForwardedPort::Own(free),
+            // No host port: the runtime picks one, so there is nothing to collide with.
+            ForwardedPort::Published("9999".to_string()),
+            ForwardedPort::Service { service: "db".into(), port: taken },
+        ];
+        let dropped = drop_busy_ports(&mut ports);
+
+        assert_eq!(dropped, vec![taken]);
+        assert_eq!(
+            ports,
+            vec![
+                ForwardedPort::Own(free),
+                ForwardedPort::Published("9999".to_string()),
+                ForwardedPort::Service { service: "db".into(), port: taken },
+            ],
+            "only the colliding published port should have been dropped"
+        );
+    }
+
+    #[test]
+    fn the_host_half_of_a_publish_spec_is_read_the_way_the_runtime_reads_it() {
+        assert_eq!(host_binding("127.0.0.1:3000:3000"), Some(("127.0.0.1".to_string(), 3000)));
+        assert_eq!(host_binding("8080:80"), Some(("0.0.0.0".to_string(), 8080)));
+        // The runtime assigns the host port, so there is nothing to preflight.
+        assert_eq!(host_binding("80"), None);
+        // A range is not a port; leave it to the runtime rather than guess.
+        assert_eq!(host_binding("8000-8010:8000-8010"), None);
     }
 
     #[test]
@@ -2158,13 +2292,56 @@ mod tests {
             Some("vscode"),
         );
         let script = &cmd[2];
-        // The entrypoint comes first, unwrapped — it is the container user's.
-        assert!(script.starts_with("/usr/local/share/docker-init.sh && "), "got: {script}");
+        // The entrypoint runs unwrapped, before the drop — it is the container user's.
+        let entry_at = script.find("/usr/local/share/docker-init.sh").unwrap();
+        let drop_at = script.find("exec su ").unwrap();
+        assert!(entry_at < drop_at, "got: {script}");
         // Everything else is inside the drop.
         assert!(script.contains("exec su vscode -s /bin/sh -c "), "got: {script}");
         let dropped = script.split("-c ").nth(1).unwrap();
         assert!(dropped.contains("echo hook"), "hooks belong to the remote user: {script}");
         assert!(dropped.contains("exec claude"), "got: {script}");
+    }
+
+    #[test]
+    fn dropping_privileges_realigns_the_users_uid_with_the_hosts() {
+        // Dropping reintroduces exactly what `updateRemoteUserUID` exists to prevent: `su
+        // vscode` lands on whatever UID the image gave that user, so a host user who is not
+        // that UID cannot write their own worktree. The reference CLI rebuilds the image to
+        // fix this; doing it at container start keeps one image per config instead of one per
+        // config-and-user.
+        let cmd = compose_entrypoint_command(
+            &["/init.sh".to_string()],
+            &[],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            Some("vscode"),
+        );
+        let script = &cmd[2];
+        if let Some((uid, _)) = get_host_uid_gid() {
+            assert!(script.contains(&format!("usermod -u {uid}")), "got: {script}");
+            // Skipped when the UID already matches, so the common case costs nothing.
+            assert!(script.contains(&format!(r#"[ "$(id -u vscode 2>/dev/null)" = {uid} ]"#)));
+            // Best-effort: an image without usermod keeps the UID it had rather than failing.
+            assert!(script.contains("|| true"), "got: {script}");
+            let align_at = script.find("usermod").unwrap();
+            let drop_at = script.find("exec su ").unwrap();
+            assert!(align_at < drop_at, "alignment must precede the drop: {script}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_realigned_without_a_drop() {
+        let cmd = compose_entrypoint_command(
+            &[],
+            &[],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            None,
+        );
+        assert!(!cmd.join(" ").contains("usermod"));
     }
 
     #[test]
@@ -2192,7 +2369,7 @@ mod tests {
             &[],
             Some("vscode"),
         );
-        assert!(cmd[2].starts_with("/init.sh && exec su "), "got: {}", cmd[2]);
+        assert!(cmd[2].contains("/init.sh && exec su "), "got: {}", cmd[2]);
     }
 
     #[test]
@@ -2328,6 +2505,52 @@ mod tests {
             env.contains("AM_KEEP=original"),
             "the probe overwrote a variable am set deliberately: {env}"
         );
+    }
+
+    /// A value with a newline in it is not exotic — `LS_COLORS` from some dotfile frameworks, a
+    /// PEM-formatted key, a multi-line prompt. The probe reads a NUL-separated environ precisely
+    /// so these survive; a line-based loop that splits on newline anyway would truncate the value
+    /// at its first line and silently drop the rest.
+    #[cfg(unix)]
+    #[test]
+    fn a_probed_value_containing_newlines_arrives_whole() {
+        let cmd = compose_entrypoint_command(
+            &[],
+            &[],
+            &["env".to_string()],
+            UserEnvProbe::LoginShell,
+            &[],
+            None,
+        );
+        let tmp = TempDir::new().unwrap();
+        let fake = tmp.path().join("fakeshell");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nAM_MULTI='first\nsecond\nthird' AM_AFTER=yes /usr/bin/env -0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let script = cmd[2].replace(
+            "_am_shell=$(getent passwd \"$(id -u)\" 2>/dev/null | cut -d: -f7)",
+            &format!("_am_shell={}", fake.display()),
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("running the generated script");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let env = String::from_utf8_lossy(&out.stdout);
+
+        assert!(
+            env.contains("AM_MULTI=first\nsecond\nthird"),
+            "a multi-line value was truncated: {env}"
+        );
+        // The variable that followed it in environ must still have made it through: a split value
+        // also derails the parse of everything after it.
+        assert!(env.contains("AM_AFTER=yes"), "the variable after a multi-line one was lost: {env}");
     }
 
     #[test]
