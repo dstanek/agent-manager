@@ -201,16 +201,56 @@ their *same absolute host paths* inside the container, so the relative path in a
 workspace's `.jj/repo` and the absolute `gitdir:` in a git worktree's `.git` file both
 resolve correctly. Nothing about your VCS choice needs special handling.
 
+## The lockfile
+
+`am` reads and writes `.devcontainer/devcontainer-lock.json`, the same file the Dev Containers
+tooling uses. It records the exact artifact each Feature resolved to:
+
+```json
+{
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "1.3.8",
+      "resolved": "ghcr.io/devcontainers/features/git@sha256:fd75…",
+      "integrity": "sha256:fd75…"
+    }
+  }
+}
+```
+
+It does two things. **Pinning**: `…/git:1` is a moving tag, so without a lockfile two people
+building the same config can get different Features; with one, `am` fetches the recorded digest.
+**Rebuild detection**: a Feature from a registry cannot be hashed without asking the registry,
+and doing that on every `am start` would defeat the point of caching images — so `am` hashes the
+lockfile instead. Move the pin and the image name changes and the next `am start` rebuilds.
+
+Commit it. It belongs to the repo the way any lockfile does, and `am` writes it into the session
+worktree during a build, so it will show up as a change there.
+
+Two things to know:
+
+- **Adding a lockfile to a repo that had none renames the image once**, so the next `am start`
+  rebuilds. It is mostly a layer-cache hit, and the alternative is never noticing a moved tag.
+- **A tarball Feature whose bytes changed is an error, not a silent update.** `integrity` is the
+  only way to detect that, and quietly installing different code than the lockfile records would
+  make the file worse than useless. Delete the entry to accept the new contents.
+
+Local Features are not recorded — the spec excludes them, and `am` hashes their files directly,
+which is both cheaper and exact.
+
 ## Rebuilding
 
 ```sh
 am start my-feature --rebuild
 ```
 
-The config hash covers the `devcontainer.json` bytes, the referenced Dockerfile, and any
-injected Features — but not other files in the build context. Hashing an arbitrary context is
-unbounded work (`"context": ".."` means the whole repo), so if you edit a file your Dockerfile
-`COPY`s, use `--rebuild`.
+The config hash covers the `devcontainer.json` bytes, the referenced Dockerfile, any injected
+Features, the contents of any Feature vendored in the repo, and the lockfile — so editing a
+vendored Feature or moving a pin rebuilds on its own.
+
+It does not cover other files in the build context. Hashing an arbitrary context is unbounded
+work (`"context": ".."` means the whole repo), so if you edit a file your Dockerfile `COPY`s,
+use `--rebuild`.
 
 ## Not supported yet
 

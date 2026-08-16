@@ -29,6 +29,7 @@ use crate::color;
 
 use crate::error::AmError;
 
+pub mod lock;
 pub mod native;
 
 // Path handling strategy: keep Path/PathBuf internally, convert at argv boundaries.
@@ -789,6 +790,12 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
         hasher.update(id.as_bytes());
         hash_dir(&mut hasher, &base.join(&id));
     }
+
+    // Registry and tarball Features reach the hash through the lockfile. Hashing them
+    // directly would mean a network round trip per `am start` just to discover that nothing
+    // moved; the lockfile records what they last resolved to, so a moved tag changes this file,
+    // which changes the image name, which rebuilds. Nothing is fetched on the fast path.
+    hasher.update(lock::load(config_path).canonical().as_bytes());
 
     // Sorted so that config ordering, which carries no meaning, cannot change the name.
     let mut features = injected.to_vec();
@@ -1604,6 +1611,61 @@ mod tests {
         let before = config_hash(&config, &[]).unwrap();
         std::fs::write(dir.join("vendored/helper.sh"), "#!/bin/sh\n").unwrap();
         assert_ne!(before, config_hash(&config, &[]).unwrap(), "file names count too");
+    }
+
+    #[test]
+    fn a_moved_lockfile_entry_changes_the_image_name() {
+        // The whole point of hashing the lockfile: a registry Feature cannot be hashed by
+        // content without a network round trip per `am start`, so the record of what it last
+        // resolved to stands in for it. Move the pin, get a different image, rebuild.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(
+            &config,
+            r#"{"image":"debian","features":{"ghcr.io/devcontainers/features/git:1":{}}}"#,
+        )
+        .unwrap();
+        let lockfile = dir.join("devcontainer-lock.json");
+        let write_lock = |digest: &str| {
+            std::fs::write(
+                &lockfile,
+                format!(
+                    r#"{{"features":{{"ghcr.io/devcontainers/features/git:1":{{
+                        "version":"1.3.8",
+                        "resolved":"ghcr.io/devcontainers/features/git@{digest}",
+                        "integrity":"{digest}"}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        write_lock("sha256:aaa");
+        let pinned_old = config_hash(&config, &[]).unwrap();
+        write_lock("sha256:bbb");
+        let pinned_new = config_hash(&config, &[]).unwrap();
+        assert_ne!(pinned_old, pinned_new, "a moved pin must produce a new image name");
+    }
+
+    #[test]
+    fn adopting_a_lockfile_changes_the_image_name_once() {
+        // Adding a lockfile to a repo that had none renames the image, so the next `am start`
+        // rebuilds. That is a one-time cost and mostly a layer-cache hit; the alternative is
+        // never noticing a moved tag at all.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(&config, r#"{"image":"debian","features":{}}"#).unwrap();
+
+        let unlocked = config_hash(&config, &[]).unwrap();
+        std::fs::write(
+            dir.join("devcontainer-lock.json"),
+            r#"{"features":{"a":{"resolved":"a@sha256:1","integrity":"sha256:1"}}}"#,
+        )
+        .unwrap();
+        assert_ne!(unlocked, config_hash(&config, &[]).unwrap());
     }
 
     #[test]
