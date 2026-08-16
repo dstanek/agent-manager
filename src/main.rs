@@ -1106,7 +1106,6 @@ fn plan_devcontainer(
                 injected: &injected,
                 no_cache: rebuild,
             },
-            cfg,
             &runtime.bin,
         )?;
     }

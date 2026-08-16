@@ -598,37 +598,6 @@ fn check_devcontainer_mode(
     // Whether the CLI matters at all depends on the builder *and* on this particular config:
     // under `auto`, a config am can build itself never touches Node, so reporting a missing
     // CLI as a failure would send the user to install something they do not need.
-    // Nothing but an explicit `builder = "cli"` reaches the CLI any more: there is no config
-    // shape `am` declines and the reference CLI accepts, so `auto` never delegates.
-    let needs_cli = cfg.devcontainer.builder == config::Builder::Cli;
-
-    let cli = devcontainer::find_cli(&cfg.devcontainer.cli);
-    match (&cli, needs_cli) {
-        (Ok(path), _) => {
-            let version = probe_version(path, "--version").unwrap_or_else(|| "unknown".to_string());
-            report.checks.push(Check::ok(
-                ENVIRONMENT,
-                "devcontainer CLI",
-                format!("{version} at {}", path.display()),
-            ));
-        }
-        (Err(_), true) => report.checks.push(Check::fail(
-            ENVIRONMENT,
-            "devcontainer CLI",
-            format!("'{}' not found on PATH", cfg.devcontainer.cli),
-            "npm install -g @devcontainers/cli (needs Node 20+), or set \
-             devcontainer.builder = \"auto\" to let am build it",
-        )),
-        (Err(_), false) => report.checks.push(Check::ok(
-            ENVIRONMENT,
-            "devcontainer CLI",
-            "not needed — am builds devcontainers itself".to_string(),
-        )),
-    }
-
-    // Node only matters if the CLI is what will run.
-    check_node(report, cli.is_ok() || !needs_cli);
-
     let json = match devcontainer::parse_config(config_path) {
         Ok(json) => json,
         Err(e) => {
@@ -687,39 +656,6 @@ fn check_devcontainer_mode(
         )),
     }
 }
-
-/// Node is only required to *build*; report accordingly.
-fn check_node(report: &mut Report, cli_present: bool) {
-    const MIN_MAJOR: u32 = 20;
-    match probe_version(Path::new("node"), "--version").and_then(|v| node_major(&v).map(|m| (v, m)))
-    {
-        Some((version, major)) if major >= MIN_MAJOR => report.checks.push(Check::ok(
-            ENVIRONMENT,
-            "node",
-            format!("{version} (>= {MIN_MAJOR} required)"),
-        )),
-        Some((version, _)) => report.checks.push(Check::fail(
-            ENVIRONMENT,
-            "node",
-            format!("{version} is too old — the devcontainer CLI needs {MIN_MAJOR} or newer"),
-            "upgrade Node, or set container.mode = \"image\"",
-        )),
-        None if cli_present => report.checks.push(Check::warn(
-            ENVIRONMENT,
-            "node",
-            "not found on PATH",
-            "the devcontainer CLI needs Node — if it is bundled with its own runtime this \
-             is fine, otherwise install Node 20+",
-        )),
-        None => report.checks.push(Check::warn(
-            ENVIRONMENT,
-            "node",
-            "not found on PATH",
-            "install Node 20+ to build devcontainer images",
-        )),
-    }
-}
-
 /// Constructs `am` will refuse or drop unless explicitly allowed.
 fn check_gated_constructs(report: &mut Report, cfg: &Config, json: &devcontainer::DevcontainerJson) {
     if cfg.devcontainer.allow_host_commands {
@@ -815,30 +751,6 @@ fn check_agent(report: &mut Report, agent_name: Option<&str>) {
         )),
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Run `<bin> <flag>` and return the first line of stdout, or `None` if it cannot run.
-fn probe_version(bin: &Path, flag: &str) -> Option<String> {
-    let output = std::process::Command::new(bin).arg(flag).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().next().map(|l| l.trim().to_string())
-}
-
-/// Parse the major version out of Node's `v22.23.2`.
-fn node_major(version: &str) -> Option<u32> {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
-}
-
 /// Multi-line errors carry a message and a hint; the report has its own hint column.
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or(text).trim().to_string()
@@ -1373,12 +1285,6 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    #[test]
-    fn node_major_parses_the_v_prefixed_form() {
-        assert_eq!(node_major("v22.23.2"), Some(22));
-        assert_eq!(node_major("20.1.0"), Some(20));
-        assert_eq!(node_major("not a version"), None);
-    }
 
     #[test]
     fn first_line_drops_the_hint_half_of_an_error() {

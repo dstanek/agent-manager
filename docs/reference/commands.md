@@ -97,10 +97,10 @@ am doctor
 | Environment | Where the environment comes from, and whether that source is usable |
 | Agent | Selected agent is known, and its credentials are present on this host |
 
-In dev container mode the Environment section additionally reports the discovered
-config, the `devcontainer` CLI and its version, Node 20+, whether the built image is
-current for the config hash, and any construct `am` will refuse or
-drop (`initializeCommand`, `runArgs`).
+In dev container mode the Environment section additionally reports the discovered config,
+whether the built image is current for the config hash, and any construct `am` will refuse or
+drop (`initializeCommand`, `runArgs`). There is nothing to report about Node: `am` builds
+devcontainers itself.
 
 **Output**
 
@@ -111,9 +111,6 @@ run, a doc section to read — rather than naming the problem abstractly:
 ```
 Environment
   ✓ source                 devcontainer at /path/to/.devcontainer/devcontainer.json
-  ✗ devcontainer CLI       'devcontainer' not found on PATH
-      → npm install -g @devcontainers/cli (needs Node 20+), or set container.mode = "image"
-  ✓ node                   v22.23.2 (>= 20 required)
   ! built image            am-dc-f260010a69f5 not built yet
       → the next 'am start' will build it — this can take a few minutes
 ```

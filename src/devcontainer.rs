@@ -1,12 +1,13 @@
 //! Dev Container support: discovery, parsing, and configuration merge.
 //!
-//! `am` delegates image *building* to the reference `@devcontainers/cli` and keeps the
-//! *run* path for itself (see `specs/devcontainer-support.md`). This module owns everything
-//! needed to turn a repo's `.devcontainer/devcontainer.json` plus the built image's
-//! `devcontainer.metadata` label into a `ResolvedConfig` that `container.rs` can run.
+//! `am` builds the image itself (`native/`) and runs it itself (`container.rs`,
+//! `compose.rs`); see `specs/devcontainer-support.md`. This module owns everything needed to
+//! turn a repo's `.devcontainer/devcontainer.json` plus the built image's
+//! `devcontainer.metadata` label into a `ResolvedConfig` that the run path can use.
 //!
 //! Two sources feed the merge, and the split between them is not arbitrary — it is dictated
-//! by what the CLI actually writes into the label:
+//! by what goes into the label, which is defined by the spec and pinned against the reference
+//! implementation by the differential tests:
 //!
 //! 1. The **label** carries feature contributions *and* the whole `devcontainer.json`
 //!    reduced to the metadata schema. Elements are already in merge order (base image, then
@@ -15,7 +16,8 @@
 //!    schema drops: `runArgs`, `workspaceFolder`, `workspaceMount`, `initializeCommand`,
 //!    `dockerComposeFile`, and `name`.
 //!
-//! Fixtures captured from a real CLI run live in `tests/fixtures/devcontainer/`.
+//! Fixtures captured from real reference-CLI runs live in `tests/fixtures/devcontainer/`.
+//! They are how `am`'s builder is kept honest; the CLI itself is not used at runtime.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -778,205 +780,15 @@ pub struct BuildRequest<'a> {
 /// `am` says what it could not handle and hands off to the reference CLI. In
 /// [`crate::config::Builder::Native`] the same condition is fatal, so that a config which
 /// silently costs a Node dependency is visible rather than invisible.
-pub fn build_image(
-    req: &BuildRequest,
-    cfg: &crate::config::Config,
-    runtime_bin: &Path,
-) -> Result<String> {
-    use crate::config::Builder;
-
-    if cfg.devcontainer.builder == Builder::Cli {
-        return build_with_cli(req, cfg, runtime_bin);
-    }
-
-    // The native builder needs the config as raw JSON: the properties it copies into the
-    // metadata label are deliberately not modelled, so they can pass through untouched.
+pub fn build_image(req: &BuildRequest, runtime_bin: &Path) -> Result<String> {
+    // The builder needs the config as raw JSON: the properties it copies into the metadata
+    // label are deliberately not modelled, so they can pass through untouched.
     let text = std::fs::read_to_string(req.config_path)
         .with_context(|| format!("reading {}", req.config_path.display()))?;
     let raw: serde_json::Value = serde_json_lenient::from_str(&text)
         .map_err(|e| AmError::ConfigError(e.to_string()))?;
 
     native::build(req, runtime_bin, &raw)
-}
-
-/// Delegate to `@devcontainers/cli`.
-fn build_with_cli(
-    req: &BuildRequest,
-    cfg: &crate::config::Config,
-    runtime_bin: &Path,
-) -> Result<String> {
-    let cli = find_cli(&cfg.devcontainer.cli)?;
-    build(
-        &cli,
-        req.worktree,
-        req.config_path,
-        req.image,
-        req.injected,
-        runtime_bin,
-        req.no_cache,
-    )
-}
-
-/// Locate the `devcontainer` CLI.
-///
-/// `AM_DEVCONTAINER_BIN` takes precedence and is used *exclusively* when set, matching
-/// how `container.rs` resolves runtimes — that is what lets tests inject a mock, or a
-/// deliberately nonexistent path to simulate "not installed".
-pub fn find_cli(configured: &str) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("AM_DEVCONTAINER_BIN") {
-        let p = PathBuf::from(&path);
-        return if p.exists() {
-            Ok(p)
-        } else {
-            Err(AmError::DevcontainerCliNotFound(path).into())
-        };
-    }
-    which::which(configured)
-        .map_err(|_| AmError::DevcontainerCliNotFound(configured.to_string()).into())
-}
-
-/// Assemble the `devcontainer build` argv.
-///
-/// Subcommand options must come **after** the subcommand — putting `--docker-path` before
-/// `build` makes the CLI ignore it and silently shell out to `docker`, which is a confusing
-/// failure on a podman-only machine.
-pub fn build_command_args(
-    worktree: &Path,
-    config_path: &Path,
-    image: &str,
-    injected: &[InjectedFeature],
-    docker_path: &Path,
-    no_cache: bool,
-) -> Vec<String> {
-    let mut args = vec![
-        "build".to_string(),
-        "--workspace-folder".to_string(),
-        worktree.to_string_lossy().into_owned(),
-        "--config".to_string(),
-        config_path.to_string_lossy().into_owned(),
-        "--image-name".to_string(),
-        image.to_string(),
-        "--docker-path".to_string(),
-        docker_path.to_string_lossy().into_owned(),
-    ];
-    if no_cache {
-        args.push("--no-cache".to_string());
-    }
-    if !injected.is_empty() {
-        args.push("--additional-features".to_string());
-        args.push(additional_features_json(injected));
-    }
-    args
-}
-
-/// Render injected features as the JSON object `--additional-features` expects.
-fn additional_features_json(injected: &[InjectedFeature]) -> String {
-    let mut map = serde_json::Map::new();
-    for feature in injected {
-        // Options come from am's own config, but a malformed value should degrade to
-        // "defaults" rather than abort a build over a cosmetic mistake.
-        let value = serde_json_lenient::from_str(&feature.options)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
-        map.insert(feature.id.clone(), value);
-    }
-    serde_json::Value::Object(map).to_string()
-}
-
-/// The JSON `devcontainer build` prints on stdout.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildResult {
-    outcome: String,
-    #[serde(default)]
-    image_name: Option<ReportedImageName>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// 0.88 reports an array; the schema also permits a bare string.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ReportedImageName {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl ReportedImageName {
-    fn first(self) -> Option<String> {
-        match self {
-            ReportedImageName::One(s) => Some(s),
-            ReportedImageName::Many(v) => v.into_iter().next(),
-        }
-    }
-}
-
-/// Run `devcontainer build` and return the built image name.
-///
-/// Build progress goes to stderr and is passed through to the user's terminal — a feature
-/// install can take minutes and silence would look like a hang. Only stdout is captured,
-/// which is where the result JSON lands.
-pub fn build(
-    cli: &Path,
-    worktree: &Path,
-    config_path: &Path,
-    image: &str,
-    injected: &[InjectedFeature],
-    docker_path: &Path,
-    no_cache: bool,
-) -> Result<String> {
-    let args = build_command_args(worktree, config_path, image, injected, docker_path, no_cache);
-    let output = std::process::Command::new(cli)
-        .args(&args)
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| {
-            AmError::DevcontainerBuildFailed(format!("failed to run {}: {e}", cli.display()))
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Both signals are checked: the CLI exits 1 on failure *and* reports outcome in the
-    // JSON, and neither alone is worth trusting across CLI versions.
-    let parsed: Option<BuildResult> = stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json_lenient::from_str(line.trim()).ok());
-
-    match parsed {
-        Some(result) if result.outcome == "success" && output.status.success() => {
-            // Prefer the name the CLI reports over the one we asked for, so a future
-            // release that normalises tags does not leave `am` running a stale image.
-            Ok(result
-                .image_name
-                .and_then(ReportedImageName::first)
-                .unwrap_or_else(|| image.to_string()))
-        }
-        Some(result) => {
-            let detail = [result.description, result.message]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(": ");
-            Err(AmError::DevcontainerBuildFailed(if detail.is_empty() {
-                format!("outcome '{}'", result.outcome)
-            } else {
-                detail
-            })
-            .into())
-        }
-        None if output.status.success() => Err(AmError::DevcontainerBuildFailed(
-            "the CLI reported success but printed no result JSON — is `devcontainer` the \
-             reference CLI from @devcontainers/cli?"
-                .to_string(),
-        )
-        .into()),
-        None => Err(AmError::DevcontainerBuildFailed(format!(
-            "the CLI exited with {} (see the output above)",
-            output.status
-        ))
-        .into()),
-    }
 }
 
 // ── Reading the built image ───────────────────────────────────────────────────
@@ -1231,7 +1043,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
-    /// Serialises tests that mutate `AM_DEVCONTAINER_BIN` or exec a mock script.
+    /// Serialises tests that mutate the environment or exec a mock script.
     ///
     /// The exec case is not paranoia: writing a script and immediately running it races
     /// with any other thread that forks in between, which inherits the still-open write
@@ -1700,246 +1512,6 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    // ── Build command assembly ────────────────────────────────────────────────
-
-    fn build_args(injected: &[InjectedFeature]) -> Vec<String> {
-        build_command_args(
-            Path::new("/wt"),
-            Path::new("/wt/.devcontainer/devcontainer.json"),
-            "am-dc-abc123",
-            injected,
-            Path::new("/usr/bin/podman"),
-            false,
-        )
-    }
-
-    #[test]
-    fn build_args_start_with_the_subcommand() {
-        // Options placed before `build` are silently ignored by the CLI — the podman
-        // path in particular would fall back to docker and fail confusingly.
-        assert_eq!(build_args(&[])[0], "build");
-    }
-
-    #[test]
-    fn build_args_pass_docker_path_after_the_subcommand() {
-        let args = build_args(&[]);
-        let idx = args.iter().position(|a| a == "--docker-path").unwrap();
-        assert!(idx > 0);
-        assert_eq!(args[idx + 1], "/usr/bin/podman");
-    }
-
-    #[test]
-    fn build_args_include_workspace_config_and_image() {
-        let args = build_args(&[]);
-        let pair = |flag: &str| {
-            let i = args.iter().position(|a| a == flag).unwrap();
-            args[i + 1].clone()
-        };
-        assert_eq!(pair("--workspace-folder"), "/wt");
-        assert_eq!(
-            pair("--config"),
-            "/wt/.devcontainer/devcontainer.json"
-        );
-        assert_eq!(pair("--image-name"), "am-dc-abc123");
-    }
-
-    #[test]
-    fn build_args_omit_additional_features_when_none_are_injected() {
-        assert!(!build_args(&[]).iter().any(|a| a == "--additional-features"));
-    }
-
-    #[test]
-    fn build_args_render_injected_features_as_json() {
-        let args = build_args(&[InjectedFeature::with_defaults(
-            "ghcr.io/anthropics/devcontainer-features/claude-code:1",
-        )]);
-        let i = args.iter().position(|a| a == "--additional-features").unwrap();
-        assert_eq!(
-            args[i + 1],
-            r#"{"ghcr.io/anthropics/devcontainer-features/claude-code:1":{}}"#
-        );
-    }
-
-    #[test]
-    fn feature_options_are_passed_through_as_json() {
-        let json = additional_features_json(&[InjectedFeature::new("f", r#"{"version":"20"}"#)]);
-        assert_eq!(json, r#"{"f":{"version":"20"}}"#);
-    }
-
-    #[test]
-    fn malformed_feature_options_fall_back_to_defaults() {
-        // A cosmetic config mistake should not abort a multi-minute build.
-        let json = additional_features_json(&[InjectedFeature::new("f", "not json")]);
-        assert_eq!(json, r#"{"f":{}}"#);
-    }
-
-    // ── Running the build ─────────────────────────────────────────────────────
-
-    fn run_build(tmp: &Path, cli_body: &str) -> Result<String> {
-        let _g = lock_env();
-        let cli = script(tmp, "devcontainer", cli_body);
-        build(
-            &cli,
-            tmp,
-            &tmp.join("devcontainer.json"),
-            "am-dc-abc123",
-            &[],
-            Path::new("/usr/bin/podman"),
-            false,
-        )
-    }
-
-    #[test]
-    fn build_returns_the_image_name_on_success() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let image = run_build(
-            tmp.path(),
-            r#"echo '{"outcome":"success","imageName":["am-dc-abc123"]}'"#,
-        )
-        .unwrap();
-        assert_eq!(image, "am-dc-abc123");
-    }
-
-    #[test]
-    fn build_surfaces_the_cli_error_message() {
-        // The spike's captured failure shape: exit 1 plus an error JSON on stdout.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let err = run_build(
-            tmp.path(),
-            r#"echo '{"outcome":"error","message":"Command failed: podman pull nope","description":"An error occurred building the container."}'
-exit 1"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("An error occurred building the container"));
-        assert!(err.contains("Command failed: podman pull nope"));
-    }
-
-    #[test]
-    fn build_fails_on_error_outcome_even_when_the_cli_exits_zero() {
-        // Defence in depth: don't rely on the exit code alone across CLI versions.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let err = run_build(
-            tmp.path(),
-            r#"echo '{"outcome":"error","message":"boom"}'
-exit 0"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("boom"));
-    }
-
-    #[test]
-    fn build_fails_on_nonzero_exit_even_without_result_json() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let err = run_build(tmp.path(), "exit 3").unwrap_err().to_string();
-        assert!(err.contains("exited with"));
-    }
-
-    #[test]
-    fn build_rejects_a_cli_that_prints_no_result_json() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let err = run_build(tmp.path(), "echo hello").unwrap_err().to_string();
-        assert!(err.contains("@devcontainers/cli"));
-    }
-
-    #[test]
-    fn build_ignores_non_json_chatter_before_the_result() {
-        // Real runs interleave progress lines; only the last JSON line is the result.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let image = run_build(
-            tmp.path(),
-            r#"echo 'Resolving Feature dependencies...'
-echo '{"outcome":"success","imageName":["am-dc-abc123"]}'"#,
-        )
-        .unwrap();
-        assert_eq!(image, "am-dc-abc123");
-    }
-
-    #[test]
-    fn build_passes_its_arguments_to_the_cli() {
-        let _g = lock_env();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let log = tmp.path().join("args.log");
-        let cli = script(
-            tmp.path(),
-            "devcontainer",
-            &format!(
-                r#"echo "$@" > {}
-echo '{{"outcome":"success","imageName":"am-dc-abc123"}}'"#,
-                log.display()
-            ),
-        );
-        build(
-            &cli,
-            tmp.path(),
-            &tmp.path().join("devcontainer.json"),
-            "am-dc-abc123",
-            &[InjectedFeature::with_defaults("ghcr.io/x/cc:1")],
-            Path::new("/usr/bin/podman"),
-            false,
-        )
-        .unwrap();
-        let recorded = std::fs::read_to_string(&log).unwrap();
-        assert!(recorded.starts_with("build "));
-        assert!(recorded.contains("--docker-path /usr/bin/podman"));
-        assert!(recorded.contains("ghcr.io/x/cc:1"));
-    }
-
-    #[test]
-    fn build_accepts_a_string_image_name_as_well_as_an_array() {
-        // 0.88 emits an array, but the schema permits a bare string. Both must be read,
-        // and the reported name is what am runs — not the one it asked for.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let from_string = run_build(
-            tmp.path(),
-            r#"echo '{"outcome":"success","imageName":"reported:tag"}'"#,
-        )
-        .unwrap();
-        assert_eq!(from_string, "reported:tag");
-
-        let from_array = run_build(
-            tmp.path(),
-            r#"echo '{"outcome":"success","imageName":["reported:tag"]}'"#,
-        )
-        .unwrap();
-        assert_eq!(from_array, "reported:tag");
-    }
-
-    #[test]
-    fn build_falls_back_to_the_requested_name_when_none_is_reported() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let image = run_build(tmp.path(), r#"echo '{"outcome":"success"}'"#).unwrap();
-        assert_eq!(image, "am-dc-abc123");
-    }
-
-    // ── Locating the CLI ──────────────────────────────────────────────────────
-
-    #[test]
-    fn find_cli_uses_the_env_override() {
-        let _g = lock_env();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let bin = script(tmp.path(), "devcontainer", "exit 0");
-        std::env::set_var("AM_DEVCONTAINER_BIN", &bin);
-
-        let found = find_cli("devcontainer");
-
-        std::env::remove_var("AM_DEVCONTAINER_BIN");
-        assert_eq!(found.unwrap(), bin);
-    }
-
-    #[test]
-    fn find_cli_errors_helpfully_when_missing() {
-        let _g = lock_env();
-        std::env::set_var("AM_DEVCONTAINER_BIN", "/nonexistent/devcontainer");
-
-        let err = find_cli("devcontainer").unwrap_err().to_string();
-
-        std::env::remove_var("AM_DEVCONTAINER_BIN");
-        assert!(err.contains("npm install -g @devcontainers/cli"));
-        assert!(err.contains("container.mode"));
-    }
-
     // ── Reading the image label ───────────────────────────────────────────────
 
     #[test]
@@ -1986,19 +1558,6 @@ echo '{{"outcome":"success","imageName":"am-dc-abc123"}}'"#,
         assert!(!image_exists(&absent, "am-dc-abc"));
     }
 
-    #[test]
-    fn no_cache_flag_is_added_only_when_requested() {
-        assert!(!build_args(&[]).iter().any(|a| a == "--no-cache"));
-        let rebuilt = build_command_args(
-            Path::new("/wt"),
-            Path::new("/wt/.devcontainer/devcontainer.json"),
-            "am-dc-abc123",
-            &[],
-            Path::new("/usr/bin/podman"),
-            true,
-        );
-        assert!(rebuilt.iter().any(|a| a == "--no-cache"));
-    }
 
     #[test]
     fn image_name_changes_when_the_dockerfile_changes() {

@@ -30,20 +30,11 @@ Three things to know about compose sessions:
 - `container.network = "none"` cannot apply, because compose services reach each other over the
   project network. `am` refuses rather than quietly ignoring it.
 
-**`am` never runs the reference CLI.** There is no config shape it hands over: a
-`devcontainer.json` `am` cannot build is one the reference CLI rejects too, and `am` says so
-directly rather than sending you to install Node over it.
+**There is no Node dependency, and no way to reintroduce one.** `am` builds every config shape
+the spec defines and never shells out to `@devcontainers/cli`. A `devcontainer.json` `am` cannot
+build is one the reference CLI rejects too, and `am` says so directly.
 
-The CLI remains available as a deliberate escape hatch, for the case where `am`'s builder gets
-something wrong and you need a second opinion:
-
-```toml
-# .am/config.toml
-[devcontainer]
-builder = "cli"   # "auto" (default, am builds it) | "cli"
-```
-
-Builds happen once per config change, not once per session, either way.
+Builds happen once per config change, not once per session.
 
 ## Choosing a mode
 
@@ -229,18 +220,14 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 
 ## Troubleshooting
 
-Start with `am doctor`. It reports the discovered config, the CLI and its version, Node,
-whether the built image is current, and any construct `am` will refuse or drop — which
-covers most of what follows before you have to guess.
+Start with `am doctor`. It reports the discovered config, whether the built image is current,
+and any construct `am` will refuse or drop — which covers most of what follows before you have
+to guess.
 
-**"devcontainer CLI not found"** — your config uses something `am` cannot build itself, so
-it tried to fall back. Install `@devcontainers/cli` globally, point `devcontainer.cli` (or
-`AM_DEVCONTAINER_BIN`) at it, or switch to `container.mode = "image"`. `am doctor` reports
-this as "not needed" when the config is one `am` can build on its own.
-
-**"am's own builder cannot handle this config"** — you set `builder = "native"`, which turns
-the CLI fallback into an error. The message names the construct; set `builder = "auto"` to
-fall back instead.
+**"this devcontainer.json has nothing to build from"** — the config names no `image`, no
+`build.dockerfile` and no `dockerComposeFile`, so there is nothing to build. This is not an `am`
+limitation: the reference CLI rejects the same config with "No image information specified in
+devcontainer.json", and `build.dockerfile` has no default there either.
 
 **The build succeeded but the agent isn't found** — the image has no agent and
 `agent_install` resolved to `none`. Check that your agent has a mapped Feature, or set

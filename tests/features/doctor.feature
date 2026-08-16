@@ -47,7 +47,7 @@ Feature: am doctor — readiness reporting
   Scenario: a discovered devcontainer config is reported as the environment source
     Given a git repository
     And am init has been run
-    And I am using a mock devcontainer CLI
+    And I am using am's own devcontainer builder
     And the repo has a devcontainer config
     When I run "am doctor"
     Then the command succeeds
@@ -57,7 +57,7 @@ Feature: am doctor — readiness reporting
   Scenario: initializeCommand is reported as refused before a session is ever started
     Given a git repository
     And am init has been run
-    And I am using a mock devcontainer CLI
+    And I am using am's own devcontainer builder
     And the repo has a devcontainer config with an initializeCommand
     When I run "am doctor"
     Then the command fails
@@ -67,7 +67,7 @@ Feature: am doctor — readiness reporting
   Scenario: a compose config missing its service is reported before a session is ever started
     Given a git repository
     And am init has been run
-    And I am using a mock devcontainer CLI
+    And I am using am's own devcontainer builder
     And the repo has a devcontainer config using docker compose with no service
     When I run "am doctor"
     Then the command fails
