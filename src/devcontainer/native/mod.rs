@@ -11,6 +11,7 @@
 //! [`super::finalize`], the trust gate, the run path — is shared with the CLI builder and
 //! cannot tell the two apart. That is what makes the differential test in `tests/` meaningful.
 
+pub mod auth;
 pub mod dockerfile;
 pub mod feature;
 pub mod oci;
