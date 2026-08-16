@@ -498,7 +498,12 @@ pub fn find_config(worktree: &Path, override_path: Option<&Path>) -> Result<Opti
 pub struct SubstitutionContext {
     pub local_workspace_folder: PathBuf,
     pub container_workspace_folder: String,
+    /// The environment of the *container*, which is the image's own plus whatever the config
+    /// contributes — not merely the config's `containerEnv`. `${containerEnv:PATH}` is a
+    /// documented idiom and the image is the only place `PATH` is defined.
     pub container_env: BTreeMap<String, String>,
+    /// Stable, host-unique identifier for this dev container.
+    pub devcontainer_id: Option<String>,
 }
 
 impl SubstitutionContext {
@@ -507,7 +512,19 @@ impl SubstitutionContext {
             local_workspace_folder: local_workspace_folder.to_path_buf(),
             container_workspace_folder: container_workspace_folder.to_string(),
             container_env: BTreeMap::new(),
+            devcontainer_id: None,
         }
+    }
+
+    /// Set the identifier `${devcontainerId}` expands to.
+    ///
+    /// The spec requires it be unique among dev containers on the same host and stable across
+    /// rebuilds. Features use it to name volumes — `docker-in-docker` asks for
+    /// `dind-var-lib-docker-${devcontainerId}` — so leaving it empty makes every session on the
+    /// machine share one volume, which is the exact collision the variable exists to prevent.
+    pub fn with_devcontainer_id(mut self, id: impl Into<String>) -> Self {
+        self.devcontainer_id = Some(id.into());
+        self
     }
 
     fn basename(path: &Path) -> String {
@@ -516,24 +533,55 @@ impl SubstitutionContext {
             .unwrap_or_default()
     }
 
-    /// Resolve a single `${...}` body. Unknown variables resolve to an empty string, which
-    /// is what the reference implementation does — erroring would reject configs that work
-    /// fine in an editor.
-    fn resolve(&self, name: &str) -> String {
-        if let Some(var) = name.strip_prefix("localEnv:") {
-            return std::env::var(var).unwrap_or_default();
+    /// Resolve a single `${...}` body, or `None` to leave it as written.
+    ///
+    /// A variable this does not recognise is left **literal**, which is what the reference
+    /// implementation does — every unmatched branch there returns the original text. Collapsing
+    /// it to an empty string is worse than doing nothing: `${devcontainerId}` became `""` and
+    /// silently merged every session's volumes, and an unsupported variable is indistinguishable
+    /// from one that legitimately expands to nothing.
+    ///
+    /// The one empty-string case is the spec's own: an environment variable that is not set and
+    /// carries no default.
+    fn resolve(&self, name: &str) -> Option<String> {
+        // `env:` is an accepted alias for `localEnv:`.
+        for prefix in ["localEnv:", "env:"] {
+            if let Some(rest) = name.strip_prefix(prefix) {
+                let (var, default) = Self::split_default(rest);
+                return Some(std::env::var(var).unwrap_or_else(|_| default.to_string()));
+            }
         }
-        if let Some(var) = name.strip_prefix("containerEnv:") {
-            return self.container_env.get(var).cloned().unwrap_or_default();
+        if let Some(rest) = name.strip_prefix("containerEnv:") {
+            let (var, default) = Self::split_default(rest);
+            return Some(
+                self.container_env
+                    .get(var)
+                    .cloned()
+                    .unwrap_or_else(|| default.to_string()),
+            );
         }
         match name {
-            "localWorkspaceFolder" => self.local_workspace_folder.to_string_lossy().into_owned(),
-            "containerWorkspaceFolder" => self.container_workspace_folder.clone(),
-            "localWorkspaceFolderBasename" => Self::basename(&self.local_workspace_folder),
-            "containerWorkspaceFolderBasename" => {
-                Self::basename(Path::new(&self.container_workspace_folder))
+            "localWorkspaceFolder" => {
+                Some(self.local_workspace_folder.to_string_lossy().into_owned())
             }
-            _ => String::new(),
+            "containerWorkspaceFolder" => Some(self.container_workspace_folder.clone()),
+            "localWorkspaceFolderBasename" => Some(Self::basename(&self.local_workspace_folder)),
+            "containerWorkspaceFolderBasename" => {
+                Some(Self::basename(Path::new(&self.container_workspace_folder)))
+            }
+            // Left literal until it is known, exactly as the CLI does, so a caller that has not
+            // supplied one cannot silently produce a shared name.
+            "devcontainerId" => self.devcontainer_id.clone(),
+            _ => None,
+        }
+    }
+
+    /// Split `VAR:default` into its parts. A missing default is the empty string, which is what
+    /// an unset variable expands to.
+    fn split_default(rest: &str) -> (&str, &str) {
+        match rest.split_once(':') {
+            Some((var, default)) => (var, default),
+            None => (rest, ""),
         }
     }
 
@@ -550,7 +598,11 @@ impl SubstitutionContext {
             let after = &rest[start + 2..];
             match after.find('}') {
                 Some(end) => {
-                    out.push_str(&self.resolve(&after[..end]));
+                    let name = &after[..end];
+                    match self.resolve(name) {
+                        Some(value) => out.push_str(&value),
+                        None => out.push_str(&format!("${{{name}}}")),
+                    }
                     rest = &after[end + 1..];
                 }
                 None => {
@@ -692,7 +744,11 @@ pub fn finalize(
     resolved.name = json.name.clone();
 
     let mut ctx = ctx.clone();
-    ctx.container_env = resolved.container_env.clone();
+    // The config's own contributions win over the image's, since they will be set on the
+    // container; everything else the image defines stays visible to `${containerEnv:…}`.
+    for (key, value) in &resolved.container_env {
+        ctx.container_env.insert(key.clone(), value.clone());
+    }
 
     resolved.container_env = resolved
         .container_env
@@ -710,6 +766,11 @@ pub fn finalize(
     }
     for arg in &mut resolved.run_args {
         *arg = ctx.substitute(arg);
+    }
+    // Feature entrypoints are listed in the spec as supporting `${devcontainerId}`, and they
+    // are shell commands that end up in the container's command line.
+    for entrypoint in &mut resolved.entrypoints {
+        *entrypoint = ctx.substitute(entrypoint);
     }
     resolved.workspace_folder = resolved.workspace_folder.as_deref().map(|s| ctx.substitute(s));
     resolved.workspace_mount = resolved.workspace_mount.as_deref().map(|s| ctx.substitute(s));
@@ -903,6 +964,36 @@ pub fn image_exists(runtime_bin: &Path, image: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The environment a built image declares, as a map.
+///
+/// This is what `${containerEnv:VAR}` resolves against: the variable names a value in the
+/// *container's* environment, and for everything the config does not set itself the image is
+/// where that value comes from. Resolving `${containerEnv:PATH}` from the config's own
+/// `containerEnv` — which almost never defines `PATH` — produced an empty string, and the
+/// documented idiom `"PATH": "${containerEnv:PATH}:/extra"` then *replaced* the image's `PATH`
+/// with `:/extra`.
+pub fn image_env(runtime_bin: &Path, image: &str) -> BTreeMap<String, String> {
+    let Ok(output) = std::process::Command::new(runtime_bin)
+        .args(["inspect", image, "--format", "{{ json .Config.Env }}"])
+        .output()
+    else {
+        return BTreeMap::new();
+    };
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<String>>(text.trim())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Read and parse the `devcontainer.metadata` label from a built image.
@@ -1414,8 +1505,84 @@ mod tests {
     }
 
     #[test]
-    fn unknown_variable_becomes_empty() {
-        assert_eq!(ctx().substitute("a${nope}b"), "ab");
+    fn an_unknown_variable_is_left_literal() {
+        // Not empty. Every unmatched branch in the reference implementation returns the
+        // original text, and collapsing instead is actively harmful: `${devcontainerId}` became
+        // `""`, so every docker-in-docker session on a host silently shared one volume.
+        assert_eq!(ctx().substitute("a${nope}b"), "a${nope}b");
+    }
+
+    #[test]
+    fn a_workspace_folder_is_substituted_before_it_becomes_the_container_path() {
+        // `/workspaces/${localWorkspaceFolderBasename}` is the common spelling, and
+        // `substitute` does not re-scan its own output — so a context built from the raw string
+        // leaves an unexpanded `${…}` inside every `${containerWorkspaceFolder}`.
+        let bare = SubstitutionContext::new(Path::new("/home/dev/.am/worktrees/feat"), "");
+        let folder = bare.substitute("/workspaces/${localWorkspaceFolderBasename}");
+        assert_eq!(folder, "/workspaces/feat");
+
+        let context = SubstitutionContext::new(Path::new("/home/dev/.am/worktrees/feat"), &folder);
+        assert_eq!(context.substitute("${containerWorkspaceFolder}/bin"), "/workspaces/feat/bin");
+        assert_eq!(context.substitute("${containerWorkspaceFolderBasename}"), "feat");
+    }
+
+    #[test]
+    fn a_feature_entrypoint_is_substituted() {
+        let resolved = ResolvedConfig {
+            entrypoints: vec!["/init.sh --id ${devcontainerId}".to_string()],
+            ..Default::default()
+        };
+        let json = parse_config_str(r#"{"image":"debian"}"#).unwrap();
+        let context = ctx().with_devcontainer_id("am-feat-ab12cd");
+        let finalized = finalize(resolved, &json, &context);
+        assert_eq!(finalized.entrypoints, ["/init.sh --id am-feat-ab12cd"]);
+    }
+
+    #[test]
+    fn env_is_an_alias_for_local_env() {
+        std::env::set_var("AM_TEST_ALIAS", "yes");
+        assert_eq!(ctx().substitute("${env:AM_TEST_ALIAS}"), "yes");
+        std::env::remove_var("AM_TEST_ALIAS");
+    }
+
+    #[test]
+    fn an_unset_environment_variable_uses_its_default() {
+        std::env::remove_var("AM_TEST_UNSET");
+        assert_eq!(ctx().substitute("${localEnv:AM_TEST_UNSET:fallback}"), "fallback");
+        // Without a default it is the one case that legitimately expands to nothing.
+        assert_eq!(ctx().substitute("${localEnv:AM_TEST_UNSET}"), "");
+    }
+
+    #[test]
+    fn a_set_environment_variable_beats_its_default() {
+        std::env::set_var("AM_TEST_SET", "real");
+        assert_eq!(ctx().substitute("${localEnv:AM_TEST_SET:fallback}"), "real");
+        std::env::remove_var("AM_TEST_SET");
+    }
+
+    #[test]
+    fn container_env_resolves_against_the_containers_environment() {
+        // The documented idiom is `"PATH": "${containerEnv:PATH}:/extra"`. Resolving it from
+        // the config's own containerEnv — which almost never defines PATH — yielded `""`, so
+        // the result *replaced* the image's PATH with `:/extra`.
+        let mut context = ctx();
+        context.container_env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        assert_eq!(
+            context.substitute("${containerEnv:PATH}:/extra"),
+            "/usr/bin:/bin:/extra"
+        );
+        assert_eq!(context.substitute("${containerEnv:MISSING:none}"), "none");
+    }
+
+    #[test]
+    fn devcontainer_id_expands_when_known_and_stays_literal_otherwise() {
+        // A Feature naming a volume `dind-var-lib-docker-${devcontainerId}` must not end up
+        // with the same name in every session on the host.
+        assert_eq!(ctx().substitute("vol-${devcontainerId}"), "vol-${devcontainerId}");
+        assert_eq!(
+            ctx().with_devcontainer_id("am-feat-ab12cd").substitute("vol-${devcontainerId}"),
+            "vol-am-feat-ab12cd"
+        );
     }
 
     #[test]

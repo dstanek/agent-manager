@@ -1111,13 +1111,30 @@ fn plan_devcontainer(
     }
 
     let snippets = devcontainer::read_image_metadata(&runtime.bin, &image)?;
-    let ctx = devcontainer::SubstitutionContext::new(
+
+    // The workspace folder is itself substitutable — `/workspaces/${localWorkspaceFolderBasename}`
+    // is the common spelling — so it is expanded before becoming the value that
+    // `${containerWorkspaceFolder}` resolves to. Substitution does not re-scan its own output,
+    // so building the context from the raw string leaves an unexpanded `${…}` inside it.
+    let bare = devcontainer::SubstitutionContext::new(
         worktree,
-        &json
-            .workspace_folder
-            .clone()
-            .unwrap_or_else(|| worktree.to_string_lossy().into_owned()),
+        &worktree.to_string_lossy(),
     );
+    let workspace_folder = json
+        .workspace_folder
+        .as_deref()
+        .map(|folder| bare.substitute(folder))
+        .unwrap_or_else(|| worktree.to_string_lossy().into_owned());
+
+    let mut ctx = devcontainer::SubstitutionContext::new(worktree, &workspace_folder)
+        // Unique per session and stable across rebuilds, which is what the spec asks of it:
+        // the name is derived from the repository path and the slug, not from the config, so
+        // editing the config does not rename a Feature's volumes.
+        .with_devcontainer_id(container_name.to_string());
+    // `${containerEnv:VAR}` means the *container's* environment. The image is where `PATH` and
+    // the rest are actually defined, so it is the base; the config's own contributions layer on
+    // top, since those will be set on the container too.
+    ctx.container_env = devcontainer::image_env(&runtime.bin, &image);
     let resolved = devcontainer::finalize(devcontainer::merge(&snippets)?, &json, &ctx);
 
     // remoteUser decides where credentials must land — an image running as root keeps its
