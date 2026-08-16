@@ -1050,6 +1050,14 @@ fn run_container_cmd(runtime: &ContainerRuntime, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Run a shell snippet inside an already-running container.
+///
+/// Used for `postAttachCommand`, the one lifecycle hook that fires against a container `am` did
+/// not just create — so it cannot be chained into the command the way the others are.
+pub fn exec_script(runtime: &ContainerRuntime, container_name: &str, script: &str) -> Result<()> {
+    run_container_cmd(runtime, &["exec", container_name, "sh", "-c", script])
+}
+
 pub fn stop_container(runtime: &ContainerRuntime, container_name: &str) -> Result<()> {
     // Ignore error — container may already be stopped
     let _ = run_container_cmd(runtime, &["stop", container_name]);

@@ -966,6 +966,21 @@ async fn given_no_user_env_probe_config(world: &mut AmWorld) {
         .expect("write label file");
 }
 
+/// Like the userEnvProbe step, the hook has to go in the image's metadata label as well as the
+/// config: `am attach` reads it from the label, which is what describes the running container.
+#[given("the repo has a devcontainer config with a postAttachCommand")]
+async fn given_post_attach_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm","postAttachCommand":"echo attached"}"#,
+    );
+    let label = world
+        .mock_label_file
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    fs::write(label, r#"[{"remoteUser":"vscode","postAttachCommand":"echo attached"}]"#)
+        .expect("write label file");
+}
+
 #[given("the repo has a devcontainer config with an initializeCommand")]
 async fn given_initialize_command_config(world: &mut AmWorld) {
     world.write_devcontainer_config(
@@ -1388,6 +1403,19 @@ async fn then_tmux_log_does_not_contain(world: &mut AmWorld, text: String) {
     assert!(
         !content.contains(&text),
         "expected tmux log to NOT contain {text:?}\ngot:\n{content}",
+    );
+}
+
+#[then(expr = "the mock podman log does not contain {string}")]
+async fn then_podman_log_does_not_contain(world: &mut AmWorld, text: String) {
+    let log = world
+        .mock_podman_log
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    let content = fs::read_to_string(log).unwrap_or_default();
+    assert!(
+        !content.contains(&text),
+        "expected podman log not to contain {text:?}\ngot:\n{content}",
     );
 }
 

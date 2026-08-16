@@ -1154,6 +1154,10 @@ fn plan_devcontainer(
         devcontainer::startup_commands(&resolved, cfg.devcontainer.skip_lifecycle);
     let mut chain = trusted.entrypoints.clone();
     chain.extend(hooks);
+    // Starting a session is also attaching to it, so postAttachCommand belongs at the end of the
+    // chain. `am attach` reaches the same hook a second way — see `run_post_attach` — for the
+    // case where the container is already up and nothing is being recreated.
+    chain.extend(devcontainer::attach_commands(&resolved, cfg.devcontainer.skip_lifecycle));
     let agent_cmd = container::compose_entrypoint_command(
         &chain,
         &agent_command(agent_name, agent, auto, resume),
@@ -1790,6 +1794,56 @@ fn launch_into_agent_pane(
     }
 }
 
+/// Run `postAttachCommand` in a container that is already up.
+///
+/// The other two attach paths recreate the container and chain the hook into its command; this
+/// is the third, where the session is live and `am attach` only moves tmux focus. Attaching is
+/// still an attach, so the hook is due.
+///
+/// The hooks come from the **image's** metadata label rather than from re-reading the config,
+/// because the label is what describes the container that is actually running — a
+/// `devcontainer.json` edited since the session started describes a container that does not
+/// exist yet.
+///
+/// Best-effort throughout: this runs on the path whose whole job is switching to a window that
+/// already works, so nothing here is allowed to turn that into a failure.
+fn run_post_attach(cfg: &config::Config, s: &session::Session) {
+    let Some(sc) = s.container.as_ref() else { return };
+    if sc.mode != session::ContainerMode::Devcontainer {
+        return;
+    }
+    let pref = match sc.runtime.as_str() {
+        "docker" => config::RuntimePreference::Docker,
+        _ => config::RuntimePreference::Podman,
+    };
+    let Ok(runtime) = container::detect_runtime(pref) else { return };
+
+    let script = match devcontainer::read_image_metadata(&runtime.bin, &sc.image)
+        .and_then(|snippets| devcontainer::merge(&snippets))
+    {
+        Ok(resolved) => {
+            devcontainer::attach_commands(&resolved, cfg.devcontainer.skip_lifecycle).join(" && ")
+        }
+        // A missing or unreadable image is not this function's error to raise: the session is
+        // running, and whatever is wrong will be far clearer from any other command.
+        Err(_) => return,
+    };
+    if script.is_empty() {
+        return;
+    }
+
+    let outcome = match &sc.compose {
+        Some(project) => compose::exec_script(&runtime.bin, project, &script),
+        None => match sc.container_name.as_deref() {
+            Some(name) => container::exec_script(&runtime, name, &script),
+            None => return,
+        },
+    };
+    if let Err(e) = outcome {
+        eprintln!("{} postAttachCommand failed: {e}", warning_prefix());
+    }
+}
+
 /// The `Note:` printed after either attach path when no agent could be determined at all
 /// (UC-5) — indented as a detail line under the headline it follows, same as `am start`'s own
 /// detail lines and the old container-recreate note this replaces.
@@ -1858,6 +1912,7 @@ fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
                 relaunch_into_existing_window(&repo_root, &vcs, &cfg, slug, &mut s, known_agent, resume)?;
             }
             PaneStatus::Running | PaneStatus::Ambiguous => {
+                run_post_attach(&cfg, &s);
                 println!("Attached to session '{slug}'.");
             }
         }

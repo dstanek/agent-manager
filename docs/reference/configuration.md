@@ -315,9 +315,9 @@ containers with `--rm`, every fresh container creation runs the create-time hook
 previous container's filesystem is gone, so anything they installed must be reinstalled. This
 applies both to `am start` and to `am attach` recreating a container that was gone (see
 [`am attach`](commands.md#am-attach-slug)); attaching to a container that is already running
-does not re-run them. `postAttachCommand` is still not run in either case — `am` has no
-"exec into a live container" attach path yet, only "switch tmux focus" or "recreate the
-container from scratch."
+does not re-run them. `postAttachCommand` runs in both cases, and on `am start`, since starting a session is also
+attaching to it. Attaching to a session that is already live `exec`s it into the running
+container — there being no new container command to chain it into.
 
 **Compose.** A config with `dockerComposeFile` must also name a `service`. `am` builds that
 service's image, brings the project up, runs the agent inside it, and takes the project down on

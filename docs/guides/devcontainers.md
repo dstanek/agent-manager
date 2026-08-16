@@ -202,8 +202,11 @@ create-time hooks run every time rather than once. This is not a shortcut: the p
 container's filesystem is gone, so anything `postCreateCommand` installed has to be installed
 again.
 
-`postAttachCommand` is not run. `am attach` moves tmux focus; it does not attach to the
-container, so there is no attach event to hang it off.
+`postAttachCommand` runs on every attach, which is what the spec asks for. Starting a session
+counts as attaching to it, so it runs there too, chained after the hooks above. When `am attach`
+finds a session that is already live — the case where it only moves tmux focus — the hook is
+`exec`'d into the running container instead, since there is no new container command to chain it
+into. A config with no `postAttachCommand` execs nothing.
 
 ## Worktrees and workspaces
 
@@ -228,7 +231,6 @@ unbounded work (`"context": ".."` means the whole repo), so if you edit a file y
 | Construct | Status |
 |---|---|
 | `portsAttributes` | Carried in the label, not acted on — it describes ports to an editor |
-| `postAttachCommand` | Not run (see above) |
 
 ## Troubleshooting
 
