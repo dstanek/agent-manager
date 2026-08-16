@@ -12,7 +12,7 @@
 //!            ─► write an override pinning that image and adding am's mounts and env
 //!            ─► compose -p am-<slug> up -d
 //!            ─► compose -p am-<slug> exec <service> <agent>
-//! am destroy ─► compose -p am-<slug> down -v
+//! am destroy ─► compose -p am-<slug> down          (named volumes survive)
 //! ```
 //!
 //! **`am` never parses YAML.** The compose file belongs to the project and can use anchors,
@@ -68,6 +68,9 @@ pub struct SessionCompose {
     pub files: Vec<PathBuf>,
     /// The override `am` generated, layered after `files`.
     pub override_path: PathBuf,
+    /// `runServices`, or empty for all of them.
+    #[serde(default)]
+    pub run_services: Vec<String>,
 }
 
 /// The compose project name for a session.
@@ -495,25 +498,63 @@ pub fn write_override(dir: &Path, document: &Value) -> Result<PathBuf> {
 }
 
 /// Bring the project up in the background.
+///
+/// `runServices` narrows what starts. The agent's own service is always included — the config
+/// naming it is what makes it the agent's service — so a list that forgets it still works
+/// rather than starting a project with nowhere to run.
 pub fn up(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
     let provider = provider(runtime_bin)?;
     let mut args = compose_args(&provider, &all_files(compose), &compose.project);
     args.extend(["up".to_string(), "-d".to_string()]);
+    args.extend(services_to_start(compose));
     run_built_command(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "starting the compose project")
 }
 
-/// Take the project down, removing its volumes.
+/// Take the project down.
 ///
-/// `-v` matters: a session's environment is meant to be disposable, and leaving anonymous
-/// volumes behind would accumulate state across `am destroy`/`am start` cycles that the user
-/// never asked to keep.
+/// Deliberately **without** `-v`. That flag removes the project's *named* volumes, not merely
+/// the anonymous ones — so a compose file declaring `volumes: { postgres-data: }` lost its
+/// database every time a session was destroyed. Named volumes are the project's data and
+/// outliving a session is the point of naming them; the containers and the network go, the data
+/// stays. Anonymous volumes are still cleaned up, since nothing references them afterwards.
 pub fn down(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
     let provider = provider(runtime_bin)?;
     let mut args = compose_args(&provider, &all_files(compose), &compose.project);
-    args.extend(["down".to_string(), "-v".to_string()]);
+    args.push("down".to_string());
     run_built_command(provider_command(&provider, &args), AmError::ContainerError)
         .with_context(|| "stopping the compose project")
+}
+
+/// The argv that stops the project, for chaining after the agent in the pane.
+///
+/// This is `shutdownAction: "stopCompose"`, the spec's default for a compose config: the
+/// environment stops when the session ends. `stop` rather than `down` — nothing is removed, so
+/// `am attach` brings it back and the project's data is untouched.
+pub fn stop_command(runtime_bin: &Path, compose: &SessionCompose) -> Result<Vec<String>> {
+    let provider = provider(runtime_bin)?;
+    let mut args = compose_args(&provider, &all_files(compose), &compose.project);
+    args.push("stop".to_string());
+    let mut prefixed: Vec<String> =
+        provider.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if prefixed.is_empty() {
+        return Ok(args);
+    }
+    prefixed.insert(0, "env".to_string());
+    prefixed.extend(args);
+    Ok(prefixed)
+}
+
+/// The services `up` should start.
+fn services_to_start(compose: &SessionCompose) -> Vec<String> {
+    if compose.run_services.is_empty() {
+        return Vec::new();
+    }
+    let mut services = compose.run_services.clone();
+    if !services.contains(&compose.service) {
+        services.push(compose.service.clone());
+    }
+    services
 }
 
 /// Run a shell snippet inside the agent's service, for `postAttachCommand`.
@@ -579,6 +620,7 @@ mod tests {
             service: "app".to_string(),
             files: vec![PathBuf::from("/repo/.devcontainer/docker-compose.yml")],
             override_path: PathBuf::from("/state/compose-override.yml"),
+            run_services: Vec::new(),
         }
     }
 
@@ -669,6 +711,27 @@ mod tests {
                 "unix:///run/user/1000/podman/podman.sock".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn run_services_narrows_what_starts_and_always_keeps_the_agents_own() {
+        // A project that also defines kafka and elasticsearch should not start them when the
+        // config asked for two services. Forgetting the agent's own service in that list is an
+        // easy mistake, and starting a project with nowhere to run the agent is a worse answer
+        // than quietly including it.
+        let mut compose = compose();
+        compose.run_services = vec!["db".to_string()];
+        assert_eq!(services_to_start(&compose), ["db", "app"]);
+
+        compose.run_services = vec!["app".to_string(), "db".to_string()];
+        assert_eq!(services_to_start(&compose), ["app", "db"], "no duplicate");
+    }
+
+    #[test]
+    fn no_run_services_starts_everything() {
+        // The spec's default, and it must stay an empty argument list rather than an explicit
+        // enumeration — naming services would exclude any the compose file adds later.
+        assert!(services_to_start(&compose()).is_empty());
     }
 
     #[test]

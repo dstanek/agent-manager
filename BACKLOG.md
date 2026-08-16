@@ -646,7 +646,12 @@ Follow-ups the native builder left behind:
       podman's socket, which is what `podman compose` does internally. `podman-compose` is
       excluded: v1.0.3 has no `config` subcommand, which `am` needs to read the compose file.
       `am doctor` reports whether a usable Compose was found.
-- [ ] **A compose session whose service exits** leaves the project up until `am destroy`.
+- [x] **Compose: `shutdownAction`, `runServices`, and volume safety.** `am destroy` ran
+      `compose down -v`, which removes *named* volumes — a project's database, not scratch —
+      so a session destroy deleted data the user never asked to lose. Now a plain `down`.
+      `shutdownAction` stops the project when the session ends (`"none"` opts out); `am destroy`
+      is explicit and always takes it down. `runServices` narrows what `up` starts, always
+      including the agent's own service.
 - [ ] **`postAttachCommand` runs once per `am attach` invocation**, not once per human attach —
       tmux has no "user looked at this window" event. Idempotent hooks are unaffected.
 - [ ] **The env probe truncates a variable whose value contains a newline.** It converts the

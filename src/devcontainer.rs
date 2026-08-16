@@ -217,6 +217,9 @@ pub struct MetadataSnippet {
     pub override_command: Option<bool>,
     #[serde(default)]
     pub update_remote_user_uid: Option<bool>,
+    /// What should happen to the environment when the session ends.
+    #[serde(default)]
+    pub shutdown_action: Option<String>,
     pub wait_for: Option<String>,
     pub on_create_command: Option<LifecycleCommand>,
     pub update_content_command: Option<LifecycleCommand>,
@@ -360,6 +363,9 @@ pub struct DevcontainerJson {
     pub docker_compose_file: Option<ComposeFile>,
     /// The compose service the agent runs in. Required alongside `dockerComposeFile`.
     pub service: Option<String>,
+    /// Services to start. Empty means all of them, which is the spec's default.
+    #[serde(default)]
+    pub run_services: Vec<String>,
     pub image: Option<String>,
     pub build: Option<BuildSection>,
 }
@@ -640,6 +646,8 @@ pub struct ResolvedConfig {
     /// Whether the container user's UID/GID should follow the host's. Defaults to true on
     /// Linux per the spec, which is what makes a bind-mounted worktree writable.
     pub update_remote_user_uid: Option<bool>,
+    /// `"none"` | `"stopContainer"` | `"stopCompose"`. Absent means the mode's default.
+    pub shutdown_action: Option<String>,
     pub wait_for: Option<String>,
     pub on_create: Vec<Command>,
     pub update_content: Vec<Command>,
@@ -709,6 +717,9 @@ pub fn merge(snippets: &[MetadataSnippet]) -> Result<ResolvedConfig> {
         }
         if snippet.update_remote_user_uid.is_some() {
             out.update_remote_user_uid = snippet.update_remote_user_uid;
+        }
+        if snippet.shutdown_action.is_some() {
+            out.shutdown_action = snippet.shutdown_action.clone();
         }
         if snippet.wait_for.is_some() {
             out.wait_for = snippet.wait_for.clone();

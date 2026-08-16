@@ -61,13 +61,16 @@ Feature: Dev container sessions
     And the output contains "service"
     And the worktree ".am/worktrees/my-feature" does not exist
 
-  Scenario: destroying a compose session takes the whole project down
+  # `-v` would remove the project's *named* volumes — a database, not scratch space — which
+  # outliving a session is the whole point of naming them.
+  Scenario: destroying a compose session takes the project down but keeps its named volumes
     Given I am using am's own devcontainer builder
     And the repo has a devcontainer config using docker compose
     And a session "my-feature" has been started
     When I run "am destroy my-feature --force"
     Then the command succeeds
-    And the mock podman log contains "down -v"
+    And the mock podman log contains "down"
+    And the mock podman log does not contain "down -v"
 
   # initializeCommand runs on the host, outside every boundary am provides.
   Scenario: initializeCommand is refused by default

@@ -911,6 +911,26 @@ cannot also apply. When privileges are dropped the agent runs as the image's rem
 UID may differ from the host's. The reference CLI reconciles this by rewriting the image so that
 user's UID matches; `am` does not. A test asserts the two cannot both emit a `--user` flag.
 
+## Compose: what stops, and what survives
+
+**`down -v` was deleting the project's data.** `-v` removes *named* volumes, not merely the
+anonymous ones a comment here claimed — so a compose file declaring `volumes: { postgres-data: }`
+lost its database on every `am destroy`. Outliving a session is the entire point of naming a
+volume. `am destroy` now runs a plain `down`: the containers and the network go, the data stays,
+and anonymous volumes are still collected because nothing references them afterwards.
+
+**`shutdownAction` decides what happens when the session ends**, which is the spec's "the tool
+window was closed" — not what `am destroy` does. Destroy is an explicit instruction and always
+takes the project down; refusing would leave a project `am` no longer tracks. A single container
+is already `--rm`, which *is* `stopContainer`; a compose project outlives its pane unless
+something stops it, so the pane chains a `compose stop` after the agent exits. `stop` rather than
+`down`, so `am attach` brings it back. `"none"` opts out.
+
+**`runServices` narrows what starts.** The agent's own service is always included: a list that
+forgets it is an easy mistake, and starting a project with nowhere to run the agent is a worse
+answer than quietly adding it. An empty list stays empty rather than becoming an enumeration,
+so services the compose file gains later are still started.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through

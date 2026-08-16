@@ -1203,6 +1203,7 @@ fn plan_devcontainer(
             &agent_auth.env,
             &trusted,
             &agent_cmd,
+            resolved.shutdown_action.clone(),
         )?;
         return Ok(ContainerPlan {
             cmd: plan.0,
@@ -1267,6 +1268,7 @@ fn plan_compose(
     extra_env: &[(String, String)],
     trusted: &container::DevcontainerRuntime,
     agent_cmd: &[String],
+    shutdown_action: Option<String>,
 ) -> anyhow::Result<(Vec<String>, compose::SessionCompose)> {
     compose::check_network(&cfg.container.network)?;
     let service = json
@@ -1294,9 +1296,26 @@ fn plan_compose(
         service,
         files: devcontainer::compose_files(config_path, json),
         override_path,
+        run_services: json.run_services.clone(),
     };
     compose::up(&runtime.bin, &project)?;
-    let cmd = compose::exec_command(&runtime.bin, &project, agent_cmd)?;
+    let mut cmd = compose::exec_command(&runtime.bin, &project, agent_cmd)?;
+
+    // `shutdownAction` decides what happens when the *session* ends — the spec's "the tool
+    // window was closed" — not what `am destroy` does, which is an explicit instruction and
+    // always takes the project down. A single container is already `--rm`, which is
+    // `stopContainer`; a compose project outlives its pane unless this stops it.
+    //
+    // `stop`, not `down`: reversible, and `am attach` brings it back.
+    if shutdown_action.as_deref() != Some("none") {
+        let stop = compose::stop_command(&runtime.bin, &project)?;
+        let script = format!(
+            "{}; {}",
+            cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+            stop.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+        );
+        cmd = vec!["sh".to_string(), "-c".to_string(), script];
+    }
     Ok((cmd, project))
 }
 
