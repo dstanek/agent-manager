@@ -583,10 +583,14 @@ Follow-ups the native builder left behind:
       tests via local Features — transitive pull-in, diamond dedup, cycle termination — but
       no Feature in the common registries declares `dependsOn`, so the two implementations
       have never been compared on one. Needs a Feature published for the purpose.
-- [ ] **Registry auth is anonymous only.** Private Feature registries need `docker
-      config.json` credentials and credential helpers. This one does not degrade gracefully:
-      a private ref is still a registry ref, so it is never handed to the CLI and instead
-      fails with the registry's own 401 text.
+- [x] **Registry auth.** Done 2026-08-16. `am` reads the auth files and credential helpers
+      `docker login`/`podman login` write — all five locations, since the two runtimes
+      disagree — and presents them to the token endpoint. Memoised per registry so a
+      keychain-backed helper is not invoked once per Feature. A 401 with no credentials found
+      now names the registry and the command to run.
+- [ ] **No test covers a real private registry.** The credential *lookup* is unit tested
+      including helpers via a mock binary, and the anonymous path is covered by the
+      differential tests, but nothing exercises an actual authenticated pull.
 - [x] **`overrideFeatureInstallOrder`.** Done 2026-08-15, as the spec's `roundPriority` on
       top of the round machinery `dependsOn` added. It is a priority rather than an order:
       it cannot make a Feature jump a dependency, and raising one Feature *splits* its round

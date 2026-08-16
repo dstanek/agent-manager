@@ -201,6 +201,28 @@ their *same absolute host paths* inside the container, so the relative path in a
 workspace's `.jj/repo` and the absolute `gitdir:` in a git worktree's `.git` file both
 resolve correctly. Nothing about your VCS choice needs special handling.
 
+## Private Feature registries
+
+A Feature in a private registry works if you are already logged in. `am` stores no credentials
+of its own — it reads the files the runtimes write, so `docker login ghcr.io` or
+`podman login ghcr.io` is all it takes:
+
+```text
+$REGISTRY_AUTH_FILE                     podman, explicit override
+$DOCKER_CONFIG/config.json              docker, explicit override
+~/.docker/config.json                   docker, default
+$XDG_RUNTIME_DIR/containers/auth.json   podman, default
+~/.config/containers/auth.json          podman, persistent
+```
+
+Credential helpers (`credsStore`, `credHelpers`) are used too, which is how a login survives on
+a machine with a keychain. `am` asks a helper once per registry per build, not once per Feature,
+so a keychain prompt does not stack up.
+
+If a registry refuses an anonymous pull and no credentials are found, `am` says which registry
+and what to run. A public Feature is unaffected: no credentials are looked for until a registry
+asks for them.
+
 ## The lockfile
 
 `am` reads and writes `.devcontainer/devcontainer-lock.json`, the same file the Dev Containers

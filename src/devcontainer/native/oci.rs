@@ -194,13 +194,17 @@ impl Manifest {
 /// following the challenge — rather than hardcoding ghcr's token endpoint — is what makes this
 /// work against mcr, Docker Hub, and a self-hosted registry without special cases.
 fn get_with_auth(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
-    let build = |token: Option<&str>| {
+    // Credentials are keyed by the registry, not by whatever host the token realm lives on —
+    // ghcr.io's realm is ghcr.io, but Docker Hub's is auth.docker.io.
+    let credentials = host_of(url).and_then(|host| super::auth::for_registry(&host));
+
+    let build = |authorization: Option<&str>| {
         let mut req = ureq::get(url);
         if let Some(a) = accept {
             req = req.set("Accept", a);
         }
-        if let Some(t) = token {
-            req = req.set("Authorization", &format!("Bearer {t}"));
+        if let Some(value) = authorization {
+            req = req.set("Authorization", value);
         }
         req
     };
@@ -209,8 +213,18 @@ fn get_with_auth(url: &str, accept: Option<&str>) -> Result<Vec<u8>> {
         Ok(r) => r,
         Err(ureq::Error::Status(401, r)) => {
             let challenge = r.header("WWW-Authenticate").unwrap_or_default().to_string();
-            let token = fetch_token(&challenge)?;
-            build(Some(&token)).call().map_err(|e| http_error(url, e))?
+            let authorization = if challenge.trim_start().starts_with("Basic") {
+                // A registry that wants Basic directly, with no token to redeem.
+                credentials
+                    .as_ref()
+                    .map(super::auth::Credentials::basic_header)
+                    .ok_or_else(|| unauthorized(url))?
+            } else {
+                format!("Bearer {}", fetch_token(&challenge, credentials.as_ref())?)
+            };
+            build(Some(&authorization))
+                .call()
+                .map_err(|e| enrich_unauthorized(url, e, credentials.is_some()))?
         }
         Err(e) => return Err(http_error(url, e)),
     };
@@ -241,8 +255,51 @@ fn http_error(url: &str, e: ureq::Error) -> anyhow::Error {
     AmError::DevcontainerBuildFailed(format!("fetching {url}: {detail}")).into()
 }
 
+/// The registry host an API URL addresses.
+fn host_of(url: &str) -> Option<String> {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?
+        .split('/')
+        .next()
+        .map(str::to_string)
+}
+
+/// A 401 that credentials could plausibly fix, phrased as something to act on.
+fn unauthorized(url: &str) -> anyhow::Error {
+    let host = host_of(url).unwrap_or_else(|| "the registry".to_string());
+    AmError::DevcontainerBuildFailed(format!(
+        "{host} refused an anonymous pull and no credentials were found for it\n\
+         Run `docker login {host}` (or `podman login {host}`) — am reads the same files"
+    ))
+    .into()
+}
+
+/// Turn a post-authentication 401/403 into something that says which case it is.
+///
+/// The registry's own text is kept, because "denied: requested access to the resource is
+/// denied" and "unauthorized: authentication required" mean different things and only the
+/// registry knows which applies.
+fn enrich_unauthorized(url: &str, e: ureq::Error, had_credentials: bool) -> anyhow::Error {
+    match (&e, had_credentials) {
+        (ureq::Error::Status(401 | 403, _), false) => unauthorized(url),
+        (ureq::Error::Status(401 | 403, _), true) => {
+            let host = host_of(url).unwrap_or_else(|| "the registry".to_string());
+            let detail = http_error(url, e).to_string();
+            AmError::DevcontainerBuildFailed(format!(
+                "{detail}\nam used the credentials it found for {host}. They may be expired, \
+                 or may not grant access to this Feature."
+            ))
+            .into()
+        }
+        _ => http_error(url, e),
+    }
+}
+
 /// Parse a `Bearer realm="…",service="…",scope="…"` challenge and redeem it for a token.
-fn fetch_token(challenge: &str) -> Result<String> {
+///
+/// Credentials, when there are any, are presented to the *token* endpoint with Basic auth —
+/// which is how a registry hands out a bearer token scoped to a private repository.
+fn fetch_token(challenge: &str, credentials: Option<&super::auth::Credentials>) -> Result<String> {
     let mut realm = None;
     let mut params: Vec<(String, String)> = Vec::new();
     for part in challenge.trim_start_matches("Bearer ").split(',') {
@@ -266,6 +323,9 @@ fn fetch_token(challenge: &str) -> Result<String> {
     let mut req = ureq::get(&realm);
     for (k, v) in &params {
         req = req.query(k, v);
+    }
+    if let Some(creds) = credentials {
+        req = req.set("Authorization", &creds.basic_header());
     }
     let body = req
         .call()

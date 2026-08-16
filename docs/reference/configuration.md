@@ -318,6 +318,12 @@ service's image, brings the project up, runs the agent inside it, and takes the 
 `command: sleep infinity`. `container.network = "none"` is refused for compose sessions rather
 than silently ignored, since the services need the project network to reach each other.
 
+**Registry credentials.** `am` reads `docker`/`podman` auth files (`$REGISTRY_AUTH_FILE`,
+`$DOCKER_CONFIG/config.json`, `~/.docker/config.json`,
+`$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json`) and their credential
+helpers, so a Feature in a private registry works once you have logged in with either runtime.
+It stores nothing of its own.
+
 **Lockfile.** `am` reads and writes `.devcontainer/devcontainer-lock.json` in the reference
 format. Registry Features are fetched at the digest it records, tarball downloads are checked
 against its `integrity` hash, and the file is folded into the image hash so a moved pin rebuilds.

@@ -771,6 +771,29 @@ test compares `am`'s resolved `repo@digest` strings to the CLI's, and a test ass
 rendering of *this repo's own committed lockfile* is byte-identical — so `am` writing it does
 not produce a spurious diff.
 
+## Private registries reuse the runtime's login
+
+`am` reads the auth files `docker login` and `podman login` write, and their credential helpers.
+It asks for nothing and stores nothing: a user who can already pull the *image* can already pull
+the *Feature*, which is the only property worth having here.
+
+The two runtimes disagree on where the file lives, so all five locations are consulted —
+`$REGISTRY_AUTH_FILE`, `$DOCKER_CONFIG/config.json`, `~/.docker/config.json`,
+`$XDG_RUNTIME_DIR/containers/auth.json`, `~/.config/containers/auth.json` — in that order. The
+format is identical either way.
+
+Two details worth keeping:
+
+- **Credentials go to the token endpoint, not the API endpoint.** A registry answers `401` with a
+  bearer challenge; the credentials buy a token scoped to the private repository, and the token
+  is what the API call carries. A registry that challenges with `Basic` instead is handled
+  directly.
+- **The lookup is memoised per registry.** A build resolves one manifest per Feature and they
+  usually share a registry, so without it a keychain-backed helper would prompt once per
+  Feature.
+
+Nothing is logged. A credential in an error message is a credential in a terminal scrollback.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -803,9 +826,6 @@ not produce a spurious diff.
   error the CLI raises. Harmless for the label, but it does mean a misspelled entry quietly
   does nothing. Closing it means resolving every entry against the registry — a network round
   trip spent purely on validation.
-- **Registry auth is anonymous only.** Private Feature registries need `docker config.json`
-  credentials and credential helpers; today they fall back to the CLI only if the ref happens
-  to be non-registry, otherwise they fail with the registry's own 401 text.
 - **The build-context hash gap is unchanged.** `config_hash` still does not cover files the
   Dockerfile `COPY`s. The native builder now knows the context and could close this — a
   git-aware hash of tracked files under it — but that is a separate change affecting both
