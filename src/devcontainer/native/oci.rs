@@ -44,12 +44,21 @@ pub struct FeatureRef {
     pub repository: String,
     /// Empty for a local path or a tarball — neither has a version to pin.
     pub tag: String,
+    /// Set instead of `tag` for a digest-pinned reference (`…/git@sha256:…`), which the spec
+    /// allows anywhere a Feature is named — including inside `dependsOn`.
+    pub digest: Option<String>,
     /// The id exactly as the user wrote it — this is what goes in the metadata label, so it
     /// must survive round-tripping rather than being reassembled from the parts.
     pub raw: String,
 }
 
 impl FeatureRef {
+    /// What to ask the registry for: a digest when the reference pins one, else the tag.
+    /// Both are valid in the `/manifests/<reference>` position.
+    pub fn reference(&self) -> &str {
+        self.digest.as_deref().unwrap_or(&self.tag)
+    }
+
     /// The Feature's short alias, as `overrideFeatureInstallOrder` may write it.
     ///
     /// The last path segment for a registry Feature (`git`). A tarball has no alias at all —
@@ -87,27 +96,40 @@ pub fn parse_ref(id: &str) -> FeatureRef {
         registry: String::new(),
         repository: id.to_string(),
         tag: String::new(),
+        digest: None,
         raw: id.to_string(),
     };
 
     if id.starts_with("./") || id.starts_with("../") {
         return local(id);
     }
+    // `http://` is classified here and refused in `fetch_tarball`, not rejected outright:
+    // falling through leaves it to be read as a registry reference with the host `http:`, and
+    // "no such host" is a much worse answer than naming the actual problem.
     if id.starts_with("https://") || id.starts_with("http://") {
         return FeatureRef {
             kind: FeatureKind::Tarball,
             registry: String::new(),
             repository: id.to_string(),
             tag: String::new(),
+            digest: None,
             raw: id.to_string(),
         };
     }
 
-    // Split the tag off first, but only from the last segment — a registry may carry a port
-    // (`localhost:5000/foo`), and that colon is not a tag separator.
-    let (path, tag) = match id.rsplit_once(':') {
-        Some((p, t)) if !t.contains('/') => (p, t.to_string()),
-        _ => (id, "latest".to_string()),
+    // A digest pin is checked before the tag split, because `@sha256:…` contains a colon that
+    // is emphatically not a tag separator — reading it as one leaves the repository ending in
+    // `@sha256` and silently fetches whatever `latest` happens to be.
+    let (path, tag, digest) = match id.split_once('@') {
+        Some((path, digest)) => (path, String::new(), Some(digest.to_string())),
+        None => {
+            // Split the tag off, but only from the last segment — a registry may carry a port
+            // (`localhost:5000/foo`), and that colon is not a tag separator either.
+            match id.rsplit_once(':') {
+                Some((p, t)) if !t.contains('/') => (p, t.to_string(), None),
+                _ => (id, "latest".to_string(), None),
+            }
+        }
     };
 
     let (registry, repository) = match path.split_once('/') {
@@ -122,6 +144,7 @@ pub fn parse_ref(id: &str) -> FeatureRef {
         registry,
         repository,
         tag,
+        digest,
         raw: id.to_string(),
     }
 }
@@ -134,6 +157,10 @@ pub struct Manifest {
     pub layers: Vec<Layer>,
     #[serde(default)]
     pub annotations: std::collections::BTreeMap<String, String>,
+    /// Digest of the manifest bytes. Filled in by [`fetch_manifest`] rather than deserialized:
+    /// it is a property of the document, not a field in it.
+    #[serde(skip)]
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,11 +292,24 @@ fn fetch_token(challenge: &str) -> Result<String> {
 pub fn fetch_manifest(feature: &FeatureRef) -> Result<Manifest> {
     let url = format!(
         "https://{}/v2/{}/manifests/{}",
-        feature.registry, feature.repository, feature.tag
+        feature.registry, feature.repository, feature.reference()
     );
     let body = get_with_auth(&url, Some(MANIFEST_ACCEPT))?;
-    serde_json::from_slice(&body)
-        .with_context(|| format!("parsing the OCI manifest for {}", feature.raw))
+    let mut manifest: Manifest = serde_json::from_slice(&body)
+        .with_context(|| format!("parsing the OCI manifest for {}", feature.raw))?;
+    // The spec identifies an OCI Feature by its *manifest* digest, not its layer's: two
+    // manifests can share a layer while differing in metadata or dependencies, and treating
+    // those as one Feature would install one and silently drop the other's dependsOn. Computed
+    // over the bytes as served, which is what a registry means by a manifest digest.
+    manifest.digest = digest_of(&body);
+    Ok(manifest)
+}
+
+/// The `sha256:…` digest of some bytes.
+pub fn digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let sum = Sha256::digest(bytes);
+    format!("sha256:{}", sum.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 /// Download and unpack a Feature's layer, returning the directory holding its files.
@@ -317,6 +357,17 @@ pub fn fetch_layer(feature: &FeatureRef, layer: &Layer, cache_root: &Path) -> Re
 /// there is no immutable name to look up first. The download therefore happens every build, and
 /// only the unpacking is skipped on a hit.
 pub fn fetch_tarball(feature: &FeatureRef, cache_root: &Path) -> Result<(PathBuf, String)> {
+    // The spec defines direct references as an HTTPS URI, and the reference CLI refuses
+    // anything else. A Feature is code that runs as root while the image is built, so fetching
+    // it over a channel with no integrity guarantee is not a convenience worth offering.
+    if !feature.raw.starts_with("https://") {
+        return Err(AmError::DevcontainerBuildFailed(format!(
+            "Feature '{}' is not an https:// URL — a Feature tarball must be served over \
+             HTTPS, since it runs as root while the image is built",
+            feature.raw
+        ))
+        .into());
+    }
     let body = get_with_auth(&feature.raw, None)
         .with_context(|| format!("downloading {}", feature.raw))?;
 
@@ -417,6 +468,38 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_pinned_reference_keeps_its_digest() {
+        // `@sha256:…` contains a colon that is not a tag separator. Reading it as one leaves
+        // the repository ending in `@sha256` and quietly fetches `latest` instead of the pinned
+        // Feature — which the spec allows anywhere a Feature is named, `dependsOn` included.
+        let r = parse_ref("ghcr.io/devcontainers/features/git@sha256:abc123");
+        assert_eq!(r.kind, FeatureKind::Registry);
+        assert_eq!(r.repository, "devcontainers/features/git");
+        assert_eq!(r.digest.as_deref(), Some("sha256:abc123"));
+        assert_eq!(r.reference(), "sha256:abc123", "the registry is asked for the digest");
+        assert_eq!(r.untagged(), "ghcr.io/devcontainers/features/git");
+    }
+
+    #[test]
+    fn a_tagged_reference_asks_for_its_tag() {
+        let r = parse_ref("ghcr.io/devcontainers/features/git:1");
+        assert_eq!(r.digest, None);
+        assert_eq!(r.reference(), "1");
+    }
+
+    #[test]
+    fn an_http_tarball_is_refused_with_a_message_about_https() {
+        // Classified as a tarball so the error can name the real problem — reading it as a
+        // registry reference instead would fail with "no such host: http:".
+        let feature = parse_ref("http://example.com/f.tgz");
+        assert_eq!(feature.kind, FeatureKind::Tarball);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = fetch_tarball(&feature, tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("https"), "must say what is required: {err}");
+        assert!(err.contains("example.com"), "must name the offending id: {err}");
+    }
+
+    #[test]
     fn a_bare_name_is_not_treated_as_docker_hub() {
         // No dot in the first segment, so this cannot be a registry host. Reading it as a
         // local path means a typo surfaces as a missing directory rather than as a confusing
@@ -479,3 +562,4 @@ mod tests {
         );
     }
 }
+

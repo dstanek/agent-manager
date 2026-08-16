@@ -715,6 +715,28 @@ The exec is best-effort and never fails the attach: it runs on the path whose en
 switching to a window that already works. A config with no `postAttachCommand` execs nothing, so
 the common case costs no extra process at all.
 
+## Spec details that only a probe would have caught
+
+Four of these were found by review rather than by the differential tests, which is worth noting:
+the label is the contract between builders, so anything that does not change the label — option
+*names*, identity, reference parsing — is invisible to them.
+
+- **Option names are normalised, not just uppercased.** `my-option` becomes `MY_OPTION`. The rule
+  was measured by building a Feature whose options exercise each case: every non-word character
+  becomes `_`, then a *leading run* of digits and underscores collapses to a single `_`, then the
+  whole thing is uppercased. So `2fa` → `_FA` (replaced, not prefixed), `12ab` → `_AB`,
+  `__dunder` → `_DUNDER`, but `a--b` → `A__B` — repeated separators are not collapsed anywhere
+  except at the front. Uppercasing alone produced `MY-OPTION`, which is not a valid shell
+  assignment, so the generated env file failed to source and took the Feature install with it.
+- **Identity is the manifest digest, not the layer's.** Two manifests can share a layer while
+  differing in metadata or `dependsOn`; keying on the layer would collapse them into one install
+  and silently drop the other's dependencies.
+- **A digest-pinned reference is a distinct form.** `…/git@sha256:…` has a colon that is not a
+  tag separator, and the spec allows the form anywhere a Feature is named, `dependsOn` included.
+- **A tarball must be HTTPS.** Refused at fetch time rather than at parse time, deliberately:
+  classifying `http://` as anything else leaves it read as a registry reference with the host
+  `http:`, and "no such host" is a worse answer than naming the real problem.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -738,6 +760,12 @@ the common case costs no extra process at all.
 - **`portsAttributes` and `otherPortsAttributes` are carried but not acted on.** They exist to
   tell an editor how to treat a forwarded port — a label, whether to open a browser — and `am`
   has no equivalent. They now reach the label, which is what a downstream reader needs.
+- **The image hash covers local Features but not registry or tarball ones.** Editing a vendored
+  Feature now changes the image name, because its files are build input exactly as the Dockerfile
+  is. A moving registry tag or a changed tarball still does not: detecting either means a network
+  round trip, and doing one per `am start` would undo the point of hashing. This is what
+  `devcontainer-lock.json` exists for in the reference implementation; `--rebuild` is the answer
+  until `am` has an equivalent.
 - **A port conflict surfaces as a runtime failure**, not a preflight one. `am` does not check
   whether a forwarded port is already bound before starting the session.
 - **A typo'd `overrideFeatureInstallOrder` entry is silently ignored** rather than being the

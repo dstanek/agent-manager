@@ -117,9 +117,11 @@ pub struct ResolvedFeature {
     /// round-stable sort uses these: the spec tie-breaks on user-defined options, so a default
     /// the author never typed must not affect where the Feature lands.
     pub supplied: BTreeMap<String, Value>,
-    /// Content digest of the Feature's layer. Two Features are the same Feature when their
-    /// contents and options match, and the digest is what "same contents" means for a registry
-    /// Feature — a moving tag like `:1` resolving to the same bytes is not a second install.
+    /// Content digest. Two Features are the same Feature when their contents and options
+    /// match, and this is what "same contents" means per source: the **manifest** digest for a
+    /// registry Feature — not its layer's, since two manifests can share a layer while
+    /// differing in metadata or `dependsOn` — the tarball's bytes for a tarball, and the
+    /// resolved path for a local Feature, which the spec says is always distinct.
     pub digest: String,
     /// [`Self::key`] of every Feature this one hard-depends on, resolved. Keys rather than
     /// indices because ordering permutes the set.
@@ -232,15 +234,42 @@ pub fn resolve_options(
     let mut out = BTreeMap::new();
     for (name, def) in &metadata.options {
         if let Some(default) = &def.default {
-            out.insert(name.to_uppercase(), stringify(default));
+            out.insert(option_env_name(name), stringify(default));
         }
     }
     for (name, value) in supplied {
         // An option the Feature never declared is still passed through: some Features read
         // env vars they do not document, and dropping the value would silently ignore it.
-        out.insert(name.to_uppercase(), stringify(value));
+        out.insert(option_env_name(name), stringify(value));
     }
     out
+}
+
+/// Turn an option name into the environment variable the install contract exposes it as.
+///
+/// Uppercasing alone is not enough: an option called `my-option` would become `MY-OPTION`, which
+/// is not a valid shell assignment, so the generated env file would fail to source and take the
+/// whole Feature install down with it.
+///
+/// The rule is the reference CLI's, established by building a Feature whose options exercise
+/// each case rather than by reading the prose:
+///
+/// | option | variable |
+/// |---|---|
+/// | `my-option` | `MY_OPTION` |
+/// | `dotted.name` | `DOTTED_NAME` |
+/// | `a--b` | `A__B` — repeated separators are *not* collapsed |
+/// | `2fa` | `_FA` — a leading digit is replaced, not prefixed |
+/// | `12ab` | `_AB` — and a leading *run* collapses to one underscore |
+/// | `__dunder` | `_DUNDER` |
+fn option_env_name(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let rest = replaced.trim_start_matches(|c: char| c.is_ascii_digit() || c == '_');
+    let leading = if rest.len() == replaced.len() { "" } else { "_" };
+    format!("{leading}{rest}").to_uppercase()
 }
 
 /// Render an option value the way the install contract expects.
@@ -477,6 +506,42 @@ mod tests {
         let options = resolve_options(&metadata, &supplied);
         assert_eq!(options.get("VERSION").map(String::as_str), Some("latest"));
         assert_eq!(options.get("PPA").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn option_names_become_valid_shell_variables() {
+        // Every case measured against a real `devcontainer build` — see `option_env_name`.
+        // `MY-OPTION` would not be a valid assignment, so getting this wrong does not degrade
+        // an option, it takes the whole Feature install down when the env file is sourced.
+        for (option, expected) in [
+            ("plain", "PLAIN"),
+            ("my-option", "MY_OPTION"),
+            ("dotted.name", "DOTTED_NAME"),
+            ("with space", "WITH_SPACE"),
+            ("a--b", "A__B"),
+            ("2fa", "_FA"),
+            ("12ab", "_AB"),
+            ("__dunder", "_DUNDER"),
+            ("_1mixed", "_MIXED"),
+            ("_leading", "_LEADING"),
+        ] {
+            assert_eq!(option_env_name(option), expected, "for option {option}");
+        }
+    }
+
+    #[test]
+    fn a_supplied_option_is_normalised_the_same_way_as_a_default() {
+        let metadata = FeatureMetadata {
+            options: BTreeMap::from([(
+                "my-option".to_string(),
+                OptionDef { default: Some(Value::String("a".into())) },
+            )]),
+            ..Default::default()
+        };
+        let supplied = BTreeMap::from([("other-one".to_string(), Value::String("b".into()))]);
+        let resolved = resolve_options(&metadata, &supplied);
+        assert_eq!(resolved.get("MY_OPTION").map(String::as_str), Some("a"));
+        assert_eq!(resolved.get("OTHER_ONE").map(String::as_str), Some("b"));
     }
 
     #[test]
