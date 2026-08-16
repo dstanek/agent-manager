@@ -579,6 +579,14 @@ Found by a spec review on 2026-08-16 and fixed:
 - [x] **`shutdownAction` was missing from the config key list.**
 - [x] **`remoteEnv` rejected the spec's `null`**, failing the whole label parse after a build.
 
+- [x] **Variable substitution.** `${devcontainerId}` implemented (an unimplemented one
+      expanded to `""`, so every docker-in-docker session on a host shared one volume);
+      `${containerEnv:VAR}` now reads the container's environment rather than the config's own
+      map; `${localEnv:VAR:default}` defaults and the `${env:}` alias supported; an unknown
+      variable is left literal as the reference implementation does. `workspaceFolder` is
+      substituted before it becomes `${containerWorkspaceFolder}`, and Feature entrypoints are
+      substituted.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

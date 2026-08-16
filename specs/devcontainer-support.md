@@ -837,6 +837,30 @@ transcribed from the CLI's `pickFeatureProperties`/`pickConfigProperties` and as
 because a probe can only reveal the properties the probed Feature happened to declare — which is
 exactly how both omissions survived.
 
+## Variable substitution
+
+Four rules, each of which was wrong in a way that only shows up in a running container:
+
+- **An unknown variable is left literal**, not collapsed to `""`. Every unmatched branch in the
+  reference implementation returns the original text. Collapsing was actively harmful:
+  `${devcontainerId}` became the empty string, so a Feature naming a volume
+  `dind-var-lib-docker-${devcontainerId}` produced the *same* name in every session — two
+  `docker-in-docker` sessions on one host ran two daemons over one `/var/lib/docker`, which is
+  the exact collision the variable exists to prevent.
+- **`${devcontainerId}` is the session's container name** — derived from the repository path and
+  the slug, so it is unique on the host and stable across rebuilds, which is what the spec asks.
+  Deriving it from the config would have renamed a Feature's volumes on every config edit.
+- **`${containerEnv:VAR}` resolves against the container's environment**, which is the image's
+  own plus the config's contributions — not the config's `containerEnv` alone. The documented
+  idiom `"PATH": "${containerEnv:PATH}:/extra"` used to yield `:/extra` and *replace* the
+  image's `PATH`, leaving the agent with almost nothing resolvable.
+- **`${localEnv:VAR:default}` supports defaults**, and `${env:VAR}` is an accepted alias.
+
+Two ordering details: `workspaceFolder` is substituted *before* it becomes the value
+`${containerWorkspaceFolder}` expands to, since substitution does not re-scan its own output and
+`/workspaces/${localWorkspaceFolderBasename}` is the common spelling; and Feature entrypoints are
+substituted, which the spec requires for `${devcontainerId}`.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
