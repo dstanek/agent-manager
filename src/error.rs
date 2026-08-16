@@ -42,8 +42,6 @@ pub enum AmError {
     #[error("container error: {0}")]
     ContainerError(String),
 
-    #[error("devcontainer CLI not found: '{0}' is not on PATH — install it with `npm install -g @devcontainers/cli` (needs Node 20+), set devcontainer.cli in config, or use container.mode = \"image\"")]
-    DevcontainerCliNotFound(String),
 
     #[error("devcontainer build failed: {0}")]
     DevcontainerBuildFailed(String),

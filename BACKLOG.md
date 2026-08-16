@@ -553,10 +553,20 @@ Follow-ups phase 1 left behind:
       hash of tracked files under it, but the fix belongs to both builders, so it stayed out
       of that change.
 
-**The Node dependency is gone.** As of 2026-08-16 there is no config shape that sends `am` to
-`@devcontainers/cli`. The last one was not a construct at all — it was a config naming nothing
-to build from, which the reference CLI rejects too, so it became an error instead of a
-delegation. `builder = "cli"` survives as an escape hatch nothing selects automatically.
+**The Node dependency is gone, and the code that could reintroduce it with it.** As of
+2026-08-16 `am` builds every config shape the spec defines and has no path to
+`@devcontainers/cli` at all: `devcontainer.builder`, `devcontainer.cli`, the
+`devcontainer build` invocation, and `doctor`'s CLI and Node checks are removed. A config `am`
+cannot build is one the reference CLI rejects too, and is reported as an error.
+
+The CLI remains a *test* dependency: the differential tests build the same configs both ways
+and compare labels, and `devcontainer features resolve-dependencies` is the oracle for install
+order. That is what keeps the builder honest, and is why the repo's own dev container still
+installs it.
+
+Two config keys were removed rather than deprecated. `am` warns on unknown keys instead of
+failing, so an existing `builder = "cli"` or `cli = "..."` produces a warning and is ignored —
+worth a line in the release notes alongside the `container.agent` removal.
 
 Follow-ups the native builder left behind:
 

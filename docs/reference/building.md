@@ -7,8 +7,9 @@ cleanly on every supported platform with a stock toolchain.
 
 The repo ships a [`.devcontainer/`](https://github.com/dstanek/agent-manager/tree/main/.devcontainer)
 with everything the project's own checks need: the Rust toolchain with clippy and
-rustfmt, `jj`, `tmux`, the docs toolchain, Node with `@devcontainers/cli`, and
-`gh`. Open it in any editor that supports dev containers, or build it directly:
+rustfmt, `jj`, `tmux`, the docs toolchain, and `gh` — plus Node with
+`@devcontainers/cli`, which `am` itself never uses but the `#[ignore]`d differential tests
+compare against. Open it in any editor that supports dev containers, or build it directly:
 
 ```sh
 devcontainer build --workspace-folder .

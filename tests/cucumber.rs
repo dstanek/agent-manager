@@ -85,10 +85,6 @@ pub struct AmWorld {
     /// Extra environment variables injected into the next `run_am` call.
     extra_env: Vec<(String, String)>,
     /// When Some, the `devcontainer` CLI is mocked (+ log file).
-    mock_devcontainer_bin: Option<PathBuf>,
-    mock_devcontainer_log: Option<PathBuf>,
-    /// Which builder the scenario pins, via `AM_DEVCONTAINER_BUILDER`.
-    devcontainer_builder: Option<&'static str>,
     /// Touched by the mock CLI on a successful build; the mock runtime reports an image
     /// as present only once it exists, so "build" and "reuse" are distinguishable.
     mock_image_marker: Option<PathBuf>,
@@ -114,9 +110,6 @@ impl Default for AmWorld {
             mock_podman_bin: None,
             mock_podman_log: None,
             extra_env: Vec::new(),
-            mock_devcontainer_bin: None,
-            mock_devcontainer_log: None,
-            devcontainer_builder: None,
             mock_image_marker: None,
             mock_label_file: None,
             isolated_home: None,
@@ -350,6 +343,10 @@ impl AmWorld {
                  exit 0\n\
              fi\n\
              if [ \"$1\" = \"build\" ]; then\n\
+                 if [ -n \"$MOCK_BUILD_FAILS\" ]; then\n\
+                     echo 'An error occurred building the container' >&2\n\
+                     exit 1\n\
+                 fi\n\
                  touch \"$MOCK_IMAGE_MARKER\"\n\
                  exit 0\n\
              fi\n\
@@ -372,48 +369,6 @@ impl AmWorld {
         self.mock_label_file = Some(label);
     }
 
-    /// Install a mock `devcontainer` CLI. `succeed = false` reproduces the real failure
-    /// shape: exit 1 with an error JSON on stdout.
-    fn setup_mock_devcontainer_cli(&mut self, succeed: bool) {
-        let bin = self.project_dir.path().join("mock_devcontainer");
-        let log = self.project_dir.path().join("mock_devcontainer.log");
-        let body = if succeed {
-            "touch \"$MOCK_IMAGE_MARKER\"\n\
-             echo '{\"outcome\":\"success\"}'\n\
-             exit 0\n"
-        } else {
-            "echo '{\"outcome\":\"error\",\"message\":\"Command failed: podman pull nope\",\
-             \"description\":\"An error occurred building the container.\"}'\n\
-             exit 1\n"
-        };
-        fs::write(
-            &bin,
-            format!(
-                // --version is answered before anything else and is not logged: `am
-                // doctor` probes it, and treating a probe as a build would both create
-                // the built-image marker and inflate the call count.
-                "#!/bin/sh\n\
-                 if [ \"$1\" = \"--version\" ]; then\n\
-                     echo '0.88.0'\n\
-                     exit 0\n\
-                 fi\n\
-                 if [ -n \"$MOCK_DEVCONTAINER_LOG\" ]; then\n\
-                     echo \"$@\" >> \"$MOCK_DEVCONTAINER_LOG\"\n\
-                 fi\n{body}"
-            ),
-        )
-        .expect("write mock devcontainer");
-        #[cfg(unix)]
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-            .expect("chmod mock devcontainer");
-        self.mock_devcontainer_bin = Some(bin);
-        self.mock_devcontainer_log = Some(log);
-    }
-
-    /// Write a devcontainer config and commit it, so it appears in session worktrees.
-    ///
-    /// Committing matters: `git worktree add` checks out a branch, so an uncommitted
-    /// config would simply not exist in the worktree am discovers against.
     fn write_devcontainer_config(&mut self, body: &str) {
         let dir = self.project_path().join(".devcontainer");
         fs::create_dir_all(&dir).expect("create .devcontainer");
@@ -421,12 +376,7 @@ impl AmWorld {
         let project = self.project_path().to_path_buf();
         run_git(&["add", "-A"], &project);
         run_git(
-            &[
-                "commit",
-                "--no-verify",
-                "-m",
-                "chore: add devcontainer config",
-            ],
+            &["commit", "--no-verify", "-m", "chore: add devcontainer config"],
             &project,
         );
     }
@@ -484,16 +434,6 @@ impl AmWorld {
             cmd.env("AM_CONTAINER_ENABLED", "false");
         }
 
-        // Devcontainer mocks, when the scenario set them up.
-        if let Some(ref bin) = self.mock_devcontainer_bin.clone() {
-            cmd.env("AM_DEVCONTAINER_BIN", bin);
-            if let Some(ref log) = self.mock_devcontainer_log.clone() {
-                cmd.env("MOCK_DEVCONTAINER_LOG", log);
-            }
-        }
-        if let Some(builder) = self.devcontainer_builder {
-            cmd.env("AM_DEVCONTAINER_BUILDER", builder);
-        }
         // Keep am's own builder off the developer's real cache: it stages build inputs under
         // the feature cache, and a test must not write there.
         cmd.env(
@@ -863,35 +803,19 @@ async fn given_record_global_config(world: &mut AmWorld) {
 
 // ── When ──────────────────────────────────────────────────────────────────────
 
-/// Pins `builder = "cli"`: a scenario that mocks the CLI is a scenario about the CLI path,
-/// and under the default (`auto`) `am`'s own builder would handle these configs instead.
-#[given("I am using a mock devcontainer CLI")]
-async fn given_mock_devcontainer(world: &mut AmWorld) {
-    world.setup_mock_devcontainer_runtime();
-    world.setup_mock_devcontainer_cli(true);
-    world.devcontainer_builder = Some("cli");
-}
-
-#[given("I am using a mock devcontainer CLI that fails")]
-async fn given_failing_devcontainer(world: &mut AmWorld) {
-    world.setup_mock_devcontainer_runtime();
-    world.setup_mock_devcontainer_cli(false);
-    world.devcontainer_builder = Some("cli");
-}
-
-/// The CLI is still mocked so a scenario can assert it was *not* reached.
+/// The devcontainer-aware mock runtime. There is only one builder now, so this is the only
+/// devcontainer setup step.
 #[given("I am using am's own devcontainer builder")]
 async fn given_native_builder(world: &mut AmWorld) {
     world.setup_mock_devcontainer_runtime();
-    world.setup_mock_devcontainer_cli(true);
-    world.devcontainer_builder = Some("auto");
 }
 
-#[given("I am using am's own devcontainer builder with no fallback")]
-async fn given_strict_native_builder(world: &mut AmWorld) {
+/// Same, with the runtime's `build` failing — the driver for the rollback scenario, which used
+/// to be a failing CLI.
+#[given("I am using a devcontainer builder whose build fails")]
+async fn given_failing_build(world: &mut AmWorld) {
     world.setup_mock_devcontainer_runtime();
-    world.setup_mock_devcontainer_cli(true);
-    world.devcontainer_builder = Some("native");
+    world.extra_env.push(("MOCK_BUILD_FAILS".to_string(), "1".to_string()));
 }
 
 #[given("the repo has a devcontainer config")]
@@ -1433,33 +1357,6 @@ async fn then_podman_log_contains(world: &mut AmWorld, text: String) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-#[then(expr = "the mock devcontainer log contains {string}")]
-async fn then_devcontainer_log_contains(world: &mut AmWorld, text: String) {
-    let log = world
-        .mock_devcontainer_log
-        .as_ref()
-        .expect("mock devcontainer CLI was not set up for this scenario");
-    let contents = fs::read_to_string(log).unwrap_or_default();
-    assert!(
-        contents.contains(&text),
-        "devcontainer log missing {text:?}\n--- log ---\n{contents}"
-    );
-}
-
-#[then(expr = "the mock devcontainer CLI was called {int} time(s)")]
-async fn then_devcontainer_called_times(world: &mut AmWorld, expected: usize) {
-    let log = world
-        .mock_devcontainer_log
-        .as_ref()
-        .expect("mock devcontainer CLI was not set up for this scenario");
-    let contents = fs::read_to_string(log).unwrap_or_default();
-    let calls = contents.lines().filter(|l| !l.trim().is_empty()).count();
-    assert_eq!(
-        calls, expected,
-        "expected {expected} CLI call(s), got {calls}\n--- log ---\n{contents}"
-    );
-}
 
 /// Read a file's mtime and full content together, so "is unchanged" can assert both at
 /// once — the no-op contract `am setup`'s `update_*` functions promise is "not touched at

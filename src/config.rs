@@ -170,32 +170,12 @@ impl Default for ContainerConfig {
     }
 }
 
-/// Which implementation turns a `devcontainer.json` into an image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Builder {
-    /// `am`'s own builder. Nothing sends it to the reference CLI: a config it cannot build is
-    /// one the reference CLI rejects too, and is reported as an error rather than delegated.
-    #[default]
-    Auto,
-    /// The same builder. Kept as a synonym for `Auto` because it was the way to say "never
-    /// silently reintroduce Node", which is now simply the behaviour.
-    Native,
-    /// Shell out to `@devcontainers/cli`. The only way to reach it — an escape hatch for a
-    /// config `am`'s builder gets wrong, not a fallback anything selects on its own.
-    Cli,
-}
-
 /// Settings that only apply when a session's environment comes from a
 /// `devcontainer.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DevcontainerConfig {
     /// Explicit config path, relative to the session worktree. `None` = discover.
     pub path: Option<PathBuf>,
-    /// Which builder produces the image. See [`Builder`].
-    pub builder: Builder,
-    /// The `devcontainer` CLI binary. Overridden by `AM_DEVCONTAINER_BIN`.
-    pub cli: String,
     pub agent_install: AgentInstall,
     /// Whether `initializeCommand` may run on the host. Off by default —
     /// `am` exists to isolate agents, and this is repo-controlled code.
@@ -206,21 +186,6 @@ pub struct DevcontainerConfig {
     pub home: Option<PathBuf>,
     /// Extra Features to inject at build time, as `id -> options JSON`.
     pub extra_features: HashMap<String, String>,
-}
-
-impl Default for DevcontainerConfig {
-    fn default() -> Self {
-        Self {
-            path: None,
-            builder: Builder::default(),
-            cli: "devcontainer".to_string(),
-            agent_install: AgentInstall::default(),
-            allow_host_commands: false,
-            skip_lifecycle: false,
-            home: None,
-            extra_features: HashMap::new(),
-        }
-    }
 }
 
 /// Settings for `am attach`.
@@ -374,8 +339,6 @@ struct FileContainer {
 #[derive(Debug, Deserialize, Default)]
 struct FileDevcontainer {
     path: Option<PathBuf>,
-    builder: Option<Builder>,
-    cli: Option<String>,
     agent_install: Option<AgentInstall>,
     allow_host_commands: Option<bool>,
     skip_lifecycle: Option<bool>,
@@ -521,12 +484,6 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
     }
 
     apply_opt_some(&mut base.devcontainer.path, file.devcontainer.path);
-    apply_opt(&mut base.devcontainer.builder, file.devcontainer.builder);
-    if let Some(cli) = file.devcontainer.cli {
-        if !cli.is_empty() {
-            base.devcontainer.cli = cli;
-        }
-    }
     apply_opt(
         &mut base.devcontainer.agent_install,
         file.devcontainer.agent_install,
@@ -621,7 +578,6 @@ pub fn render_project_config_skeleton() -> &'static str {
 # Applies only when container.mode resolves to "devcontainer".
 [devcontainer]
 # path = ""                  # explicit devcontainer.json, relative to the worktree
-# builder = "auto"           # "auto" (am builds it, CLI as fallback) | "native" | "cli"
 # agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
 # allow_host_commands = false # let initializeCommand run on the HOST — off by default
 # skip_lifecycle = false     # skip postCreateCommand and friends
@@ -656,8 +612,6 @@ pub fn global_config_template() -> &'static str {
 #   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
 #   AM_CONTAINER_NETWORK, AM_CONTAINER_SSH_AGENT, AM_CONTAINER_USER
 #   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS
-#   AM_DEVCONTAINER_BUILDER ("auto" | "native" | "cli")
-#   AM_DEVCONTAINER_BIN (path to the `devcontainer` CLI)
 #   AM_FEATURE_CACHE (where am's own builder caches downloaded Features)
 
 [defaults]
@@ -704,16 +658,6 @@ ssh_agent = true       # forward the host's SSH_AUTH_SOCK, so a passphrase-prote
 [devcontainer]
 # path = ""                    # explicit devcontainer.json, relative to the session worktree;
                                # default is to discover .devcontainer/devcontainer.json
-builder = "auto"               # which builder turns devcontainer.json into an image:
-                               #   "auto"   — am's own builder. Never delegates: a config it
-                               #              cannot build is one the CLI rejects too
-                               #   "native" — a synonym for "auto"
-                               #   "cli"    — use @devcontainers/cli instead. An escape hatch
-                               #              for a config am gets wrong; nothing selects it
-                               #              automatically
-cli = "devcontainer"           # CLI binary name or path (AM_DEVCONTAINER_BIN overrides).
-                               # Only used when builder = "cli"; installing it takes
-                               # `npm install -g @devcontainers/cli` and Node 20+.
 agent_install = "auto"         # how the agent gets into the image:
                                #   "feature"   — inject the agent's devcontainer Feature at build
                                #   "bootstrap" — install into a shared volume at run time
@@ -830,14 +774,6 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
     if let Ok(val) = std::env::var("AM_DEVCONTAINER_PATH") {
         if !val.is_empty() {
             config.devcontainer.path = Some(PathBuf::from(val));
-        }
-    }
-    if let Ok(val) = std::env::var("AM_DEVCONTAINER_BUILDER") {
-        match val.as_str() {
-            "auto" => config.devcontainer.builder = Builder::Auto,
-            "native" => config.devcontainer.builder = Builder::Native,
-            "cli" => config.devcontainer.builder = Builder::Cli,
-            _ => {}
         }
     }
     if let Ok(val) = std::env::var("AM_DEVCONTAINER_AGENT_INSTALL") {
@@ -1031,26 +967,6 @@ imag = "nope:latest"
         assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
     }
 
-    /// `devcontainer.builder` is a real field, so the unknown-key catch-all must not see it.
-    /// Adding a config key without wiring it into `FileDevcontainer` would warn on every run.
-    #[test]
-    fn the_builder_key_is_recognised_and_applied() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let _env = EnvGuard::save(&["AM_AGENT", "AM_DEVCONTAINER_BUILDER"]);
-        std::env::remove_var("AM_AGENT");
-        std::env::remove_var("AM_DEVCONTAINER_BUILDER");
-        let tmp = TempDir::new().unwrap();
-
-        let project = write_toml(
-            tmp.path(),
-            "project.toml",
-            "[devcontainer]\nbuilder = \"native\"\n",
-        );
-
-        let config = load_with_global(None, Some(&project)).unwrap();
-        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
-        assert_eq!(config.devcontainer.builder, Builder::Native);
-    }
 
     #[test]
     fn unknown_keys_name_the_file_they_came_from() {
@@ -1800,7 +1716,6 @@ user = "../root"
         assert!(!config.devcontainer.allow_host_commands);
         assert!(!config.devcontainer.skip_lifecycle);
         assert_eq!(config.devcontainer.agent_install, AgentInstall::Auto);
-        assert_eq!(config.devcontainer.cli, "devcontainer");
     }
 
     #[test]

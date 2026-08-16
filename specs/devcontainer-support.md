@@ -512,11 +512,24 @@ devcontainer.json", and `build.dockerfile` has no default there either. Delegati
 second tool the same unanswerable question, and when the CLI was not installed it answered a
 typo'd config with "install Node". It is an error now, naming what to add.
 
-That emptied `Unsupported`, and with it the fallback machinery: the `Ok(Err(reason))` signal
-threaded through `build`, the "Falling back to the devcontainer CLI" line, the strict-mode error
-that had nothing left to be strict about, and `doctor`'s reason to demand Node.
-`devcontainer.builder = "cli"` remains as a deliberate escape hatch — the only way to reach the
-reference CLI, and one nothing selects on its own.
+That emptied `Unsupported`, and with it the fallback machinery. The CLI delegation went next:
+with nothing selecting it and nothing needing it, `devcontainer.builder`, `devcontainer.cli`,
+`AM_DEVCONTAINER_BUILDER`, `AM_DEVCONTAINER_BIN`, the `devcontainer build` invocation and its
+result-JSON parsing, and `doctor`'s CLI and Node checks are all gone.
+
+**The design in *Why this over the alternatives* has therefore inverted, and it is worth saying
+why that is not an admission the split was wrong.** The build/run split was chosen so the Node
+dependency sat behind one replaceable call, and predicted that a Rust builder would "swap that
+one call" and leave the run path untouched. That is exactly what happened — the run path never
+learned which builder produced an image, because the `devcontainer.metadata` label was the only
+contract between them. The spike's estimate of the build half (~8,000 lines, "a project with its
+own cadence") was the part that proved wrong: reading the reference CLI's actual output rather
+than the specification made it about a tenth of that.
+
+The reference CLI is still a dependency of the *test suite* — the differential tests build the
+same configs both ways and compare labels, and `devcontainer features resolve-dependencies` is
+the oracle for install order. That is a development-time dependency, not a runtime one, and it
+is what keeps the builder honest.
 
 ## Compose is a second run model, not a builder change
 

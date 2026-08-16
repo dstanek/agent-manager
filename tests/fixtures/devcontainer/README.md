@@ -16,8 +16,6 @@ label format changes; hand-editing defeats the purpose.
 | `features-metadata-label.json` | The `devcontainer.metadata` label the build produced from it |
 | `properties-devcontainer.json` | Input config exercising every property `am` might consume |
 | `properties-metadata-label.json` | Its label — the authority on which properties survive into the label and which do not |
-| `build-success.stdout.json` | `devcontainer build` stdout on success (exit 0) |
-| `build-error.stdout.json` | `devcontainer build` stdout on a nonexistent base image (exit 1) |
 
 Labels are pretty-printed for reviewability. Podman emits them as one line; JSON is
 whitespace-insensitive, so parsers see the same document either way.

@@ -124,7 +124,7 @@ Feature: am setup — guided setup
 
   Scenario: a discovered devcontainer config is reported, with no prompt
     Given claude credentials are present
-    And I am using a mock devcontainer CLI
+    And I am using am's own devcontainer builder
     And the repo has a devcontainer config
     When I run "am setup --yes"
     Then the command succeeds
@@ -141,7 +141,7 @@ Feature: am setup — guided setup
   # step-6 note runs *before* the verification step re-derives and fails on the same fact.
   Scenario: a devcontainer with initializeCommand is flagged, never silently enabled
     Given claude credentials are present
-    And I am using a mock devcontainer CLI
+    And I am using am's own devcontainer builder
     And the repo has a devcontainer config with an initializeCommand
     When I run "am setup --yes"
     Then the command fails
