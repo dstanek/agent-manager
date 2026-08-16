@@ -57,16 +57,51 @@ pub enum NamedCommand {
     Argv(Vec<String>),
 }
 
+/// A shell snippet running every member of a named lifecycle group concurrently.
+///
+/// Each member is backgrounded and every pid is waited on individually, so the group fails if
+/// *any* member fails — a bare `wait` reports only the last one, which would let a failed setup
+/// step pass unnoticed.
+fn parallel_script(map: &BTreeMap<String, NamedCommand>) -> String {
+    let mut script = String::from("__am_pids=''\n");
+    for value in map.values() {
+        let command = match value {
+            NamedCommand::Shell(s) => s.clone(),
+            NamedCommand::Argv(a) => a
+                .iter()
+                .map(|arg| crate::command::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        script.push_str(&format!("{{ {command} ; }} &\n__am_pids=\"$__am_pids $!\"\n"));
+    }
+    script.push_str(
+        "__am_rc=0\n\
+         for __am_p in $__am_pids; do wait \"$__am_p\" || __am_rc=1; done\n\
+         unset __am_pids __am_p\n\
+         [ \"$__am_rc\" -eq 0 ]",
+    );
+    script
+}
+
 impl LifecycleCommand {
     /// Flatten into the individual commands to run, in a stable order.
     ///
-    /// Named commands are sorted by key rather than left in map order: `am` runs them
-    /// sequentially (not in parallel like the reference CLI), so a deterministic order is
-    /// what makes a failure reproducible.
+    /// A named group becomes **one** command that runs its members in parallel, which is the
+    /// whole reason the object form exists. Running them in sequence looks equivalent for
+    /// independent commands and deadlocks for co-dependent ones: `{ "server": "npm start",
+    /// "wait": "wait-on http://localhost:3000 && npm run seed" }` never gets past the server,
+    /// because it is not supposed to exit.
+    ///
+    /// Members are ordered by key so the generated script is reproducible; they run
+    /// concurrently, so the order is presentational.
     pub fn commands(&self) -> Vec<Command> {
         match self {
             LifecycleCommand::Shell(s) => vec![Command::Shell(s.clone())],
             LifecycleCommand::Argv(a) => vec![Command::Argv(a.clone())],
+            LifecycleCommand::Named(map) if map.len() > 1 => {
+                vec![Command::Shell(parallel_script(map))]
+            }
             LifecycleCommand::Named(map) => map
                 .values()
                 .map(|v| match v {
@@ -279,6 +314,8 @@ impl UserEnvProbe {
 pub enum ForwardedPort {
     /// A port on the container the agent runs in.
     Own(u16),
+    /// An already-rendered publish specification, from `appPort`.
+    Published(String),
     /// `"<service>:<port>"` — a port on another compose service. Meaningless outside a compose
     /// project, where there is only one container to publish from.
     Service { service: String, port: u16 },
@@ -299,6 +336,16 @@ impl ForwardedPort {
                 _ => s.parse().ok().map(ForwardedPort::Own),
             },
             _ => None,
+        }
+    }
+
+    /// The publish specification for this port, if it has one on a single container.
+    pub fn spec(&self) -> Option<String> {
+        match self {
+            ForwardedPort::Own(port) => Some(Self::publish_spec(*port)),
+            ForwardedPort::Published(spec) => Some(spec.clone()),
+            // Names another compose service, so there is nothing to publish here.
+            ForwardedPort::Service { .. } => None,
         }
     }
 
@@ -366,6 +413,10 @@ pub struct DevcontainerJson {
     /// Services to start. Empty means all of them, which is the spec's default.
     #[serde(default)]
     pub run_services: Vec<String>,
+    /// Ports to publish. Unlike `forwardPorts` this is a *publish* instruction — the reference
+    /// CLI turns it into `-p` — and it is a `devcontainer.json` property, not label-carried.
+    #[serde(default)]
+    pub app_port: AppPort,
     pub image: Option<String>,
     pub build: Option<BuildSection>,
 }
@@ -386,6 +437,44 @@ pub struct BuildSection {
     /// Images to consider as cache sources.
     #[serde(default)]
     pub cache_from: CacheFrom,
+}
+
+/// `appPort` is a number, a string, or an array mixing both.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+pub enum AppPort {
+    #[default]
+    None,
+    // `Many` is tried before `One` deliberately: `serde_json::Value` matches an array too, so
+    // the scalar variant would swallow the list and yield nothing.
+    Many(Vec<serde_json::Value>),
+    One(serde_json::Value),
+}
+
+impl AppPort {
+    /// The publish specifications, as the runtime's `-p` expects them.
+    ///
+    /// A bare port binds loopback — which is what the reference CLI does, verified by reading
+    /// the `docker run` line it builds — while an explicit `host:container` mapping is passed
+    /// through as written, since spelling it out is how a config asks for something wider.
+    pub fn publish_specs(&self) -> Vec<String> {
+        let values = match self {
+            AppPort::None => Vec::new(),
+            AppPort::One(v) => vec![v.clone()],
+            AppPort::Many(v) => v.clone(),
+        };
+        values
+            .iter()
+            .filter_map(|value| match value {
+                serde_json::Value::Number(n) => n.as_u64().map(|p| format!("127.0.0.1:{p}:{p}")),
+                serde_json::Value::String(s) if s.contains(':') => Some(s.clone()),
+                serde_json::Value::String(s) => {
+                    s.parse::<u16>().ok().map(|p| format!("127.0.0.1:{p}:{p}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// `cacheFrom` is a string or an array of them.
@@ -658,6 +747,8 @@ pub struct ResolvedConfig {
     pub forward_ports: Vec<ForwardedPort>,
     /// From `devcontainer.json` only — the label drops these.
     pub run_args: Vec<String>,
+    /// `appPort`, already rendered as publish specifications.
+    pub app_port: Vec<String>,
     pub workspace_folder: Option<String>,
     pub workspace_mount: Option<String>,
     pub name: Option<String>,
@@ -758,6 +849,7 @@ pub fn finalize(
     ctx: &SubstitutionContext,
 ) -> ResolvedConfig {
     resolved.run_args = json.run_args.clone();
+    resolved.app_port = json.app_port.publish_specs();
     resolved.workspace_folder = json.workspace_folder.clone();
     resolved.workspace_mount = json.workspace_mount.clone();
     resolved.name = json.name.clone();
@@ -1252,7 +1344,15 @@ pub fn apply_trust(
         // that says nothing still gets the environment its dotfiles set up — which is the whole
         // reason the property exists.
         user_env_probe: UserEnvProbe::parse(resolved.user_env_probe.as_deref()),
-        ports: resolved.forward_ports.clone(),
+        // `appPort` publishes alongside `forwardPorts`. They are different properties — one
+        // asks a tool to forward, the other asks the runtime to publish — and a config may use
+        // either or both.
+        ports: resolved
+            .forward_ports
+            .clone()
+            .into_iter()
+            .chain(resolved.app_port.iter().map(|spec| ForwardedPort::Published(spec.clone())))
+            .collect(),
         // With an entrypoint to run, this is who the *container* starts as — the container
         // user, or the image's own default when the config names none. Otherwise it is the
         // remote user, as before.
@@ -1262,6 +1362,17 @@ pub fn apply_trust(
             resolved.container_user.clone()
         },
     };
+
+    // `overrideCommand: false` asks that the image's own command run — which in am's model is
+    // impossible, because the agent *is* the container command. Saying so beats ignoring it:
+    // the property is usually set because an init process matters.
+    if resolved.override_command == Some(false) {
+        eprintln!(
+            "{} this devcontainer sets overrideCommand: false, but am runs the agent as the \
+             container's command — the image's own command will not run",
+            color::note_prefix(color::enabled(color::Stream::Stderr))
+        );
+    }
 
     if allow {
         runtime.privileged = resolved.privileged;
@@ -1789,6 +1900,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merge(&obj).unwrap().mounts, merge(&string).unwrap().mounts);
+    }
+
+    #[test]
+    fn app_port_publishes_the_way_the_cli_does() {
+        // A bare port binds loopback; an explicit mapping passes through, since spelling it out
+        // is how a config asks for something wider. Both read off the `docker run` line the
+        // reference CLI builds.
+        let json = parse_config_str(r#"{"image":"debian","appPort":[9000,"9100:9200","8080"]}"#)
+            .unwrap();
+        assert_eq!(
+            json.app_port.publish_specs(),
+            ["127.0.0.1:9000:9000", "9100:9200", "127.0.0.1:8080:8080"]
+        );
+    }
+
+    #[test]
+    fn app_port_accepts_a_bare_scalar() {
+        let json = parse_config_str(r#"{"image":"debian","appPort":3000}"#).unwrap();
+        assert_eq!(json.app_port.publish_specs(), ["127.0.0.1:3000:3000"]);
+        let none = parse_config_str(r#"{"image":"debian"}"#).unwrap();
+        assert!(none.app_port.publish_specs().is_empty());
+    }
+
+    #[test]
+    fn a_parallel_hook_group_runs_its_members_concurrently() {
+        // The object form exists for co-dependent commands: a server that never exits and a
+        // waiter that depends on it. Sequential execution deadlocks on the first.
+        let hook: LifecycleCommand = serde_json::from_str(
+            r#"{"server":"npm start","wait":"wait-on http://localhost:3000"}"#,
+        )
+        .unwrap();
+        let commands = hook.commands();
+        assert_eq!(commands.len(), 1, "a group is one command, not a sequence");
+        let script = commands[0].to_shell();
+        assert!(script.contains("{ npm start ; } &"), "got: {script}");
+        assert!(script.contains("{ wait-on http://localhost:3000 ; } &"), "got: {script}");
+        // Every pid is waited on individually — a bare `wait` reports only the last, which
+        // would let a failed member pass for success.
+        assert!(script.contains("|| __am_rc=1"), "got: {script}");
+    }
+
+    #[test]
+    fn a_single_member_group_needs_no_parallel_machinery() {
+        let hook: LifecycleCommand = serde_json::from_str(r#"{"only":"echo hi"}"#).unwrap();
+        assert_eq!(hook.commands(), vec![Command::Shell("echo hi".to_string())]);
     }
 
     #[test]

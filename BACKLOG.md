@@ -602,6 +602,12 @@ Found by a spec review on 2026-08-16 and fixed:
       must start as the container user to run an entrypoint, so the numeric UID mapping cannot
       also apply. The reference CLI rewrites the image to reconcile the two; `am` does not.
 
+- [x] **The rest of the spec review.** Named lifecycle groups run in parallel (the object form
+      exists for co-dependent commands and deadlocked in sequence); `appPort` publishes;
+      Feature ids are case-insensitive; two tags of one Feature install as two; `installsAfter`
+      resolves `legacyIds`; `overrideCommand: false` is reported rather than ignored, since
+      `am` cannot honour it — the agent is the container command.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

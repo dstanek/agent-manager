@@ -931,6 +931,30 @@ forgets it is an easy mistake, and starting a project with nowhere to run the ag
 answer than quietly adding it. An empty list stays empty rather than becoming an enumeration,
 so services the compose file gains later are still started.
 
+## The remainder of the review
+
+- **A named lifecycle group runs in parallel.** That is the only reason the object form exists:
+  `{ "server": "npm start", "wait": "wait-on http://localhost:3000 && npm run seed" }` deadlocks
+  in sequence, because the server is not supposed to exit. Members are backgrounded and each pid
+  is waited on individually — a bare `wait` reports only the last, which would let a failed
+  member pass for success.
+- **`appPort` publishes.** Distinct from `forwardPorts`: one asks a tool to forward, the other
+  asks the runtime to publish. A bare port binds loopback and an explicit `host:container`
+  mapping passes through, both read off the `docker run` line the reference CLI builds.
+- **Feature ids are case-insensitive.** `ghcr.io/Devcontainers/features/git:1` works in an editor
+  and 404s against a registry, which requires lowercase repository names. The registry and
+  repository are folded; the tag is not, and `raw` keeps the user's spelling because that is what
+  the label echoes back.
+- **Two tags of one Feature are two Features.** `{"…/node:18": {}, "…/node:20": {}}` asks for
+  both, and deduplicating on the untagged name silently installed only the first. An *injected*
+  Feature still defers to the config on the untagged name — a project that pinned its own version
+  of what `am` injects meant that version.
+- **`installsAfter` resolves `legacyIds`.** A republished Feature keeps its old ids; an ordering
+  constraint naming one still refers to it.
+- **`overrideCommand: false` is reported, not silently ignored.** It cannot be honoured — the
+  agent *is* the container command in `am`'s model — and the property is usually set because an
+  init process matters, so saying so beats dropping it.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
