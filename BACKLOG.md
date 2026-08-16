@@ -587,6 +587,12 @@ Found by a spec review on 2026-08-16 and fixed:
       substituted before it becomes `${containerWorkspaceFolder}`, and Feature entrypoints are
       substituted.
 
+- [x] **`workspaceMount` and `updateRemoteUserUID`.** `workspaceMount` was parsed and never
+      used, so pairing it with `workspaceFolder` left the agent in an empty directory; it is
+      now added alongside host-path mirroring. `updateRemoteUserUID` is applied on the Docker
+      path, which previously skipped the host UID mapping whenever a user was named — leaving
+      any host user that is not uid 1000 unable to write their own worktree.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

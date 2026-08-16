@@ -150,6 +150,8 @@ pub struct DevcontainerRuntime {
     pub workdir: Option<String>,
     /// Feature entrypoint scripts, composed ahead of the agent command.
     pub entrypoints: Vec<String>,
+    /// Whether to map the container user onto the host's UID/GID, from `updateRemoteUserUID`.
+    pub update_remote_user_uid: bool,
     /// How to derive the agent's environment, from `userEnvProbe`.
     pub user_env_probe: crate::devcontainer::UserEnvProbe,
     /// Ports to publish on the host, from `forwardPorts`.
@@ -705,10 +707,18 @@ pub fn build_run_command(
                 cmd.push(format!("--userns=keep-id:uid={uid},gid={gid}"));
             }
             RuntimeKind::Docker => {
-                // A named devcontainer user takes precedence over the numeric mapping;
-                // devcontainer images give that user uid 1000, which is the same mapping
-                // by another name.
-                if dc.user.is_none() {
+                // Docker has no `keep-id`, so the only way to make a bind-mounted worktree
+                // writable is to run as the host's own uid. This used to be skipped whenever
+                // the config named a user, on the assumption that a devcontainer user is
+                // uid 1000 and therefore the same mapping by another name — true only for a
+                // host user who is also 1000. For anyone else the container could not write
+                // its own worktree.
+                //
+                // `updateRemoteUserUID` is the spec's switch for this, and defaults to true.
+                // `am` maps the process rather than rewriting the image's passwd entry as the
+                // reference CLI does, so `HOME` is set explicitly below: a numeric uid with no
+                // passwd entry would otherwise leave the agent without one.
+                if dc.user.is_none() || dc.update_remote_user_uid {
                     cmd.push("--user".to_string());
                     cmd.push(format!("{uid}:{gid}"));
                 }
@@ -717,10 +727,22 @@ pub fn build_run_command(
     }
 
     // Run as the devcontainer's remoteUser rather than the image's default (usually root),
-    // so $HOME matches where the credential mounts land.
+    // so $HOME matches where the credential mounts land. Skipped when the uid mapping above
+    // already applies, since the two `--user` flags would contradict each other and the
+    // numeric one is what keeps the worktree writable.
+    let mapped_uid = matches!(runtime.kind, RuntimeKind::Docker)
+        && dc.update_remote_user_uid
+        && get_host_uid_gid().is_some();
     if let Some(ref user) = dc.user {
-        cmd.push("--user".to_string());
-        cmd.push(user.clone());
+        if !mapped_uid {
+            cmd.push("--user".to_string());
+            cmd.push(user.clone());
+        } else {
+            // Running as a bare uid means no passwd entry, so nothing derives HOME. The
+            // credential mounts are already placed at this path.
+            cmd.push("-e".to_string());
+            cmd.push(format!("HOME={home}"));
+        }
     }
 
     // Worktree mount — same path inside the container as on the host
@@ -1370,6 +1392,57 @@ mod tests {
         assert_eq!(mounts.colocated_git_host, None);
 
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn docker_maps_the_host_uid_even_when_a_user_is_named() {
+        // The old behaviour skipped the mapping whenever a user was named, which is only
+        // harmless for a host user who happens to be uid 1000. For anyone else the container
+        // could not write the worktree bind-mounted into it.
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            user: Some("vscode".to_string()),
+            update_remote_user_uid: true,
+            ..DevcontainerRuntime::default()
+        };
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        let joined = cmd.join(" ");
+        if let Some((uid, gid)) = get_host_uid_gid() {
+            assert!(joined.contains(&format!("--user {uid}:{gid}")), "got: {joined}");
+            // A bare uid has no passwd entry, so HOME has to be stated.
+            assert!(joined.contains("-e HOME=/home/am"), "got: {joined}");
+            assert!(!joined.contains("--user vscode"), "the two would contradict: {joined}");
+        }
+    }
+
+    #[test]
+    fn update_remote_user_uid_false_keeps_the_named_user() {
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            user: Some("vscode".to_string()),
+            update_remote_user_uid: false,
+            ..DevcontainerRuntime::default()
+        };
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        assert!(cmd.join(" ").contains("--user vscode"));
     }
 
     #[test]
