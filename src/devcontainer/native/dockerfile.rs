@@ -151,6 +151,28 @@ chmod +x ./install.sh
     )
 }
 
+/// A Feature's `containerEnv` as `ENV` instructions.
+///
+/// Values are *not* `$`-escaped, unlike the metadata label: `"PATH": "/opt/tool/bin:${PATH}"` is
+/// the standard idiom and depends on the build-time expansion this gets from Docker. Quotes and
+/// backslashes are escaped so a value cannot terminate its own instruction.
+fn container_env_instructions(feature: &ResolvedFeature) -> String {
+    feature
+        .raw
+        .get("containerEnv")
+        .and_then(|v| v.as_object())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| value.as_str().map(|v| (key, v)))
+                .map(|(key, value)| {
+                    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("ENV {key}=\"{escaped}\"\n")
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
 /// Generate the Dockerfile that installs the Features and stamps the metadata label.
 pub fn render(
     features: &[ResolvedFeature],
@@ -177,6 +199,12 @@ pub fn render(
         for (index, feature) in features.iter().enumerate() {
             let dir = feature.dir_name(index);
             out.push_str(&format!("# {}\n", feature.reference.raw));
+            // A Feature's `containerEnv` is baked in as `ENV`, before its own install step so
+            // that later Features see it too. This is the whole toolchain contract for `go`,
+            // `node`, `python`, `rust` and friends — they install into a prefix and put it on
+            // `PATH` here — and it is deliberately *absent* from the Feature's label snippet,
+            // so nothing downstream would ever restore it.
+            out.push_str(&container_env_instructions(feature));
             out.push_str(&format!(
                 "RUN chmod -R 0755 {FEATURES_DIR}/{dir} \\\n\
                  && cd {FEATURES_DIR}/{dir} \\\n\
@@ -314,6 +342,46 @@ mod tests {
         let git = rendered.find("dev-container-features/git_0").unwrap();
         let node = rendered.find("dev-container-features/node_1").unwrap();
         assert!(git < node, "index order must follow install order");
+    }
+
+    #[test]
+    fn a_features_container_env_becomes_env_before_its_install_step() {
+        // The toolchain contract for go, node, python, rust and friends: they install into a
+        // prefix and put it on PATH through containerEnv. It is deliberately absent from the
+        // Feature's label snippet, so if the Dockerfile does not carry it nothing downstream
+        // ever will — the Feature installs and its tools are not on PATH.
+        let mut feature = git_feature();
+        feature.raw = serde_json_lenient::from_str(
+            r#"{"containerEnv":{"GOROOT":"/usr/local/go","PATH":"/usr/local/go/bin:${PATH}"}}"#,
+        )
+        .unwrap();
+        let rendered = render(&[feature], "[]", "root", "root");
+
+        assert!(rendered.contains(r#"ENV GOROOT="/usr/local/go""#), "got: {rendered}");
+        // `${PATH}` is left unescaped on purpose: the standard idiom depends on Docker
+        // expanding it at build time, unlike the metadata label where `$` must survive.
+        assert!(rendered.contains(r#"ENV PATH="/usr/local/go/bin:${PATH}""#), "got: {rendered}");
+
+        let env_at = rendered.find("ENV GOROOT").unwrap();
+        let install_at = rendered.find("devcontainer-features-install.sh").unwrap();
+        assert!(env_at < install_at, "ENV must precede the install step so later Features see it");
+    }
+
+    #[test]
+    fn a_feature_with_no_container_env_adds_no_env_instructions() {
+        let rendered = render(&[git_feature()], "[]", "root", "root");
+        assert!(!rendered.contains("\nENV "), "got: {rendered}");
+    }
+
+    #[test]
+    fn a_container_env_value_cannot_terminate_its_own_instruction() {
+        let mut feature = git_feature();
+        // JSON escapes: Q's value is  a"b  and B's is  c\d
+        feature.raw =
+            serde_json_lenient::from_str(r#"{"containerEnv":{"Q":"a\"b","B":"c\\d"}}"#).unwrap();
+        let rendered = render(&[feature], "[]", "root", "root");
+        assert!(rendered.contains(r#"ENV Q="a\"b""#), "got: {rendered}");
+        assert!(rendered.contains(r#"ENV B="c\\d""#), "got: {rendered}");
     }
 
     #[test]

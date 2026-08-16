@@ -206,8 +206,11 @@ pub struct MetadataSnippet {
     pub security_opt: Vec<String>,
     #[serde(default)]
     pub container_env: BTreeMap<String, String>,
+    /// `null` is a permitted value in the schema and means *unset*, so this holds options
+    /// rather than strings. Modelling it as `String` made any label carrying one unparseable,
+    /// which surfaced only after the build as "parsing the devcontainer.metadata image label".
     #[serde(default)]
-    pub remote_env: BTreeMap<String, String>,
+    pub remote_env: BTreeMap<String, Option<String>>,
     pub container_user: Option<String>,
     pub remote_user: Option<String>,
     pub user_env_probe: Option<String>,
@@ -574,7 +577,8 @@ pub struct ResolvedConfig {
     pub cap_add: Vec<String>,
     pub security_opt: Vec<String>,
     pub container_env: BTreeMap<String, String>,
-    pub remote_env: BTreeMap<String, String>,
+    /// `null` means the variable is deliberately *not* set, so the value is an option.
+    pub remote_env: BTreeMap<String, Option<String>>,
     pub container_user: Option<String>,
     pub remote_user: Option<String>,
     pub user_env_probe: Option<String>,
@@ -631,6 +635,7 @@ pub fn merge(snippets: &[MetadataSnippet]) -> Result<ResolvedConfig> {
             out.container_env.insert(k.clone(), v.clone());
         }
         for (k, v) in &snippet.remote_env {
+            // A later `null` unsets an earlier value, which is what the null is for.
             out.remote_env.insert(k.clone(), v.clone());
         }
         if snippet.container_user.is_some() {
@@ -697,7 +702,7 @@ pub fn finalize(
     resolved.remote_env = resolved
         .remote_env
         .iter()
-        .map(|(k, v)| (k.clone(), ctx.substitute(v)))
+        .map(|(k, v)| (k.clone(), v.as_deref().map(|value| ctx.substitute(value))))
         .collect();
     for mount in &mut resolved.mounts {
         mount.source = mount.source.as_deref().map(|s| ctx.substitute(s));
@@ -1077,9 +1082,13 @@ pub fn apply_trust(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     // remoteEnv applies to processes the user starts in the container, which for am is
-    // the agent itself — so it is folded into the container environment.
+    // the agent itself — so it is folded into the container environment. A `null` value means
+    // the variable is deliberately not set, so it contributes nothing rather than an empty
+    // string: `FOO=` and "no FOO" are different to a program that checks for presence.
     for (k, v) in &resolved.remote_env {
-        env.push((k.clone(), v.clone()));
+        if let Some(value) = v {
+            env.push((k.clone(), value.clone()));
+        }
     }
 
     let mut runtime = crate::container::DevcontainerRuntime {
@@ -1984,7 +1993,7 @@ mod tests {
         resolved
             .container_env
             .insert("A".to_string(), "1".to_string());
-        resolved.remote_env.insert("B".to_string(), "2".to_string());
+        resolved.remote_env.insert("B".to_string(), Some("2".to_string()));
         let runtime = apply_trust(&resolved, &cfg_with(false));
         assert!(runtime.env.contains(&("A".to_string(), "1".to_string())));
         assert!(runtime.env.contains(&("B".to_string(), "2".to_string())));
@@ -2102,3 +2111,4 @@ mod tests {
         assert_eq!(cmd.to_shell(), "echo 'two words'");
     }
 }
+

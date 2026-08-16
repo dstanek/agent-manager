@@ -1,0 +1,9 @@
+{
+  "id": "envfeat",
+  "version": "1.0.0",
+  "containerEnv": {
+    "FEATURE_TOOL_HOME": "/opt/tool",
+    "PATH": "/opt/tool/bin:${PATH}"
+  },
+  "postCreateCommand": "echo feature-post-create-ran"
+}

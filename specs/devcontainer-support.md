@@ -811,6 +811,32 @@ no `config` subcommand at all — `config --format json` being exactly what lets
 compose file without carrying a YAML parser. Selecting it would fail later and less clearly, so
 the error names it and says it will not do.
 
+## A Feature's containerEnv is baked in, not carried in the label
+
+This was the worst bug in the builder and the differential tests could not see it.
+
+The reference CLI drops a Feature's `containerEnv` from its label snippet — which an early probe
+here observed and recorded as "the CLI drops it". What that probe did not ask was where it went
+*instead*: the CLI emits it as `ENV` in the generated Dockerfile, before that Feature's own
+install step so later Features inherit it. `am` did neither, so the property vanished.
+
+That is the entire toolchain contract for `go`, `node`, `python`, `rust`, `java`, `ruby` and
+others: they install into a prefix and put it on `PATH` this way. Under the old builder the
+Feature installed and its tools were not on `PATH`. Because the CLI omits it from the label too,
+a broken build and a working one produce **identical labels** — the difference is in the image's
+`Config.Env`, which no label comparison inspects.
+
+The lesson generalises beyond this one property: *the label is the contract between builders, so
+anything the label does not carry is invisible to a test that compares labels.* The differential
+test added with the fix asserts the built image's environment as well.
+
+The same review found the two `*_METADATA_KEYS` lists had drifted — the Feature list was missing
+all five lifecycle hooks (so a Feature's own `postCreateCommand` never ran; `git-lfs` declares
+one to pull its artifacts) and the config list was missing `shutdownAction`. Both lists are now
+transcribed from the CLI's `pickFeatureProperties`/`pickConfigProperties` and asserted whole,
+because a probe can only reveal the properties the probed Feature happened to declare — which is
+exactly how both omissions survived.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through

@@ -1040,6 +1040,52 @@ mod tests {
         );
     }
 
+    /// A Feature's `containerEnv` and lifecycle hooks — the two things a label comparison
+    /// alone cannot check.
+    ///
+    /// `containerEnv` is deliberately absent from a Feature's label snippet, so the labels of a
+    /// broken and a working build are *identical*; the difference is in the image's own
+    /// environment. That is why this test asserts `Config.Env` as well, and why the bug went
+    /// unnoticed: a Feature installed a toolchain and left it off `PATH`.
+    #[test]
+    #[ignore = "needs a container runtime and network access"]
+    fn native_build_matches_the_cli_for_feature_env_and_hooks() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/devcontainer/native");
+        let image = "am-dc-native-difftest-env";
+        assert_matches_reference_with(
+            &std::fs::read_to_string(format!("{dir}/env-devcontainer.json")).unwrap(),
+            &std::fs::read_to_string(format!("{dir}/cli-env-label.json")).unwrap(),
+            image,
+            None,
+            // The Feature is copied in beside the config, exactly as a vendored one would be.
+            &[],
+        );
+
+        let runtime = std::path::PathBuf::from(
+            std::env::var("AM_DOCKER_BIN").unwrap_or_else(|_| "/usr/bin/docker".to_string()),
+        );
+        let ours = String::from_utf8(
+            std::process::Command::new(&runtime)
+                .args(["inspect", image, "--format", "{{ json .Config.Env }}"])
+                .output()
+                .expect("inspecting the built image")
+                .stdout,
+        )
+        .unwrap();
+        let ours: Vec<String> = serde_json::from_str(ours.trim()).unwrap();
+        let theirs: Vec<String> = serde_json::from_str(
+            std::fs::read_to_string(format!("{dir}/cli-env-image-env.json")).unwrap().trim(),
+        )
+        .unwrap();
+
+        for expected in &theirs {
+            assert!(
+                ours.contains(expected),
+                "the image is missing {expected:?} that the reference CLI bakes in\ngot: {ours:?}"
+            );
+        }
+    }
+
     /// A compose config: the Features go onto the *service's* image, and the label that comes
     /// out has to be the same one the reference CLI produces for the same project.
     ///
@@ -1187,6 +1233,21 @@ mod tests {
         std::fs::write(&config_path, config_text).unwrap();
         for (name, body) in extra_files {
             std::fs::write(dir.join(name), body).unwrap();
+        }
+        // Any local Feature the fixtures carry, copied in beside the config so a `./name`
+        // reference resolves the same way it would in a real repo.
+        let fixtures = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/devcontainer/native"
+        ));
+        if let Ok(entries) = std::fs::read_dir(fixtures) {
+            for entry in entries.filter_map(Result::ok).filter(|e| e.path().is_dir()) {
+                let target = dir.join(entry.file_name());
+                std::fs::create_dir_all(&target).unwrap();
+                for file in std::fs::read_dir(entry.path()).unwrap().filter_map(Result::ok) {
+                    std::fs::copy(file.path(), target.join(file.file_name())).unwrap();
+                }
+            }
         }
 
         let typed: DevcontainerJson = serde_json_lenient::from_str(config_text).unwrap();
