@@ -376,13 +376,21 @@ pub fn fetch_manifest(feature: &FeatureRef) -> Result<Manifest> {
         feature.reference()
     );
     let body = get_with_auth(&url, Some(MANIFEST_ACCEPT))?;
-    let mut manifest: Manifest = serde_json::from_slice(&body)
-        .with_context(|| format!("parsing the OCI manifest for {}", feature.raw))?;
     // The spec identifies an OCI Feature by its *manifest* digest, not its layer's: two
     // manifests can share a layer while differing in metadata or dependencies, and treating
     // those as one Feature would install one and silently drop the other's dependsOn. Computed
     // over the bytes as served, which is what a registry means by a manifest digest.
-    manifest.digest = digest_of(&body);
+    let digest = digest_of(&body);
+    // A digest-pinned reference (written by the user as `@sha256:…`, or pinned by the
+    // lockfile) asked the registry for these exact bytes by content address. A tag-addressed
+    // request has no expected digest to check against; the first fetch is what establishes one,
+    // for the lockfile to pin next time.
+    if let Some(expected) = &feature.digest {
+        verify_digest("manifest", &feature.raw, expected, &digest)?;
+    }
+    let mut manifest: Manifest = serde_json::from_slice(&body)
+        .with_context(|| format!("parsing the OCI manifest for {}", feature.raw))?;
+    manifest.digest = digest;
     Ok(manifest)
 }
 
@@ -393,11 +401,33 @@ pub fn digest_of(bytes: &[u8]) -> String {
     format!("sha256:{}", sum.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
+/// Confirm that a digest computed from downloaded bytes matches the one a content-addressed
+/// request asked for.
+///
+/// `am` requests a manifest or a layer blob by digest — `/manifests/sha256:…` or
+/// `/blobs/sha256:…` — and a registry that answers with anything else is misbehaving,
+/// misconfigured, or compromised. Features run their install script as root while the image is
+/// built, so that is refused rather than trusted: this is the supply-chain boundary a lockfile
+/// pin exists to enforce. `what` names the object in the error (`"manifest"`, `"layer"`).
+fn verify_digest(what: &str, feature_raw: &str, expected: &str, actual: &str) -> Result<()> {
+    if expected != actual {
+        return Err(AmError::DevcontainerBuildFailed(format!(
+            "{what} for '{feature_raw}' failed integrity verification\n\
+             expected {expected}, got {actual}\n\
+             The registry returned different content than the digest it was asked for."
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Download and unpack a Feature's layer, returning the directory holding its files.
 ///
-/// Cached by content digest under `cache_root`. A digest is immutable, so a cache hit needs no
-/// validation — and a moving tag like `:1` still gets picked up, because the digest comes from
-/// a manifest fetched fresh on every build.
+/// Cached by content digest under `cache_root`. A digest is immutable, so a cache *hit* needs no
+/// re-verification — the cache key itself is the layer digest, and it only got there by a fetch
+/// that hashed the bytes and confirmed they matched before writing `.am-complete` (below). A
+/// moving tag like `:1` still gets picked up on a miss, because the digest comes from a manifest
+/// fetched fresh on every build.
 pub fn fetch_layer(feature: &FeatureRef, layer: &Layer, cache_root: &Path) -> Result<PathBuf> {
     let digest = layer.digest.replace(':', "-");
     let dir = cache_root.join(&digest);
@@ -416,6 +446,12 @@ pub fn fetch_layer(feature: &FeatureRef, layer: &Layer, cache_root: &Path) -> Re
         layer.digest
     );
     let blob = get_with_auth(&url, None)?;
+
+    // The blob request is always content-addressed — a layer digest comes from the manifest,
+    // never from a tag — so this check is unconditional, unlike the manifest's. Verified before
+    // anything touches disk: on a mismatch there is no cache directory to clean up, and
+    // `.am-complete` never gets written for content that failed the check.
+    verify_digest("layer", &feature.raw, &layer.digest, &digest_of(&blob))?;
 
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
@@ -678,6 +714,90 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("devcontainer-feature.json")).unwrap();
         assert!(metadata.contains("\"id\": \"tarball-only\""), "got: {metadata}");
         assert!(tmp.path().join("install.sh").is_file());
+    }
+
+    #[test]
+    fn verify_digest_accepts_a_match() {
+        let sum = digest_of(b"install.sh");
+        assert!(verify_digest("layer", "some/feature:1", &sum, &sum).is_ok());
+    }
+
+    #[test]
+    fn verify_digest_rejects_a_mismatch_naming_both_digests() {
+        let expected = digest_of(b"what the lockfile pinned");
+        let actual = digest_of(b"what the registry actually sent");
+        let err = verify_digest("layer", "some/feature:1", &expected, &actual)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed integrity verification"), "got: {err}");
+        assert!(err.contains("some/feature:1"), "must name the Feature: {err}");
+        assert!(err.contains(&expected), "must show the expected digest: {err}");
+        assert!(err.contains(&actual), "must show the actual digest: {err}");
+    }
+
+    /// Answers exactly one HTTP request with a canned body, then closes. Enough to exercise
+    /// `get_with_auth` against a registry that returns content not matching what was requested
+    /// by digest, without a real registry or an HTTP-mocking dependency.
+    fn respond_once(body: Vec<u8>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+        addr
+    }
+
+    /// A digest-pinned manifest reference — the lockfile's whole mechanism — asks a registry for
+    /// specific content by address. A registry that answers with something else must be refused,
+    /// not installed: this is the case the review that prompted this test found unguarded.
+    #[test]
+    fn a_manifest_that_does_not_match_its_pinned_digest_is_rejected() {
+        let addr = respond_once(br#"{"layers":[],"annotations":{}}"#.to_vec());
+        let feature = parse_ref(&format!(
+            "127.0.0.1:{}/some/feature@sha256:{}",
+            addr.port(),
+            "0".repeat(64)
+        ));
+        assert!(feature.digest.is_some(), "must be read as digest-pinned");
+
+        let err = fetch_manifest(&feature).unwrap_err().to_string();
+        assert!(err.contains("failed integrity verification"), "got: {err}");
+        assert!(err.contains(&format!("sha256:{}", "0".repeat(64))), "got: {err}");
+    }
+
+    /// A blob request is always content-addressed, so unlike the manifest this has no "no digest
+    /// pinned" escape hatch — every layer must be verified. On a mismatch, nothing may be cached:
+    /// a later successful build must not find a stale, wrong directory sitting under its digest.
+    #[test]
+    fn a_layer_that_does_not_match_its_digest_is_rejected_and_never_cached() {
+        let addr = respond_once(b"not the bytes the manifest promised".to_vec());
+        let feature = parse_ref(&format!("127.0.0.1:{}/some/feature:1", addr.port()));
+        let layer = Layer {
+            media_type: "application/vnd.devcontainers.layer.v1+tar".to_string(),
+            digest: format!("sha256:{}", "0".repeat(64)),
+        };
+        let cache = tempfile::tempdir().unwrap();
+
+        let err = fetch_layer(&feature, &layer, cache.path()).unwrap_err().to_string();
+        assert!(err.contains("failed integrity verification"), "got: {err}");
+
+        let cached_dir = cache.path().join(layer.digest.replace(':', "-"));
+        assert!(!cached_dir.exists(), "a mismatched layer must not be cached at all");
+        assert!(
+            !cached_dir.join(".am-complete").exists(),
+            "must never be marked complete"
+        );
     }
 
     /// The direct-tarball path, end to end: fetch over real HTTPS, unpack, hash.

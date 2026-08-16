@@ -346,6 +346,12 @@ first build writes the file, a Feature tag that moves to a new digest is invisib
 nothing recorded to compare against. It is self-correcting: commit the lockfile that build
 writes, and every later move is caught.
 
+A digest-pinned manifest and every layer blob are hashed on arrival and compared against the
+digest they were requested by; a registry that answers a digest-addressed request with different
+bytes fails the build with an integrity error rather than installing what it sent. Feature
+install runs as root while the image is built, so this is enforced by `am` itself and does not
+depend on the registry honoring the address it was asked for.
+
 **Ports.** `forwardPorts` publishes each port on `127.0.0.1`. The reference CLI publishes
 nothing here and leaves forwarding to an editor; `am` has none, so publishing is what makes the
 key mean anything. In a compose project a bare port lands on the agent's service and a
