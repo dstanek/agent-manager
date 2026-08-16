@@ -505,10 +505,18 @@ the spec defines — an OCI registry, a local path, or a tarball URL — ordered
 round-based algorithm over `dependsOn` (hard, resolved recursively), `installsAfter` (soft,
 ordering only), and `overrideFeatureInstallOrder` (`roundPriority`).
 
-Compose projects are supported too, which leaves no construct-level fallback at all: the CLI is
-reached only for a config with no `image`, no `build.dockerfile` and no `dockerComposeFile`.
-`devcontainer.builder = "native"` turns that into an error, for users who want a guarantee that
-no config silently reintroduces Node.
+Compose projects are supported too, which leaves **no fallback at all**. The last remaining
+`Unsupported` case was "the config names nothing to build from" — and that is not an `am`
+limitation: the reference CLI rejects the same configs with "No image information specified in
+devcontainer.json", and `build.dockerfile` has no default there either. Delegating it asked a
+second tool the same unanswerable question, and when the CLI was not installed it answered a
+typo'd config with "install Node". It is an error now, naming what to add.
+
+That emptied `Unsupported`, and with it the fallback machinery: the `Ok(Err(reason))` signal
+threaded through `build`, the "Falling back to the devcontainer CLI" line, the strict-mode error
+that had nothing left to be strict about, and `doctor`'s reason to demand Node.
+`devcontainer.builder = "cli"` remains as a deliberate escape hatch — the only way to reach the
+reference CLI, and one nothing selects on its own.
 
 ## Compose is a second run model, not a builder change
 

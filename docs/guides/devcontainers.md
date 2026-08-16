@@ -30,25 +30,20 @@ Three things to know about compose sessions:
 - `container.network = "none"` cannot apply, because compose services reach each other over the
   project network. `am` refuses rather than quietly ignoring it.
 
-`am` reaches for the reference CLI only for a config it can find no base image in at all — no
-`image`, no `build.dockerfile`, and no `dockerComposeFile`.
+**`am` never runs the reference CLI.** There is no config shape it hands over: a
+`devcontainer.json` `am` cannot build is one the reference CLI rejects too, and `am` says so
+directly rather than sending you to install Node over it.
 
-If you hit that, `am` says so, and the CLI needs Node 20+:
-
-```sh
-npm install -g @devcontainers/cli
-```
-
-Either way a build happens once per config change, not once per session, so it stays off
-the hot path.
-
-If you would rather never depend on Node, make the fallback an error instead:
+The CLI remains available as a deliberate escape hatch, for the case where `am`'s builder gets
+something wrong and you need a second opinion:
 
 ```toml
 # .am/config.toml
 [devcontainer]
-builder = "native"   # "auto" (default) | "native" | "cli"
+builder = "cli"   # "auto" (default, am builds it) | "cli"
 ```
+
+Builds happen once per config change, not once per session, either way.
 
 ## Choosing a mode
 

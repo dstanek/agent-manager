@@ -147,7 +147,7 @@ These variables redirect `am` to a specific binary instead of searching `PATH`. 
 | `AM_DOCKER_BIN` | `docker` (from PATH) | Path or name of the Docker binary |
 | `AM_JJ_BIN` | `jj` (from PATH) | Path or name of the Jujutsu binary |
 | `AM_GH_BIN` | `gh` (from PATH) | Path or name of the GitHub CLI binary (used for Copilot auth) |
-| `AM_DEVCONTAINER_BIN` | `devcontainer` (from PATH) | Path or name of the Dev Containers CLI (used only when a devcontainer build falls back to it) |
+| `AM_DEVCONTAINER_BIN` | `devcontainer` (from PATH) | Path or name of the Dev Containers CLI (used only when `devcontainer.builder = "cli"`) |
 | `AM_FEATURE_CACHE` | `~/.cache/am/features` | Where `am`'s own builder caches downloaded Features |
 
 If set to a bare name (e.g. `AM_TMUX_BIN=tmux3`), `am` searches PATH for that name. If set to an absolute path, it uses that path directly and errors if the file does not exist.
@@ -265,19 +265,20 @@ Controls container lifecycle and what gets mounted or exposed inside the contain
 Applies only when `container.mode` resolves to `devcontainer`. `am` builds an image once per
 config change and runs it itself, so nothing here is on the per-session path.
 
-By default (`builder = "auto"`) `am` builds the image itself and needs no extra tooling. It
-builds every config shape it supports, compose projects included. The reference CLI — which
-requires `npm install -g @devcontainers/cli` and Node 20+ — is now reached only for a config
-with no `image`, no `build.dockerfile` and no `dockerComposeFile` to build from.
+`am` builds the image itself and needs no tooling beyond your container runtime — every config
+shape the spec defines, compose projects included. It never falls back: a config `am` cannot
+build is one the reference CLI rejects too, and it is reported as the error it is.
 
-When it falls back, `am` prints the reason. Set `builder = "native"` to turn those cases into
-errors instead, so no config can silently reintroduce the Node dependency.
+`builder = "cli"` delegates to `@devcontainers/cli` instead, and is the only way to reach it.
+That needs `npm install -g @devcontainers/cli` and Node 20+. It exists as an escape hatch for
+the case where `am`'s builder gets something wrong, not as a fallback anything reaches on its
+own. `"native"` is accepted as a synonym for the default.
 
 | Key | Type | Default | Description | Valid Values |
 |---|---|---|---|---|
 | `path` | path | `""` | Explicit `devcontainer.json`, relative to the session worktree; unset means discover | Any path inside the worktree |
-| `builder` | string | `"auto"` | Which builder turns `devcontainer.json` into an image | `"auto"`, `"native"`, `"cli"` |
-| `cli` | string | `"devcontainer"` | CLI binary name or path (`AM_DEVCONTAINER_BIN` overrides), used when a build falls back to it | Any binary name or path |
+| `builder` | string | `"auto"` | Which builder turns `devcontainer.json` into an image. `"auto"` and `"native"` both mean `am` | `"auto"`, `"native"`, `"cli"` |
+| `cli` | string | `"devcontainer"` | CLI binary name or path (`AM_DEVCONTAINER_BIN` overrides), used only when `builder = "cli"` | Any binary name or path |
 | `agent_install` | string | `"auto"` | How the agent gets into the image | `"feature"`, `"bootstrap"`, `"none"`, `"auto"` |
 | `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, and `runArgs` are honoured | `true`, `false` |
 | `skip_lifecycle` | boolean | `false` | Skip `postCreateCommand` and the other in-container hooks | `true`, `false` |

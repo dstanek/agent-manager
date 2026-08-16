@@ -796,20 +796,7 @@ pub fn build_image(
     let raw: serde_json::Value = serde_json_lenient::from_str(&text)
         .map_err(|e| AmError::ConfigError(e.to_string()))?;
 
-    match native::build(req, runtime_bin, &raw)? {
-        Ok(image) => Ok(image),
-        Err(reason) if cfg.devcontainer.builder == Builder::Native => {
-            Err(AmError::DevcontainerBuildFailed(format!(
-                "am's own builder cannot handle this config: {reason}\n\
-                 Set devcontainer.builder = \"auto\" to fall back to the reference CLI"
-            ))
-            .into())
-        }
-        Err(reason) => {
-            println!("Falling back to the devcontainer CLI: {reason}.");
-            build_with_cli(req, cfg, runtime_bin)
-        }
-    }
+    native::build(req, runtime_bin, &raw)
 }
 
 /// Delegate to `@devcontainers/cli`.

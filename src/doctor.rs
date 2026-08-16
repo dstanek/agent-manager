@@ -598,15 +598,9 @@ fn check_devcontainer_mode(
     // Whether the CLI matters at all depends on the builder *and* on this particular config:
     // under `auto`, a config am can build itself never touches Node, so reporting a missing
     // CLI as a failure would send the user to install something they do not need.
-    let needs_cli = match cfg.devcontainer.builder {
-        config::Builder::Cli => true,
-        config::Builder::Native => false,
-        config::Builder::Auto => match devcontainer::parse_config(config_path) {
-            Ok(parsed) => devcontainer::native::check_static(&parsed).is_err(),
-            // An unparseable config is reported separately below; assume the worst here.
-            Err(_) => true,
-        },
-    };
+    // Nothing but an explicit `builder = "cli"` reaches the CLI any more: there is no config
+    // shape `am` declines and the reference CLI accepts, so `auto` never delegates.
+    let needs_cli = cfg.devcontainer.builder == config::Builder::Cli;
 
     let cli = devcontainer::find_cli(&cfg.devcontainer.cli);
     match (&cli, needs_cli) {
@@ -623,12 +617,12 @@ fn check_devcontainer_mode(
             "devcontainer CLI",
             format!("'{}' not found on PATH", cfg.devcontainer.cli),
             "npm install -g @devcontainers/cli (needs Node 20+), or set \
-             container.mode = \"image\"",
+             devcontainer.builder = \"auto\" to let am build it",
         )),
         (Err(_), false) => report.checks.push(Check::ok(
             ENVIRONMENT,
             "devcontainer CLI",
-            "not needed — am builds this config itself".to_string(),
+            "not needed — am builds devcontainers itself".to_string(),
         )),
     }
 

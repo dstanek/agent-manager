@@ -157,23 +157,17 @@ Feature: Dev container sessions
     Then the command succeeds
     And the mock devcontainer CLI was called 0 times
 
-  Scenario: an unsupported construct falls back to the CLI and says why
+  # A config with nothing to build from is invalid, not unsupported: the reference CLI rejects
+  # it too ("No image information specified in devcontainer.json"). Handing it over would ask a
+  # second tool the same unanswerable question — and, with no CLI installed, send the user off
+  # to install Node over what is usually a typo.
+  Scenario: a config with nothing to build from is an error, not a fallback
     Given I am using am's own devcontainer builder
     And the repo has a devcontainer config with no base image
     When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
-    Then the command succeeds
-    And the output contains "Falling back to the devcontainer CLI"
-    And the output contains "build.dockerfile"
-    And the mock devcontainer CLI was called 1 time
-
-  # builder = "native" is the setting for someone who wants no Node dependency at all;
-  # silently falling back would defeat the point, so it is an error instead.
-  Scenario: the native builder refuses to fall back when told not to
-    Given I am using am's own devcontainer builder with no fallback
-    And the repo has a devcontainer config with no base image
-    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
     Then the command fails
-    And the output contains "cannot handle this config"
+    And the output contains "nothing to build from"
+    And the output contains "dockerComposeFile"
     And the mock devcontainer CLI was called 0 times
     And the worktree ".am/worktrees/my-feature" does not exist
 
