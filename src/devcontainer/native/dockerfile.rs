@@ -256,6 +256,41 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The same comparison for a Feature whose option names need normalising.
+    ///
+    /// `cli-git_0-features.env` cannot catch a normalisation bug — `version` and `ppa` survive
+    /// naive uppercasing intact — and neither can the label differential tests, since the label
+    /// carries option *values* contributed by the config, never the Feature's option names. This
+    /// fixture is the only thing standing between a rename rule and `MY-OPTION="a"`, which is
+    /// not a valid shell assignment and fails the whole install when the env file is sourced.
+    #[test]
+    fn awkward_option_names_match_the_cli_output() {
+        let text = include_str!(
+            "../../../tests/fixtures/devcontainer/native/awkward-devcontainer-feature.json"
+        );
+        let (metadata, raw) = parse_metadata(text).unwrap();
+        let options = resolve_options(&metadata, &BTreeMap::new());
+        let feature = ResolvedFeature {
+            reference: oci::parse_ref("./awkward"),
+            metadata,
+            raw,
+            options,
+            supplied: BTreeMap::new(),
+            digest: "local:test".to_string(),
+            hard_deps: Vec::new(),
+        };
+
+        let expected =
+            include_str!("../../../tests/fixtures/devcontainer/native/cli-awkward-features.env");
+        let generated = options_env(&feature);
+        // Sets of lines, same reason as above.
+        let mut want: Vec<&str> = expected.lines().filter(|l| !l.is_empty()).collect();
+        let mut got: Vec<&str> = generated.lines().filter(|l| !l.is_empty()).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn install_wrapper_sources_both_env_files_in_contract_order() {
         let wrapper = install_wrapper(&git_feature());

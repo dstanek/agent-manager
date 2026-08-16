@@ -1,0 +1,15 @@
+{
+  "id": "awkward",
+  "version": "1.0.0",
+  "options": {
+    "plain":       { "type": "string", "default": "f" },
+    "my-option":   { "type": "string", "default": "a" },
+    "dotted.name": { "type": "string", "default": "b" },
+    "with space":  { "type": "string", "default": "e" },
+    "a--b":        { "type": "string", "default": "d" },
+    "2fa":         { "type": "string", "default": "c" },
+    "12ab":        { "type": "string", "default": "g" },
+    "__dunder":    { "type": "string", "default": "h" },
+    "_1mixed":     { "type": "string", "default": "i" }
+  }
+}
