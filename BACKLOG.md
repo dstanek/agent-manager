@@ -697,6 +697,19 @@ Follow-ups the native builder left behind:
       into the image hash so a moved pin rebuilds, and writes it back after resolving. Local
       Features stay excluded per the spec — their files are hashed directly. Adopting a
       lockfile renames the image once, which is a layer-cache hit in practice.
+- [x] **OCI Feature content was never verified against the digest it was fetched by.**
+      Done 2026-08-17. `fetch_manifest` and `fetch_layer` built content-addressed URLs
+      (`/manifests/<digest>`, `/blobs/<digest>`) but trusted the registry to honor them,
+      rather than hashing the response and checking it — the exact thing `fetch_tarball`
+      already did for its own downloads. A compromised, misconfigured, or non-conforming
+      registry could return different bytes for a pinned digest and `am` would install and
+      cache them anyway, running Feature code as root during the build that the lockfile
+      never actually verified. Both paths now hash the bytes they receive: a layer blob is
+      always digest-addressed, so it is checked unconditionally; a manifest is checked only
+      when the reference is digest-pinned (by `@sha256:…` or a lockfile pin), since a
+      tag-addressed fetch has no digest yet to compare against. A mismatch fails the build
+      before anything is written to the Feature cache — no partial directory, no
+      `.am-complete`.
 - [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
       until `am` writes one on its first build. Self-correcting, and now documented in the
       configuration reference; kept open only because the first build of a fresh checkout is
