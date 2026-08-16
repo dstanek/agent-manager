@@ -547,11 +547,12 @@ Follow-ups phase 1 left behind:
       Correct given ephemeral containers, but a persistent-container mode would make the
       spec's once-per-container semantics achievable; `lifecycle_done` already records what
       ran.
-- [ ] The config hash does not cover build-context files, only the config and the
-      Dockerfile. `--rebuild` is the workaround; a bounded context fingerprint would be
-      better. The native builder now knows the context and could close this with a git-aware
-      hash of tracked files under it, but the fix belongs to both builders, so it stayed out
-      of that change.
+- [x] The config hash does not cover build-context files. Done 2026-08-16 with the git-aware
+      fingerprint this entry proposed: the names and contents of everything
+      `git ls-files --cached --others --exclude-standard` lists under the context. That bounds
+      the work when `"context": ".."` means the whole repo, and keeps build output and caches
+      from renaming the image on every build. `--rebuild` is still the answer for a git-ignored
+      file the build nonetheless `COPY`s, and for a context outside any repository.
 
 **The Node dependency is gone, and the code that could reintroduce it with it.** As of
 2026-08-16 `am` builds every config shape the spec defines and has no path to
@@ -598,9 +599,12 @@ Found by a spec review on 2026-08-16 and fixed:
       `&&`-chained ahead of the agent, it took the session with it. The container now starts as
       the container user and drops to `remoteUser` with `su` for the hooks and the agent, which
       is what the reference CLI does. With no entrypoint nothing is dropped.
-- [ ] **A dropped session's agent runs with the image's UID, not the host's.** The container
-      must start as the container user to run an entrypoint, so the numeric UID mapping cannot
-      also apply. The reference CLI rewrites the image to reconcile the two; `am` does not.
+- [x] **A dropped session's agent runs with the image's UID, not the host's.** Done
+      2026-08-16. When privileges are dropped, the container command now realigns the remote
+      user's UID/GID with the host's before the entrypoints run — `usermod`/`groupmod` on its
+      own line, best-effort, so an image without them keeps the behaviour this replaces rather
+      than losing the session. The reference CLI rebuilds the image instead, which would mean
+      one image per config *and user*.
 
 - [x] **The rest of the spec review.** Named lifecycle groups run in parallel (the object form
       exists for co-dependent commands and deadlocked in sequence); `appPort` publishes;
@@ -619,18 +623,22 @@ Follow-ups the native builder left behind:
       independent `installsAfter` chains — that is, most real configs. `installsAfter` is in
       nearly every published Feature and `dependsOn` in almost none (15 popular Features
       checked, none used it), so the incidental fix is worth more than the feature.
-- [ ] **`dependsOn` is not differentially tested.** The recursive walk now has offline unit
-      tests via local Features — transitive pull-in, diamond dedup, cycle termination — but
-      no Feature in the common registries declares `dependsOn`, so the two implementations
-      have never been compared on one. Needs a Feature published for the purpose.
+- [x] **`dependsOn` is not differentially tested.** Done 2026-08-16 by publishing the
+      Feature the comparison needed: `scripts/test-registry.sh` stands up a local `registry:2`
+      and publishes `tests/fixtures/registry/*`, one of which declares `dependsOn` on the
+      other. The reference CLI speaks plain HTTP only to `localhost`, so the script forwards
+      that name to the registry's published port when they are not the same host — and `am`
+      now does the same for loopback registries.
 - [x] **Registry auth.** Done 2026-08-16. `am` reads the auth files and credential helpers
       `docker login`/`podman login` write — all five locations, since the two runtimes
       disagree — and presents them to the token endpoint. Memoised per registry so a
       keychain-backed helper is not invoked once per Feature. A 401 with no credentials found
       now names the registry and the command to run.
-- [ ] **No test covers a real private registry.** The credential *lookup* is unit tested
-      including helpers via a mock binary, and the anonymous path is covered by the
-      differential tests, but nothing exercises an actual authenticated pull.
+- [x] **No test covers a real private registry.** Done 2026-08-16. The same script starts a
+      second `registry:2` behind htpasswd basic auth, logs in with the runtime, and publishes
+      to it; the test asserts an anonymous request is refused *and* that `am` then fetches the
+      manifest using the credential `docker login` left in the auth file. Without the
+      anonymous half, a registry that quietly stopped requiring auth would pass.
 - [x] **`overrideFeatureInstallOrder`.** Done 2026-08-15, as the spec's `roundPriority` on
       top of the round machinery `dependsOn` added. It is a priority rather than an order:
       it cannot make a Feature jump a dependency, and raising one Feature *splits* its round
@@ -644,7 +652,9 @@ Follow-ups the native builder left behind:
 - [ ] **Compose sessions are only tested against a mock runtime.** The build half has a
       differential test against the reference CLI, and the generated override is validated
       against real `docker compose config`, but no test brings a real project up and execs an
-      agent into it — that needs a runtime, a tmux session and a live agent at once.
+      agent into it — that needs a runtime, a tmux session and a live agent at once. The last
+      of the four coverage gaps still open; the other three were closed by
+      `scripts/test-registry.sh` and the tarball fixture on 2026-08-16.
 - [x] **podman compose.** Done 2026-08-16, and it was broken rather than merely untested:
       podman only grew the `compose` subcommand in 4.7, so on the podman Debian 12 and Ubuntu
       22.04 ship, every compose session failed with `unknown shorthand flag: 'f'`. `am` now
@@ -658,13 +668,25 @@ Follow-ups the native builder left behind:
       `shutdownAction` stops the project when the session ends (`"none"` opts out); `am destroy`
       is explicit and always takes it down. `runServices` narrows what `up` starts, always
       including the agent's own service.
-- [ ] **`postAttachCommand` runs once per `am attach` invocation**, not once per human attach —
-      tmux has no "user looked at this window" event. Idempotent hooks are unaffected.
-- [ ] **The env probe truncates a variable whose value contains a newline.** It converts the
-      NUL-separated `/proc/self/environ` to lines; the reference CLI parses the NUL stream.
-- [ ] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
-      They describe a port to an editor; `am` has no equivalent behaviour to apply.
-- [ ] **A forwarded port that is already bound fails at session start**, not in preflight.
+- [x] **`postAttachCommand` runs once per `am attach` invocation**, not once per human
+      attach — tmux has no "user looked at this window" event. Closed as documented behaviour
+      rather than fixed: switching windows with tmux's own keys can fire nothing at all, so
+      there is no version of this that is not surprising in one direction. The docs now say so
+      and ask for an idempotent hook.
+- [x] **The env probe truncates a variable whose value contains a newline.** Done
+      2026-08-16. A single `tr` now swaps both delimiters at once — newlines inside values
+      become `\001`, the NULs between variables become newlines — so one variable is one line
+      whatever it contains, and the newlines go back before it is exported. The truncated
+      remainder used to look like a malformed entry and be dropped silently.
+- [x] **`portsAttributes`/`otherPortsAttributes` are carried in the label but not acted on.**
+      Done 2026-08-16 for the one part of the property that is not about an editor:
+      `onAutoForward: "ignore"` now means the port is not published. Keys may be a port or an
+      inclusive range, with `otherPortsAttributes` as the fallback; the remaining fields
+      (`label`, `openBrowser`, …) still have no equivalent here.
+- [x] **A forwarded port that is already bound fails at session start.** Done 2026-08-16:
+      the port is dropped with a note instead. Two sessions on one repo forward the same ports
+      because they read the same config, and the second one died at `podman run` — after the
+      worktree, the image and the window were built — over a convenience property.
 - [x] **Registry and tarball Features participate in rebuild detection.** Done 2026-08-16 by
       adopting `devcontainer-lock.json` in the reference format: `am` reads it to pin fetches
       to a recorded digest, verifies tarball downloads against its `integrity` hash, folds it
@@ -672,15 +694,23 @@ Follow-ups the native builder left behind:
       Features stay excluded per the spec — their files are hashed directly. Adopting a
       lockfile renames the image once, which is a layer-cache hit in practice.
 - [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
-      until `am` writes one on its first build. Self-correcting, but worth knowing.
-- [ ] **Tarball Features are not differentially tested.** The CLI's resolver accepts one from
-      a local TLS server but its build path will not fetch from one, so no reference label
-      can be produced locally. Unpacking has unit tests and everything after the fetch is
-      shared with the other two sources; the HTTP fetch itself is untested.
-- [ ] **A typo'd `overrideFeatureInstallOrder` entry is ignored, not an error.** The CLI
-      resolves every entry and fails if it cannot; `am` only matches against the Features
-      being installed. No effect on the label, so it is a diagnostics gap rather than a
-      correctness one — closing it costs a network round trip per entry.
+      until `am` writes one on its first build. Self-correcting, and now documented in the
+      configuration reference; kept open only because the first build of a fresh checkout is
+      the one build that cannot notice.
+- [x] **The tarball fetch itself is untested.** Done 2026-08-16, though not by a local
+      server: `ureq` verifies against a bundled root store, so no locally issued certificate
+      can be trusted, and `am` accepts no other scheme. The fixture is therefore served the
+      one way that needs no infrastructure — as a committed file in this repository over
+      GitHub's HTTPS (`tests/fixtures/tarball/`). An offline test pins the committed archive's
+      shape; the `#[ignore]`d one fetches it back and checks the unpack and the cache hit.
+      A full *differential* comparison is still out of reach: the CLI's build path will not
+      fetch a tarball from a host we can point it at.
+- [x] **A typo'd `overrideFeatureInstallOrder` entry is ignored, not an error.** Done
+      2026-08-16 as a warning naming the entry and listing the Features that are installed.
+      Not an error, because the CLI's error is on a different condition — it fails on an entry
+      it cannot *resolve*, so it accepts one naming a real Feature that this config does not
+      install, which is the leftover-entry case. Warning locally catches both, with no network
+      round trip and no risk of failing a build the CLI builds.
 
 ---
 

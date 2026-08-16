@@ -392,24 +392,44 @@ pub fn install_order(
 ///
 /// An entry matches either the fully qualified name without its tag, or the Feature's short
 /// alias (`git` for `ghcr.io/devcontainers/features/git`) — the reference CLI accepts both, and
-/// the short form is what people actually write. An entry matching nothing being installed is
-/// ignored; the CLI instead resolves every entry and errors if it cannot, but since such an
-/// entry changes no ordering, the resulting label — the thing that is actually the contract —
-/// is identical either way.
+/// the short form is what people actually write. An entry matching nothing being installed
+/// changes no ordering; [`unmatched_override_entries`] is what reports it.
 fn round_priority(feature: &ResolvedFeature, override_order: &[String]) -> i64 {
-    let untagged = feature.reference.untagged();
-    let alias = feature.reference.name();
     override_order
         .iter()
-        .position(|entry| {
-            let entry = entry.rsplit_once(':').map_or(entry.as_str(), |(head, tail)| {
-                // Only a trailing tag, not the port in `localhost:5000/…`.
-                if tail.contains('/') { entry } else { head }
-            });
-            entry == untagged || entry == alias
-        })
+        .position(|entry| entry_matches(entry, feature))
         .map(|idx| (override_order.len() - idx) as i64)
         .unwrap_or(0)
+}
+
+fn entry_matches(entry: &str, feature: &ResolvedFeature) -> bool {
+    let entry = entry.rsplit_once(':').map_or(entry, |(head, tail)| {
+        // Only a trailing tag, not the port in `localhost:5000/…`.
+        if tail.contains('/') { entry } else { head }
+    });
+    entry == feature.reference.untagged() || entry == feature.reference.name()
+}
+
+/// `overrideFeatureInstallOrder` entries that name nothing being installed.
+///
+/// Such an entry is inert: it raises no Feature's priority, so the build is byte-for-byte the
+/// one the user would have got without it — and their intended ordering silently does not
+/// happen. Almost always a typo or a leftover from a Feature that was removed from the config.
+///
+/// Reported rather than refused. The reference CLI does error here, but on a different
+/// condition: it resolves every entry against the registry and fails on one it cannot fetch, so
+/// it accepts an entry naming a Feature that exists but is not in this config — exactly the
+/// leftover case — and rejects a typo only after a network round trip per entry. Warning locally
+/// catches both without either the round trip or the risk of failing a build the CLI builds.
+pub fn unmatched_override_entries(
+    features: &[ResolvedFeature],
+    override_order: &[String],
+) -> Vec<String> {
+    override_order
+        .iter()
+        .filter(|entry| !features.iter().any(|f| entry_matches(entry, f)))
+        .cloned()
+        .collect()
 }
 
 /// The spec's "Round Stable Sort": the tie-break among Features committed in the same round.
@@ -944,6 +964,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids(&plain), ids(&bogus));
+    }
+
+    /// The other half of the test above: changing no order is exactly why a typo here is worth
+    /// reporting — nothing else about the build differs from one without the key at all.
+    #[test]
+    fn an_override_entry_matching_nothing_is_reported() {
+        let features = two_chains();
+        assert_eq!(
+            unmatched_override_entries(
+                &features,
+                &[
+                    "ghcr.io/nobody/features/absent".to_string(),
+                    // A real member, named three ways the matcher must all accept.
+                    "ghcr.io/devcontainers/features/git".to_string(),
+                    "ghcr.io/devcontainers/features/git:1".to_string(),
+                    "git".to_string(),
+                ],
+            ),
+            vec!["ghcr.io/nobody/features/absent".to_string()]
+        );
+        assert!(unmatched_override_entries(&features, &[]).is_empty());
     }
 
     #[test]

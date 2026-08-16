@@ -259,6 +259,20 @@ fn http_error(url: &str, e: ureq::Error) -> anyhow::Error {
     AmError::DevcontainerBuildFailed(format!("fetching {url}: {detail}")).into()
 }
 
+/// Which scheme to speak to a registry.
+///
+/// HTTPS everywhere except a loopback host, which is plain HTTP — the same rule Docker and
+/// podman apply, where a localhost registry is insecure by default. Without it a developer
+/// running `registry:2` on their own machine cannot use it at all, and neither can `am`'s own
+/// integration tests, which publish purpose-built Features to exactly such a registry.
+fn scheme(registry: &str) -> &'static str {
+    let host = registry.split(':').next().unwrap_or(registry);
+    match host {
+        "localhost" | "127.0.0.1" | "::1" => "http",
+        _ => "https",
+    }
+}
+
 /// The registry host an API URL addresses.
 fn host_of(url: &str) -> Option<String> {
     url.strip_prefix("https://")
@@ -355,8 +369,11 @@ fn fetch_token(challenge: &str, credentials: Option<&super::auth::Credentials>) 
 /// Fetch a Feature's manifest.
 pub fn fetch_manifest(feature: &FeatureRef) -> Result<Manifest> {
     let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        feature.registry, feature.repository, feature.reference()
+        "{}://{}/v2/{}/manifests/{}",
+        scheme(&feature.registry),
+        feature.registry,
+        feature.repository,
+        feature.reference()
     );
     let body = get_with_auth(&url, Some(MANIFEST_ACCEPT))?;
     let mut manifest: Manifest = serde_json::from_slice(&body)
@@ -392,8 +409,11 @@ pub fn fetch_layer(feature: &FeatureRef, layer: &Layer, cache_root: &Path) -> Re
     }
 
     let url = format!(
-        "https://{}/v2/{}/blobs/{}",
-        feature.registry, feature.repository, layer.digest
+        "{}://{}/v2/{}/blobs/{}",
+        scheme(&feature.registry),
+        feature.registry,
+        feature.repository,
+        layer.digest
     );
     let blob = get_with_auth(&url, None)?;
 
@@ -532,6 +552,16 @@ mod tests {
     }
 
     #[test]
+    fn a_loopback_registry_is_plain_http() {
+        // The same rule Docker and podman apply. Without it a developer running `registry:2`
+        // locally cannot use it, and neither can am's own integration tests.
+        assert_eq!(scheme("localhost:5000"), "http");
+        assert_eq!(scheme("127.0.0.1:5000"), "http");
+        assert_eq!(scheme("ghcr.io"), "https");
+        assert_eq!(scheme("registry.example.com:5000"), "https");
+    }
+
+    #[test]
     fn a_feature_id_is_case_insensitive() {
         let r = parse_ref("GHCR.io/Devcontainers/Features/Git:1");
         assert_eq!(r.registry, "ghcr.io");
@@ -632,6 +662,78 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("install.sh")).unwrap(),
             "echo gz"
+        );
+    }
+
+    /// The committed fixture is the *only* copy of that Feature — the network test below fetches
+    /// this same file back out of the repository — so a rebuild that changes its shape has to
+    /// fail here, offline, rather than in an `#[ignore]`d test nobody ran.
+    #[test]
+    fn the_committed_tarball_fixture_unpacks_to_a_feature() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = include_bytes!("../../../tests/fixtures/tarball/tarball-only.tgz");
+        unpack(blob, tmp.path()).unwrap();
+
+        let metadata =
+            std::fs::read_to_string(tmp.path().join("devcontainer-feature.json")).unwrap();
+        assert!(metadata.contains("\"id\": \"tarball-only\""), "got: {metadata}");
+        assert!(tmp.path().join("install.sh").is_file());
+    }
+
+    /// The direct-tarball path, end to end: fetch over real HTTPS, unpack, hash.
+    ///
+    /// Served from this repository over GitHub's own TLS, because `am` accepts no other scheme
+    /// and a locally issued certificate cannot join the root store `ureq` verifies against —
+    /// see `tests/fixtures/tarball/README.md`. That makes this the one Feature path with no
+    /// local harness to start; the ignore is about the network, not about infrastructure.
+    #[test]
+    #[ignore = "fetches the fixture tarball over the network"]
+    fn a_feature_tarball_is_fetched_and_unpacked_over_https() {
+        let url = std::env::var("AM_TARBALL_FIXTURE_URL").unwrap_or_else(|_| {
+            "https://raw.githubusercontent.com/dstanek/agent-manager/main/\
+             tests/fixtures/tarball/tarball-only.tgz"
+                .to_string()
+        });
+        let cache = tempfile::tempdir().unwrap();
+        let feature = parse_ref(&url);
+        assert_eq!(feature.kind, FeatureKind::Tarball);
+
+        let (dir, digest) = fetch_tarball(&feature, cache.path()).expect("fetching the tarball");
+        assert!(digest.starts_with("sha256:"));
+        let metadata = std::fs::read_to_string(dir.join("devcontainer-feature.json"))
+            .expect("the archive had no devcontainer-feature.json at its root");
+        assert!(metadata.contains("\"id\": \"tarball-only\""), "got: {metadata}");
+        assert!(dir.join("install.sh").is_file());
+
+        // Second call is a cache hit on the digest, and must land on the same directory rather
+        // than re-downloading into a new one.
+        let (again, same_digest) = fetch_tarball(&feature, cache.path()).unwrap();
+        assert_eq!((again, same_digest), (dir, digest));
+    }
+
+    /// The whole credential path, end to end: a registry that refuses anonymous callers, a
+    /// credential in the runtime's auth file put there by a real `docker login`, and `am`
+    /// finding it. Nothing in the public registries can test this — they let everyone in.
+    ///
+    /// The anonymous request first is what keeps the test honest: without it, a registry that
+    /// had quietly stopped requiring auth would let the second half pass on its own.
+    #[test]
+    #[ignore = "needs the local test registries — see scripts/test-registry.sh"]
+    fn a_private_registry_is_read_with_the_runtimes_stored_credentials() {
+        let feature = parse_ref("localhost:5001/amtest/base:1.0.0");
+        let url = "http://localhost:5001/v2/amtest/base/manifests/1.0.0";
+
+        let anonymous = ureq::get(url).set("Accept", MANIFEST_ACCEPT).call();
+        assert!(
+            matches!(anonymous, Err(ureq::Error::Status(401, _))),
+            "the test registry is not actually private: {anonymous:?}"
+        );
+
+        let manifest = fetch_manifest(&feature).expect("fetching through the stored credential");
+        assert!(manifest.digest.starts_with("sha256:"));
+        assert!(
+            manifest.feature_layer().is_some(),
+            "the manifest carries no Feature layer: {manifest:?}"
         );
     }
 }

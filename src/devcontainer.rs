@@ -265,6 +265,30 @@ pub struct MetadataSnippet {
     /// union of numbers and `"<service>:<port>"` strings; [`ForwardedPort::parse`] sorts them out.
     #[serde(default)]
     pub forward_ports: Vec<serde_json::Value>,
+    /// Per-port settings, keyed by port number or `"<lo>-<hi>"` range.
+    #[serde(default)]
+    pub ports_attributes: BTreeMap<String, PortAttributes>,
+    /// The same settings for every port no key matches.
+    pub other_ports_attributes: Option<PortAttributes>,
+}
+
+/// The settings a config can attach to a forwarded port.
+///
+/// Most of this property describes a port to an *editor* — what to label it, whether to open a
+/// browser when it appears — and `am` has no editor, so those fields are not modelled. One is
+/// not editor-specific: `onAutoForward: "ignore"` says this port should not be forwarded at all,
+/// which in am's model means not published. Honouring it matters because the usual reason to
+/// write it is that something else on the host already owns that port.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PortAttributes {
+    pub on_auto_forward: Option<String>,
+}
+
+impl PortAttributes {
+    fn is_ignored(&self) -> bool {
+        self.on_auto_forward.as_deref() == Some("ignore")
+    }
 }
 
 /// How to derive the environment the agent runs with.
@@ -745,6 +769,9 @@ pub struct ResolvedConfig {
     pub post_attach: Vec<Command>,
     /// Ports to publish, in contribution order and de-duplicated.
     pub forward_ports: Vec<ForwardedPort>,
+    /// Per-port settings, merged key by key.
+    pub ports_attributes: BTreeMap<String, PortAttributes>,
+    pub other_ports_attributes: Option<PortAttributes>,
     /// From `devcontainer.json` only — the label drops these.
     pub run_args: Vec<String>,
     /// `appPort`, already rendered as publish specifications.
@@ -752,6 +779,35 @@ pub struct ResolvedConfig {
     pub workspace_folder: Option<String>,
     pub workspace_mount: Option<String>,
     pub name: Option<String>,
+}
+
+impl ResolvedConfig {
+    /// Whether `portsAttributes` asks that this port not be forwarded.
+    ///
+    /// The keyed entry wins; `otherPortsAttributes` covers everything no key matches.
+    pub fn port_is_ignored(&self, port: u16) -> bool {
+        match self.ports_attributes.iter().find(|(key, _)| port_key_matches(key, port)) {
+            Some((_, attrs)) => attrs.is_ignored(),
+            None => self.other_ports_attributes.as_ref().is_some_and(PortAttributes::is_ignored),
+        }
+    }
+}
+
+/// A `portsAttributes` key: a port number, or an inclusive `"<lo>-<hi>"` range.
+///
+/// VS Code also accepts a regex key. `am` treats one as matching nothing, so such a port falls
+/// through to `otherPortsAttributes` — the same place it would land if the key were absent.
+fn port_key_matches(key: &str, port: u16) -> bool {
+    if let Ok(exact) = key.trim().parse::<u16>() {
+        return exact == port;
+    }
+    match key.split_once('-') {
+        Some((lo, hi)) => match (lo.trim().parse::<u16>(), hi.trim().parse::<u16>()) {
+            (Ok(lo), Ok(hi)) => (lo..=hi).contains(&port),
+            _ => false,
+        },
+        None => false,
+    }
 }
 
 /// Append `values` to `target`, skipping duplicates. Used for the union-merged lists.
@@ -828,6 +884,14 @@ pub fn merge(snippets: &[MetadataSnippet]) -> Result<ResolvedConfig> {
                     out.forward_ports.push(port);
                 }
             }
+        }
+        // Keyed settings merge per key rather than wholesale, so a config that describes one
+        // port does not discard what a Feature said about another.
+        for (k, v) in &snippet.ports_attributes {
+            out.ports_attributes.insert(k.clone(), v.clone());
+        }
+        if snippet.other_ports_attributes.is_some() {
+            out.other_ports_attributes = snippet.other_ports_attributes.clone();
         }
     }
     Ok(out)
@@ -955,6 +1019,7 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
             Ok(content) => hasher.update(&content),
             Err(_) => hasher.update(dockerfile.to_string_lossy().as_bytes()),
         }
+        hash_build_context(&mut hasher, config_path, &json);
     }
 
     // A Feature vendored in the repo is build input like the Dockerfile is: editing its
@@ -984,6 +1049,54 @@ pub fn config_hash(config_path: &Path, injected: &[InjectedFeature]) -> Result<S
 
     let digest = hasher.finalize();
     Ok(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+}
+
+/// Fold the build context's *tracked* files into the hash.
+///
+/// A `COPY` in the Dockerfile makes those files build input, so editing one has to produce a
+/// different image — otherwise `am start` reuses the old one and the edit appears to do nothing,
+/// which is a genuinely baffling way to lose an afternoon.
+///
+/// Only files git knows about, and only their names and contents. That bound is what makes this
+/// affordable: `"context": ".."` means the whole repository, and walking it would drag in
+/// `target/`, `node_modules/` and every build artefact — exactly the paths a `.dockerignore`
+/// excludes and `git` already ignores. It also makes the hash reproducible across machines,
+/// where mtimes and directory order are not.
+///
+/// A context outside a repository, or a `git` that fails, contributes nothing: the previous
+/// behaviour, and `--rebuild` remains the answer.
+fn hash_build_context(hasher: &mut sha2::Sha256, config_path: &Path, json: &DevcontainerJson) {
+    use sha2::Digest;
+
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let context = json
+        .build
+        .as_ref()
+        .and_then(|b| b.context.as_deref())
+        .map(|c| base.join(c))
+        .unwrap_or_else(|| base.to_path_buf());
+
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&context)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+
+    // `ls-files` output is already sorted, and NUL-separated so a filename containing a newline
+    // does not split into two.
+    for name in output.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        hasher.update(name);
+        let path = context.join(String::from_utf8_lossy(name).as_ref());
+        if let Ok(content) = std::fs::read(&path) {
+            hasher.update(&content);
+        }
+    }
 }
 
 /// The `./path` Feature ids a config names, in sorted order.
@@ -1347,10 +1460,15 @@ pub fn apply_trust(
         // `appPort` publishes alongside `forwardPorts`. They are different properties — one
         // asks a tool to forward, the other asks the runtime to publish — and a config may use
         // either or both.
+        // `portsAttributes` can say `onAutoForward: "ignore"` for a port, which is the one part
+        // of that property that is not about an editor: it asks that the port not be forwarded.
+        // It applies to `forwardPorts` only — `appPort` asks the runtime to publish directly,
+        // and is not something an editor was ever going to forward.
         ports: resolved
             .forward_ports
-            .clone()
-            .into_iter()
+            .iter()
+            .filter(|port| !matches!(port, ForwardedPort::Own(n) if resolved.port_is_ignored(*n)))
+            .cloned()
             .chain(resolved.app_port.iter().map(|spec| ForwardedPort::Published(spec.clone())))
             .collect(),
         // With an entrypoint to run, this is who the *container* starts as — the container
@@ -1399,6 +1517,21 @@ pub fn apply_trust(
             );
         }
     }
+
+    // Ports last, so the check runs against the list the container would actually be started
+    // with. A port another process already holds would otherwise fail the whole `run`.
+    let busy = crate::container::drop_busy_ports(&mut runtime.ports);
+    if !busy.is_empty() {
+        eprintln!(
+            "{} not forwarding {} — already in use on this host. \
+             The session runs without {}; another am session on this repo forwards the same \
+             ports, and whatever is listening is reachable there.",
+            color::note_prefix(color::enabled(color::Stream::Stderr)),
+            busy.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
+            if busy.len() == 1 { "it" } else { "them" },
+        );
+    }
+
     runtime
 }
 
@@ -2044,6 +2177,78 @@ mod tests {
 
     // ── Hashing ───────────────────────────────────────────────────────────────
 
+    /// A repo with a Dockerfile that copies a file from its context.
+    fn context_repo() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM debian\nCOPY app.txt /app.txt\n").unwrap();
+        std::fs::write(
+            dir.join("devcontainer.json"),
+            r#"{"build":{"dockerfile":"Dockerfile","context":".."}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("app.txt"), "one").unwrap();
+        for args in [
+            vec!["init"],
+            vec!["-c", "user.email=t@e.com", "-c", "user.name=T", "add", "-A"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn editing_a_file_the_dockerfile_copies_changes_the_image_name() {
+        // Otherwise `am start` reuses the image built from the old file and the edit appears to
+        // do nothing — the most confusing way this can fail, because nothing reports an error.
+        let tmp = context_repo();
+        let config = tmp.path().join(".devcontainer/devcontainer.json");
+
+        let before = config_hash(&config, &[]).unwrap();
+        std::fs::write(tmp.path().join("app.txt"), "two").unwrap();
+        assert_ne!(before, config_hash(&config, &[]).unwrap());
+    }
+
+    #[test]
+    fn an_untracked_ignored_file_does_not_change_the_image_name() {
+        // The bound that makes hashing a context affordable: `"context": ".."` is the whole
+        // repository, and walking it unbounded would drag in target/ and node_modules/ — the
+        // very paths a .dockerignore excludes and git already ignores.
+        let tmp = context_repo();
+        let config = tmp.path().join(".devcontainer/devcontainer.json");
+        std::fs::write(tmp.path().join(".gitignore"), "junk/\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+
+        let before = config_hash(&config, &[]).unwrap();
+        std::fs::create_dir_all(tmp.path().join("junk")).unwrap();
+        std::fs::write(tmp.path().join("junk/build.o"), "artifact").unwrap();
+        assert_eq!(before, config_hash(&config, &[]).unwrap());
+    }
+
+    #[test]
+    fn a_context_outside_a_repository_still_produces_a_hash() {
+        // No git, no context contribution — the previous behaviour, and `--rebuild` remains the
+        // answer. It must not fail the session.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM debian\n").unwrap();
+        let config = dir.join("devcontainer.json");
+        std::fs::write(&config, r#"{"build":{"dockerfile":"Dockerfile"}}"#).unwrap();
+        assert!(config_hash(&config, &[]).is_ok());
+    }
+
     #[test]
     fn editing_a_vendored_feature_changes_the_image_name() {
         // Otherwise `am start` reuses the image built from the old install.sh and the edit
@@ -2298,6 +2503,65 @@ mod tests {
         // Not 0.0.0.0: a session container is not something to put on the network by default,
         // and this is what the reference CLI does for a bare appPort.
         assert_eq!(ForwardedPort::publish_spec(3000), "127.0.0.1:3000:3000");
+    }
+
+    #[test]
+    fn ports_attributes_can_ask_that_a_port_not_be_forwarded() {
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"portsAttributes":{"3000":{"label":"web","onAutoForward":"ignore"},
+                                    "9000-9100":{"onAutoForward":"ignore"},
+                                    "8080":{"onAutoForward":"notify"}}}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+
+        assert!(merged.port_is_ignored(3000));
+        // A range key covers every port in it, inclusive of both ends.
+        assert!(merged.port_is_ignored(9000));
+        assert!(merged.port_is_ignored(9050));
+        assert!(merged.port_is_ignored(9100));
+        assert!(!merged.port_is_ignored(9101));
+        // Every other value of onAutoForward describes what an editor should do once the port
+        // *is* forwarded, so it stays forwarded.
+        assert!(!merged.port_is_ignored(8080));
+        assert!(!merged.port_is_ignored(1234));
+    }
+
+    #[test]
+    fn other_ports_attributes_covers_what_no_key_matches() {
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"portsAttributes":{"3000":{"onAutoForward":"notify"}},
+                 "otherPortsAttributes":{"onAutoForward":"ignore"}}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+        assert!(!merged.port_is_ignored(3000), "the keyed entry wins over the fallback");
+        assert!(merged.port_is_ignored(8080));
+    }
+
+    #[test]
+    fn ports_attributes_merge_key_by_key_across_snippets() {
+        // A config describing one port must not discard what a Feature said about another.
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"portsAttributes":{"3000":{"onAutoForward":"ignore"}}},
+                {"portsAttributes":{"8080":{"onAutoForward":"ignore"}}}]"#,
+        )
+        .unwrap();
+        let merged = merge(&snippets).unwrap();
+        assert!(merged.port_is_ignored(3000));
+        assert!(merged.port_is_ignored(8080));
+    }
+
+    #[test]
+    fn an_ignored_port_is_not_published() {
+        let resolved = merge(&serde_json::from_str::<Vec<MetadataSnippet>>(
+            r#"[{"forwardPorts":[3000,8080],
+                 "portsAttributes":{"3000":{"onAutoForward":"ignore"}}}]"#,
+        )
+        .unwrap())
+        .unwrap();
+        let runtime = apply_trust(&resolved, &crate::config::Config::default());
+        assert_eq!(runtime.ports, vec![ForwardedPort::Own(8080)]);
     }
 
     #[test]

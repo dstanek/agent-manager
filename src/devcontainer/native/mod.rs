@@ -576,10 +576,25 @@ pub fn build(
         .iter()
         .map(|(f, content)| (f.reference.raw.clone(), content.clone()))
         .collect();
-    let ordered = feature::install_order(
-        resolved.into_iter().map(|(f, _)| f).collect(),
-        &override_install_order(raw_config),
-    )?;
+    let override_order = override_install_order(raw_config);
+    let features: Vec<feature::ResolvedFeature> = resolved.into_iter().map(|(f, _)| f).collect();
+    // An entry naming nothing here does nothing at all, so the ordering the user wrote the key
+    // for silently does not happen. Said once, before the slow part of the build.
+    let unmatched = feature::unmatched_override_entries(&features, &override_order);
+    if !unmatched.is_empty() {
+        eprintln!(
+            "{} overrideFeatureInstallOrder names {} which no Feature in this config \
+             matches — the entry has no effect. Installed: {}",
+            crate::color::warning_prefix(crate::color::enabled(crate::color::Stream::Stderr)),
+            unmatched.join(", "),
+            features
+                .iter()
+                .map(|f| f.reference.untagged().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let ordered = feature::install_order(features, &override_order)?;
 
     let base = resolve_base(req, runtime_bin)?;
     let base_elements = base_label_elements(runtime_bin, &base)?;
@@ -1162,6 +1177,19 @@ mod tests {
     fn override_install_order_matches_the_reference_cli_resolver() {
         assert_order_matches_reference(include_str!(
             "../../../tests/fixtures/devcontainer/native/override-order-devcontainer.json"
+        ));
+    }
+
+    /// The `dependsOn` differential test, which needs Features that actually declare one.
+    ///
+    /// Nothing in the common registries does, which is why this went unverified for so long.
+    /// `scripts/test-registry.sh` publishes purpose-built Features to a local registry; this
+    /// resolves a config using them through both implementations and compares.
+    #[test]
+    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
+    fn depends_on_matches_the_reference_cli_resolver() {
+        assert_order_matches_reference(include_str!(
+            "../../../tests/fixtures/devcontainer/native/depends-on-devcontainer.json"
         ));
     }
 

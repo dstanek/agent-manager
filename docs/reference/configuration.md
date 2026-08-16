@@ -287,13 +287,17 @@ checked-in, branch-specific file):
    error listing the candidates
 
 **Image caching.** The built image is named `am-dc-<hash>`, where the hash covers the config
-bytes, the referenced Dockerfile, and any injected Features. Sessions sharing a config share
-an image, and an unchanged config skips the build entirely.
+bytes, the referenced Dockerfile, any injected Features, and the build context's files — so
+editing a script your Dockerfile `COPY`s rebuilds the image. Sessions sharing a config share an
+image, and an unchanged config skips the build entirely.
 
-!!! warning "Other build-context files are not hashed"
-    Hashing an arbitrary build context is unbounded work — `"context": ".."` means the whole
-    repo. Editing a file that your Dockerfile `COPY`s will not trigger a rebuild on its own;
-    run `am start <slug> --rebuild` when that happens.
+!!! note "The build context is hashed through git"
+    The files that count are the ones `git ls-files --cached --others --exclude-standard` lists
+    under the context directory: tracked files, plus untracked ones that are not ignored. This
+    keeps the work bounded when `"context": ".."` means the whole repo, and keeps build
+    artifacts and caches from renaming the image on every build. Two cases still need
+    `am start <slug> --rebuild`: a git-ignored file that the build nonetheless `COPY`s, and a
+    context outside any git repository, which is not hashed at all.
 
 !!! danger "`initializeCommand` runs on your host"
     Of the six lifecycle hooks, `initializeCommand` is the only one that runs outside the
@@ -311,6 +315,12 @@ applies both to `am start` and to `am attach` recreating a container that was go
 does not re-run them. `postAttachCommand` runs in both cases, and on `am start`, since starting a session is also
 attaching to it. Attaching to a session that is already live `exec`s it into the running
 container — there being no new container command to chain it into.
+
+!!! note "`postAttachCommand` runs per `am attach`, not per glance at the window"
+    The hook fires each time you run `am attach`, including when the session was already up and
+    all that happens is a tmux window switch. Switching to that window with tmux's own keys
+    fires nothing at all — tmux has no event `am` could hook. Write the command so that running
+    it twice is harmless.
 
 **Compose.** A config with `dockerComposeFile` must also name a `service`. `am` builds that
 service's image, brings the project up, runs the agent inside it, and takes the project down on
@@ -331,12 +341,22 @@ It stores nothing of its own.
 **Lockfile.** `am` reads and writes `.devcontainer/devcontainer-lock.json` in the reference
 format. Registry Features are fetched at the digest it records, tarball downloads are checked
 against its `integrity` hash, and the file is folded into the image hash so a moved pin rebuilds.
-Local Features are excluded per the spec; their files are hashed directly instead.
+Local Features are excluded per the spec; their files are hashed directly instead. Until the
+first build writes the file, a Feature tag that moves to a new digest is invisible — there is
+nothing recorded to compare against. It is self-correcting: commit the lockfile that build
+writes, and every later move is caught.
 
 **Ports.** `forwardPorts` publishes each port on `127.0.0.1`. The reference CLI publishes
 nothing here and leaves forwarding to an editor; `am` has none, so publishing is what makes the
 key mean anything. In a compose project a bare port lands on the agent's service and a
 `"<service>:<port>"` entry on the service it names.
+
+A port already in use on the host is dropped with a note instead of failing the session — two
+sessions on the same repo forward the same ports, because they read the same config, and the
+second one would otherwise not start. `portsAttributes` can also ask for a port to be left
+alone: `{"3000": {"onAutoForward": "ignore"}}` means 3000 is not published. Keys may be a port
+or an inclusive `"9000-9100"` range, with `otherPortsAttributes` covering the rest. The
+property's other fields describe a port to an editor and have no meaning here.
 
 **Environment.** `userEnvProbe` decides how the agent's environment is derived, defaulting to
 `loginInteractiveShell` per the spec: `am` runs the container user's login shell, reads the
@@ -344,8 +364,9 @@ environment it produces, and applies it — so a toolchain installed via a dotfi
 Variables `am` set deliberately are never overwritten by it. Set `"userEnvProbe": "none"` to opt
 out. Image-mode sessions never probe.
 
-**Not yet supported.** `portsAttributes` is carried in the image label but not acted on — it
-exists to describe ports to an editor.
+**Environment probing caveat.** The probe carries values containing newlines intact; a value
+containing a literal `\001` (SOH) is the one thing it cannot round-trip, since that byte is what
+stands in for the newlines while the environment is parsed.
 
 ### `[attach]`
 

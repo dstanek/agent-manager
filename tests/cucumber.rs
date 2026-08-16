@@ -905,6 +905,25 @@ async fn given_post_attach_config(world: &mut AmWorld) {
         .expect("write label file");
 }
 
+/// The forwarded ports and the attributes that describe them both reach the run path through the
+/// image's metadata label, so both belong in the mock label rather than only in the config.
+#[given("the repo has a devcontainer config that forwards a port it asks to be ignored")]
+async fn given_ignored_port_config(world: &mut AmWorld) {
+    let config = r#"{"name":"test","image":"debian:bookworm","forwardPorts":[3000,8080],
+                     "portsAttributes":{"3000":{"onAutoForward":"ignore"}}}"#;
+    world.write_devcontainer_config(config);
+    let label = world
+        .mock_label_file
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    fs::write(
+        label,
+        r#"[{"remoteUser":"vscode","forwardPorts":[3000,8080],
+             "portsAttributes":{"3000":{"onAutoForward":"ignore"}}}]"#,
+    )
+    .expect("write label file");
+}
+
 #[given("the repo has a devcontainer config with an initializeCommand")]
 async fn given_initialize_command_config(world: &mut AmWorld) {
     world.write_devcontainer_config(

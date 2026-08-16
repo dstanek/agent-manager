@@ -1,0 +1,6 @@
+{
+  "id": "base",
+  "version": "1.0.0",
+  "name": "Base",
+  "description": "A Feature with no dependencies, published so another can depend on it."
+}
