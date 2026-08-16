@@ -1,0 +1,5 @@
+{
+  "name": "feature containerEnv and hooks",
+  "image": "debian:bookworm-slim",
+  "features": { "./envfeat": {} }
+}

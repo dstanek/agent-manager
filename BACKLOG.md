@@ -568,6 +568,17 @@ Two config keys were removed rather than deprecated. `am` warns on unknown keys 
 failing, so an existing `builder = "cli"` or `cli = "..."` produces a warning and is ignored —
 worth a line in the release notes alongside the `container.agent` removal.
 
+Found by a spec review on 2026-08-16 and fixed:
+
+- [x] **A Feature's `containerEnv` was dropped entirely.** The CLI bakes it into the image as
+      `ENV`; `am` did neither that nor carry it in the label, so `go`/`node`/`python`/`rust`
+      installed their toolchains and left them off `PATH`. Invisible to the differential tests,
+      which compare labels — and the CLI omits this from the label too.
+- [x] **A Feature's lifecycle hooks were dropped from the label**, so a Feature's own
+      `postCreateCommand` never ran.
+- [x] **`shutdownAction` was missing from the config key list.**
+- [x] **`remoteEnv` rejected the spec's `null`**, failing the whole label parse after a build.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

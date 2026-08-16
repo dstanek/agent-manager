@@ -26,9 +26,20 @@ use crate::error::AmError;
 ///
 /// What a **Feature** contributes, in the order the reference CLI emits it.
 ///
-/// Narrower than a config's: a Feature declaring `containerEnv`, `forwardPorts` or
-/// `hostRequirements` has those dropped, which is the CLI's behaviour and not an omission here.
+/// Transcribed from the CLI's own `pickFeatureProperties` rather than inferred from a probe: a
+/// probe only shows the properties the Feature it was built from happened to declare, which is
+/// how the five lifecycle hooks were missed here originally — a Feature's `postCreateCommand`
+/// was dropped, so `git-lfs` never pulled its artifacts.
+///
+/// Still narrower than a config's. A Feature declaring `forwardPorts` or `hostRequirements` has
+/// those dropped, and `containerEnv` is dropped *from the label* — but only because the builder
+/// bakes it into the image as `ENV` instead. See `dockerfile::render`.
 const FEATURE_METADATA_KEYS: &[&str] = &[
+    "onCreateCommand",
+    "updateContentCommand",
+    "postCreateCommand",
+    "postStartCommand",
+    "postAttachCommand",
     "init",
     "privileged",
     "capAdd",
@@ -45,6 +56,10 @@ const FEATURE_METADATA_KEYS: &[&str] = &[
 /// `init`/`mounts`/`containerEnv` would have hit: the CLI emits `customizations` seventh, while
 /// the Feature order puts it last. `entrypoint` is absent because `devcontainer.json` has no
 /// such property; only Features contribute entrypoints.
+///
+/// Transcribed from the CLI's `pickConfigProperties`. A probe cannot produce this list on its
+/// own — it only reveals what the probe config declared, which is how `shutdownAction` was
+/// missing until a review caught it.
 const CONFIG_METADATA_KEYS: &[&str] = &[
     "onCreateCommand",
     "updateContentCommand",
@@ -67,6 +82,7 @@ const CONFIG_METADATA_KEYS: &[&str] = &[
     "portsAttributes",
     "otherPortsAttributes",
     "forwardPorts",
+    "shutdownAction",
     "updateRemoteUserUID",
     "hostRequirements",
 ];
@@ -584,6 +600,83 @@ mod tests {
         for dropped in ["options", "installsAfter", "version", "name", "description"] {
             assert!(!obj.contains_key(dropped), "{dropped} should not reach the label");
         }
+    }
+
+    /// The two key lists, pinned against the reference CLI's own `pickConfigProperties` and
+    /// `pickFeatureProperties`.
+    ///
+    /// These are transcriptions, not observations, and that is the point: a probe only shows
+    /// the properties whichever Feature or config it was built from happened to declare. Both
+    /// lists were wrong for exactly that reason — the Feature list was missing all five
+    /// lifecycle hooks, and the config list was missing `shutdownAction`. Asserting the whole
+    /// list, rather than a sample of it, is what makes a future omission fail here instead of
+    /// silently dropping a property from every image `am` builds.
+    #[test]
+    fn the_key_lists_match_the_reference_implementation() {
+        // src/spec-node/imageMetadata.ts — pickConfigProperties
+        assert_eq!(
+            CONFIG_METADATA_KEYS,
+            [
+                "onCreateCommand",
+                "updateContentCommand",
+                "postCreateCommand",
+                "postStartCommand",
+                "postAttachCommand",
+                "waitFor",
+                "customizations",
+                "mounts",
+                "containerEnv",
+                "containerUser",
+                "init",
+                "privileged",
+                "capAdd",
+                "securityOpt",
+                "remoteUser",
+                "userEnvProbe",
+                "remoteEnv",
+                "overrideCommand",
+                "portsAttributes",
+                "otherPortsAttributes",
+                "forwardPorts",
+                "shutdownAction",
+                "updateRemoteUserUID",
+                "hostRequirements",
+            ]
+        );
+
+        // pickFeatureProperties — the five lifecycle hooks lead, and there is no containerEnv:
+        // a Feature's is baked into the image as ENV instead. See dockerfile::render.
+        assert_eq!(
+            FEATURE_METADATA_KEYS,
+            [
+                "onCreateCommand",
+                "updateContentCommand",
+                "postCreateCommand",
+                "postStartCommand",
+                "postAttachCommand",
+                "init",
+                "privileged",
+                "capAdd",
+                "securityOpt",
+                "entrypoint",
+                "mounts",
+                "customizations",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_features_lifecycle_hooks_reach_the_label() {
+        // Dropping these meant a Feature's own postCreateCommand never ran — `git-lfs` declares
+        // one to pull its artifacts, so a checkout kept stub files.
+        let raw: Value = serde_json_lenient::from_str(
+            r#"{"postCreateCommand":"/usr/local/share/pull-git-lfs-artifacts.sh",
+                "customizations":{"vscode":{}},"init":true}"#,
+        )
+        .unwrap();
+        let keys: Vec<String> =
+            metadata_properties(&raw, FEATURE_METADATA_KEYS).map(|(k, _)| k).collect();
+        assert_eq!(keys, ["postCreateCommand", "init", "customizations"]);
     }
 
     #[test]
