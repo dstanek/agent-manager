@@ -150,6 +150,12 @@ pub struct DevcontainerRuntime {
     pub workdir: Option<String>,
     /// Feature entrypoint scripts, composed ahead of the agent command.
     pub entrypoints: Vec<String>,
+    /// The user to drop to for the agent, when the container itself must start as someone
+    /// else. Set only when a Feature contributes an entrypoint: those run as the *container*
+    /// user — root unless the config says otherwise — while the agent and the lifecycle hooks
+    /// run as `remoteUser`. Verified against the reference CLI, which starts the container as
+    /// root and `exec`s tools as the remote user.
+    pub drop_to: Option<String>,
     /// Whether to map the container user onto the host's UID/GID, from `updateRemoteUserUID`.
     pub update_remote_user_uid: bool,
     /// How to derive the agent's environment, from `userEnvProbe`.
@@ -718,7 +724,12 @@ pub fn build_run_command(
                 // `am` maps the process rather than rewriting the image's passwd entry as the
                 // reference CLI does, so `HOME` is set explicitly below: a numeric uid with no
                 // passwd entry would otherwise leave the agent without one.
-                if dc.user.is_none() || dc.update_remote_user_uid {
+                // Not when privileges are about to be dropped: the container has to start as
+                // the container user for the Feature entrypoints, and `su` from a mapped
+                // numeric uid is not possible. The agent then runs as the image's remote user,
+                // whose uid may differ from the host's — the reference CLI rewrites the image
+                // to reconcile that, which `am` does not do.
+                if dc.drop_to.is_none() && (dc.user.is_none() || dc.update_remote_user_uid) {
                     cmd.push("--user".to_string());
                     cmd.push(format!("{uid}:{gid}"));
                 }
@@ -731,6 +742,7 @@ pub fn build_run_command(
     // already applies, since the two `--user` flags would contradict each other and the
     // numeric one is what keeps the worktree writable.
     let mapped_uid = matches!(runtime.kind, RuntimeKind::Docker)
+        && dc.drop_to.is_none()
         && dc.update_remote_user_uid
         && get_host_uid_gid().is_some();
     if let Some(ref user) = dc.user {
@@ -941,19 +953,22 @@ pub fn build_run_command(
 /// deliberately, which the probe must not overwrite.
 pub fn compose_entrypoint_command(
     entrypoints: &[String],
+    hooks: &[String],
     agent_cmd: &[String],
     probe: crate::devcontainer::UserEnvProbe,
     protected: &[String],
+    drop_to: Option<&str>,
 ) -> Vec<String> {
     let probe_script = user_env_probe_script(probe, protected);
-    if entrypoints.is_empty() && probe_script.is_none() {
+    if entrypoints.is_empty() && hooks.is_empty() && probe_script.is_none() {
         return agent_cmd.to_vec();
     }
 
-    // Entrypoints stay `&&`-chained through to the agent: a Feature's init script failing must
-    // stop the session rather than launch an agent into a half-built container. The probe is
-    // joined with a newline instead, because finding no variables is not a failure.
-    let mut tail = entrypoints.join(" && ");
+    // What the *remote* user runs: probe the environment, run the lifecycle hooks, exec the
+    // agent. Hooks stay `&&`-chained through to the agent — a failed postCreateCommand must
+    // stop the session rather than launch an agent into a half-built container — while the
+    // probe is joined with a newline, because finding no variables is not a failure.
+    let mut tail = hooks.join(" && ");
     if !agent_cmd.is_empty() {
         let quoted = agent_cmd
             .iter()
@@ -966,12 +981,29 @@ pub fn compose_entrypoint_command(
             tail.push_str(&format!(" && exec {quoted}"));
         }
     }
-
-    let script = match probe_script {
+    let user_script = match probe_script {
         Some(probe) if tail.is_empty() => probe,
         Some(probe) => format!("{probe}\n{tail}"),
         None => tail,
     };
+
+    // What the *container* user runs: the Feature entrypoints, then a drop to the remote user
+    // for everything above. `su` rather than a second `--user`, because there is only one
+    // command — and `exec` so the agent keeps the pane's tty and PID 1's signals.
+    let mut script = entrypoints.join(" && ");
+    let dropped = match drop_to {
+        Some(user) if !user_script.is_empty() => {
+            format!("exec su {} -s /bin/sh -c {}", shell_quote(user), shell_quote(&user_script))
+        }
+        _ => user_script,
+    };
+    if !dropped.is_empty() {
+        if script.is_empty() {
+            script = dropped;
+        } else {
+            script.push_str(&format!(" && {dropped}"));
+        }
+    }
     vec!["sh".to_string(), "-c".to_string(), script]
 }
 
@@ -2079,13 +2111,13 @@ mod tests {
         entrypoints: &[String],
         agent_cmd: &[String],
     ) -> Vec<String> {
-        compose_entrypoint_command(entrypoints, agent_cmd, UserEnvProbe::None, &[])
+        compose_entrypoint_command(entrypoints, &[], agent_cmd, UserEnvProbe::None, &[], None)
     }
 
     #[test]
     fn no_entrypoints_leaves_the_agent_command_alone() {
         let agent = vec!["claude".to_string()];
-        assert_eq!(compose_entrypoint_command(&[], &agent, UserEnvProbe::None, &[]), agent);
+        assert_eq!(compose_entrypoint_command(&[], &[], &agent, UserEnvProbe::None, &[], None), agent);
     }
 
     #[test]
@@ -2112,12 +2144,110 @@ mod tests {
     }
 
     #[test]
+    fn entrypoints_run_as_the_container_user_and_the_agent_is_dropped_to_the_remote_one() {
+        // Verified against the reference CLI: it starts the container as root, runs Feature
+        // entrypoints there, and runs postCreateCommand and tools as remoteUser. A
+        // docker-in-docker entrypoint starting dockerd, or sshd binding a privileged port,
+        // cannot work any other way.
+        let cmd = compose_entrypoint_command(
+            &["/usr/local/share/docker-init.sh".to_string()],
+            &["echo hook".to_string()],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            Some("vscode"),
+        );
+        let script = &cmd[2];
+        // The entrypoint comes first, unwrapped — it is the container user's.
+        assert!(script.starts_with("/usr/local/share/docker-init.sh && "), "got: {script}");
+        // Everything else is inside the drop.
+        assert!(script.contains("exec su vscode -s /bin/sh -c "), "got: {script}");
+        let dropped = script.split("-c ").nth(1).unwrap();
+        assert!(dropped.contains("echo hook"), "hooks belong to the remote user: {script}");
+        assert!(dropped.contains("exec claude"), "got: {script}");
+    }
+
+    #[test]
+    fn without_an_entrypoint_nothing_is_dropped() {
+        // Nothing needs elevation, so the container runs as the remote user directly and the
+        // common path keeps exactly the shape it had.
+        let cmd = compose_entrypoint_command(
+            &[],
+            &["echo hook".to_string()],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            None,
+        );
+        assert_eq!(cmd[2], "echo hook && exec claude");
+    }
+
+    #[test]
+    fn a_failed_entrypoint_stops_the_session_before_the_drop() {
+        let cmd = compose_entrypoint_command(
+            &["/init.sh".to_string()],
+            &[],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            Some("vscode"),
+        );
+        assert!(cmd[2].starts_with("/init.sh && exec su "), "got: {}", cmd[2]);
+    }
+
+    #[test]
+    fn the_dropped_script_is_quoted_as_one_argument() {
+        // The inner script carries quotes of its own — a hook with an argument, the probe's
+        // `case` statement — and must survive being handed to `su -c`.
+        let cmd = compose_entrypoint_command(
+            &["/init.sh".to_string()],
+            &["echo 'it works'".to_string()],
+            &["claude".to_string()],
+            UserEnvProbe::None,
+            &[],
+            Some("vscode"),
+        );
+        // Single-quoted with the inner quotes escaped the POSIX way: '\'' closes, escapes, reopens.
+        let expected = concat!(r"'echo '", r"\", r"'", r"'it works'", r"\", r"'", r"' && exec claude'");
+        assert!(cmd[2].contains(expected), "got: {}", cmd[2]);
+    }
+
+    #[test]
+    fn dropping_privileges_and_the_uid_mapping_do_not_contradict_each_other() {
+        // Both fixes touch `--user`. The container must start as the container user to run an
+        // entrypoint, so the numeric mapping cannot also apply — asserting it here so a future
+        // change to either cannot silently produce two conflicting `--user` flags.
+        let tmp = TempDir::new().unwrap();
+        let dc = DevcontainerRuntime {
+            user: None,
+            drop_to: Some("vscode".to_string()),
+            update_remote_user_uid: true,
+            entrypoints: vec!["/init.sh".to_string()],
+            ..DevcontainerRuntime::default()
+        };
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &make_mounts(tmp.path()),
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        let joined = cmd.join(" ");
+        assert!(!joined.contains("--user"), "must start as the image's own user: {joined}");
+    }
+
+    #[test]
     fn a_probe_runs_before_the_agent_and_does_not_gate_it() {
         let cmd = compose_entrypoint_command(
+            &[],
             &[],
             &["claude".to_string()],
             UserEnvProbe::LoginInteractiveShell,
             &[],
+            None,
         );
         let script = &cmd[2];
         assert!(script.contains("-lic 'cat /proc/self/environ'"), "got: {script}");
@@ -2130,25 +2260,27 @@ mod tests {
     #[test]
     fn a_failing_entrypoint_still_gates_the_agent_when_probing() {
         let cmd = compose_entrypoint_command(
-            &["/init.sh".to_string()],
+            &[],
+            &["/hook.sh".to_string()],
             &["claude".to_string()],
             UserEnvProbe::LoginShell,
             &[],
+            None,
         );
-        assert!(cmd[2].contains("/init.sh && exec claude"), "got: {}", cmd[2]);
+        assert!(cmd[2].contains("/hook.sh && exec claude"), "got: {}", cmd[2]);
     }
 
     #[test]
     fn each_probe_mode_maps_to_the_shell_flags_the_cli_uses() {
         let flags = |p: UserEnvProbe| {
-            compose_entrypoint_command(&[], &["a".to_string()], p, &[]).join(" ")
+            compose_entrypoint_command(&[], &[], &["a".to_string()], p, &[], None).join(" ")
         };
         assert!(flags(UserEnvProbe::LoginInteractiveShell).contains(" -lic "));
         assert!(flags(UserEnvProbe::LoginShell).contains(" -lc "));
         assert!(flags(UserEnvProbe::InteractiveShell).contains(" -ic "));
         // `none` must leave the command completely alone — no shell wrapper at all.
         assert_eq!(
-            compose_entrypoint_command(&[], &["a".to_string()], UserEnvProbe::None, &[]),
+            compose_entrypoint_command(&[], &[], &["a".to_string()], UserEnvProbe::None, &[], None),
             vec!["a".to_string()]
         );
     }
@@ -2159,9 +2291,11 @@ mod tests {
     fn the_probe_script_applies_what_it_finds_and_respects_protected_names() {
         let cmd = compose_entrypoint_command(
             &[],
+            &[],
             &["env".to_string()],
             UserEnvProbe::LoginShell,
             &["AM_KEEP".to_string()],
+            None,
         );
         // Stand in for the container's login shell: it "sources a dotfile" that sets one new
         // variable and tries to clobber one am set on purpose.

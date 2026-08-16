@@ -593,6 +593,15 @@ Found by a spec review on 2026-08-16 and fixed:
       path, which previously skipped the host UID mapping whenever a user was named — leaving
       any host user that is not uid 1000 unable to write their own worktree.
 
+- [x] **Feature entrypoints run as the container user.** They ran as `remoteUser`, so a
+      `docker-in-docker` entrypoint starting `dockerd` failed — and since entrypoints are
+      `&&`-chained ahead of the agent, it took the session with it. The container now starts as
+      the container user and drops to `remoteUser` with `su` for the hooks and the agent, which
+      is what the reference CLI does. With no entrypoint nothing is dropped.
+- [ ] **A dropped session's agent runs with the image's UID, not the host's.** The container
+      must start as the container user to run an entrypoint, so the numeric UID mapping cannot
+      also apply. The reference CLI rewrites the image to reconcile the two; `am` does not.
+
 Follow-ups the native builder left behind:
 
 - [x] **`dependsOn`.** Done 2026-08-15. Hard dependencies resolve recursively — a worklist

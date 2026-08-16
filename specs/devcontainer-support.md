@@ -882,6 +882,35 @@ could not write its own worktree.
 a smaller hammer with one consequence worth stating: a bare numeric uid has no passwd entry, so
 `HOME` is set explicitly to the path the credential mounts already use.
 
+## Who runs what
+
+Measured against the reference CLI rather than reasoned from the prose, because the prose
+distinguishes `containerUser` from `remoteUser` without saying which applies to a Feature
+entrypoint:
+
+| | runs as |
+|---|---|
+| the container itself | `containerUser` — **root** unless the config says otherwise |
+| a Feature entrypoint | the container user |
+| `postCreateCommand` and the other hooks | `remoteUser` |
+| the agent | `remoteUser` |
+
+`am` used to run all of it as `remoteUser`, so a `docker-in-docker` entrypoint starting `dockerd`
+or an `sshd` one binding a privileged port failed — and because entrypoints are `&&`-chained
+ahead of the agent, the failure took the whole session with it rather than degrading.
+
+The container now starts as the container user when a Feature contributes an entrypoint, and
+drops to `remoteUser` with `su` for the hooks and the agent. `exec` on the drop keeps the pane's
+tty and leaves the agent as PID 1's direct child, so signals and exit codes still propagate.
+**With no entrypoint nothing is dropped** — there is nothing needing elevation, the container runs
+as the remote user exactly as before, and the common path is unchanged.
+
+One consequence worth stating, because it collides with `updateRemoteUserUID` above: the
+container has to *start* as the container user to run an entrypoint, so the numeric UID mapping
+cannot also apply. When privileges are dropped the agent runs as the image's remote user, whose
+UID may differ from the host's. The reference CLI reconciles this by rewriting the image so that
+user's UID matches; `am` does not. A test asserts the two cannot both emit a `--user` flag.
+
 ## Known gaps
 
 - **`dependsOn` has no differential test.** The recursive walk is exercised offline through
@@ -905,6 +934,11 @@ a smaller hammer with one consequence worth stating: a bare numeric uid has no p
 - **`portsAttributes` and `otherPortsAttributes` are carried but not acted on.** They exist to
   tell an editor how to treat a forwarded port — a label, whether to open a browser — and `am`
   has no equivalent. They now reach the label, which is what a downstream reader needs.
+- **With a Feature entrypoint present, the agent's UID is the image's, not the host's.** The
+  container must start as the container user to run the entrypoint, so the numeric mapping is
+  skipped. A host user whose UID differs from the image's remote user may find bind-mounted
+  files unwritable in that configuration. Closing it means rewriting the image the way the
+  reference CLI does.
 - **A repo with no lockfile still cannot detect a moved tag.** Hashing the lockfile is what
   makes registry Features participate; without one there is nothing to hash, and `--rebuild`
   remains the answer. `am` writes the file on its first build, so this self-corrects.
