@@ -649,12 +649,16 @@ Follow-ups the native builder left behind:
       ordering, staging and the label are the same code. Identity follows the spec per
       source: layer digest for a registry Feature, the resolved path for a local one (the
       spec says every local Feature is distinct), and a hash of the bytes for a tarball.
-- [ ] **Compose sessions are only tested against a mock runtime.** The build half has a
-      differential test against the reference CLI, and the generated override is validated
-      against real `docker compose config`, but no test brings a real project up and execs an
-      agent into it — that needs a runtime, a tmux session and a live agent at once. The last
-      of the four coverage gaps still open; the other three were closed by
-      `scripts/test-registry.sh` and the tarball fixture on 2026-08-16.
+- [x] **Compose sessions are only tested against a mock runtime.** Done 2026-08-16 with
+      `scripts/test-live-session.sh`, which runs one session for real: a scratch repo, a tmux
+      server, `am start` bringing a two-service project up, and `am destroy` taking it down. It
+      asserts `postCreateCommand` ran in the **named** service and *not* in the other one, which
+      is the thing a mock runtime cannot tell you. It found one bug on its first run: `main`
+      printed only an error's outermost context, so a failed compose up reported "starting the
+      compose project" and dropped the runtime's own message. Two things it still does not
+      cover: a real agent (there is none in a debian-slim service, so the session sets
+      `shutdownAction: "none"` and lets it exit), and the live-attach path, which needs an agent
+      process to still be running.
 - [x] **podman compose.** Done 2026-08-16, and it was broken rather than merely untested:
       podman only grew the `compose` subcommand in 4.7, so on the podman Debian 12 and Ubuntu
       22.04 ship, every compose session failed with `unknown shorthand flag: 'f'`. `am` now
