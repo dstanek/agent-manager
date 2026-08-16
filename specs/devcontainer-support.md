@@ -166,9 +166,9 @@ for the properties the label **does not** carry:
 | --- | --- |
 | `runArgs` | Raw runtime flags; gated by the trust prompt |
 | `workspaceFolder` | `--workdir`; defaults to the mirrored host path |
-| `workspaceMount` | Detect a custom mount that conflicts with host-path mirroring |
+| `workspaceMount` | Added as a mount *alongside* host-path mirroring, so both paths resolve |
 | `initializeCommand` | Only to detect and refuse it — `am` never runs it |
-| `dockerComposeFile` | Detect and reject (phases 1–2) |
+| `dockerComposeFile` | Drives the compose run model |
 | `name` | Display in `am list` |
 
 Everything else comes from the label. Note the asymmetry this creates: the label is the
@@ -860,6 +860,27 @@ Two ordering details: `workspaceFolder` is substituted *before* it becomes the v
 `${containerWorkspaceFolder}` expands to, since substitution does not re-scan its own output and
 `/workspaces/${localWorkspaceFolderBasename}` is the common spelling; and Feature entrypoints are
 substituted, which the spec requires for `${devcontainerId}`.
+
+## The run path: workspaceMount and the container's UID
+
+**`workspaceMount` is honoured by *adding* a mount, not by replacing the mirroring.** It was
+parsed, substituted, and then never read, so a config pairing it with `workspaceFolder` pointed
+`--workdir` at a path nothing was mounted at — the agent started in an empty, root-owned
+directory. The reference CLI mounts the workspace only at that target; `am` mounts it there *and*
+at its host path, because the mirroring is what makes a git worktree's absolute `gitdir:` pointer
+and a jj workspace's relative repo path resolve. Both paths are the same bind, so this is a
+superset rather than a compromise. An explicit `mounts` entry on the same target wins, since two
+mounts on one target is a runtime error.
+
+**`updateRemoteUserUID` is applied on the Docker path.** Podman's `--userns=keep-id:uid=,gid=`
+already did the right thing. Docker skipped the numeric mapping whenever the config named a
+user, on the reasoning that a devcontainer user is uid 1000 and therefore the same mapping by
+another name — true only for a host user who is also 1000. Everyone else got a container that
+could not write its own worktree.
+
+`am` maps the *process* rather than rewriting the image's passwd entry as the CLI does, which is
+a smaller hammer with one consequence worth stating: a bare numeric uid has no passwd entry, so
+`HOME` is set explicitly to the path the credential mounts already use.
 
 ## Known gaps
 

@@ -215,6 +215,8 @@ pub struct MetadataSnippet {
     pub remote_user: Option<String>,
     pub user_env_probe: Option<String>,
     pub override_command: Option<bool>,
+    #[serde(default)]
+    pub update_remote_user_uid: Option<bool>,
     pub wait_for: Option<String>,
     pub on_create_command: Option<LifecycleCommand>,
     pub update_content_command: Option<LifecycleCommand>,
@@ -635,6 +637,9 @@ pub struct ResolvedConfig {
     pub remote_user: Option<String>,
     pub user_env_probe: Option<String>,
     pub override_command: Option<bool>,
+    /// Whether the container user's UID/GID should follow the host's. Defaults to true on
+    /// Linux per the spec, which is what makes a bind-mounted worktree writable.
+    pub update_remote_user_uid: Option<bool>,
     pub wait_for: Option<String>,
     pub on_create: Vec<Command>,
     pub update_content: Vec<Command>,
@@ -701,6 +706,9 @@ pub fn merge(snippets: &[MetadataSnippet]) -> Result<ResolvedConfig> {
         }
         if snippet.override_command.is_some() {
             out.override_command = snippet.override_command;
+        }
+        if snippet.update_remote_user_uid.is_some() {
+            out.update_remote_user_uid = snippet.update_remote_user_uid;
         }
         if snippet.wait_for.is_some() {
             out.wait_for = snippet.wait_for.clone();
@@ -1182,9 +1190,32 @@ pub fn apply_trust(
         }
     }
 
+    // `workspaceMount` was parsed, substituted, and then never used — so a config pairing it
+    // with `workspaceFolder` got `--workdir` pointing at a path nothing was mounted at, and the
+    // agent started in an empty root-owned directory.
+    //
+    // It is added *alongside* am's host-path mirroring rather than replacing it. The mirroring
+    // is what makes a git worktree's absolute `gitdir:` pointer and a jj workspace's relative
+    // repo path resolve; dropping it to honour the config would trade one broken thing for
+    // another. Both paths are the same bind, so an edit through either is the same file.
+    let mut mounts = resolved.mounts.clone();
+    if let Some(spec) = &resolved.workspace_mount {
+        match (Mount::Str(spec.clone())).normalize() {
+            Ok(normalized) => {
+                if !mounts.iter().any(|m| m.target == normalized.target) {
+                    mounts.push(normalized);
+                }
+            }
+            Err(e) => eprintln!(
+                "{} ignoring workspaceMount: {e}",
+                color::warning_prefix(color::enabled(color::Stream::Stderr))
+            ),
+        }
+    }
+
     let mut runtime = crate::container::DevcontainerRuntime {
         env,
-        mounts: resolved.mounts.clone(),
+        mounts,
         init: resolved.init,
         privileged: false,
         cap_add: Vec::new(),
@@ -1192,6 +1223,9 @@ pub fn apply_trust(
         run_args: Vec::new(),
         workdir: resolved.workspace_folder.clone(),
         entrypoints: resolved.entrypoints.clone(),
+        // Defaults to true per the spec: on Linux the container user's UID/GID follow the
+        // host's, which is what keeps a bind-mounted worktree writable.
+        update_remote_user_uid: resolved.update_remote_user_uid.unwrap_or(true),
         // The spec's default when the key is absent is loginInteractiveShell, so a devcontainer
         // that says nothing still gets the environment its dotfiles set up — which is the whole
         // reason the property exists.
@@ -1729,6 +1763,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merge(&obj).unwrap().mounts, merge(&string).unwrap().mounts);
+    }
+
+    #[test]
+    fn workspace_mount_becomes_a_real_mount() {
+        // Parsed, substituted, then dropped — so `workspaceFolder` pointed `--workdir` at a
+        // path nothing was mounted at and the agent started in an empty directory.
+        let resolved = ResolvedConfig {
+            workspace_mount: Some(
+                "source=/host/repo,target=/workspaces/app,type=bind".to_string(),
+            ),
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false));
+        let found = runtime
+            .mounts
+            .iter()
+            .find(|m| m.target == "/workspaces/app")
+            .expect("workspaceMount must reach the run path");
+        assert_eq!(found.source.as_deref(), Some("/host/repo"));
+        assert_eq!(found.kind, "bind");
+    }
+
+    #[test]
+    fn workspace_mount_does_not_displace_an_explicit_mount_on_the_same_target() {
+        let resolved = ResolvedConfig {
+            mounts: vec![Mount::Str(
+                "source=/other,target=/workspaces/app,type=bind".to_string(),
+            )
+            .normalize()
+            .unwrap()],
+            workspace_mount: Some(
+                "source=/host/repo,target=/workspaces/app,type=bind".to_string(),
+            ),
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false));
+        let same: Vec<_> =
+            runtime.mounts.iter().filter(|m| m.target == "/workspaces/app").collect();
+        assert_eq!(same.len(), 1, "two mounts on one target is a runtime error");
+        assert_eq!(same[0].source.as_deref(), Some("/other"));
+    }
+
+    #[test]
+    fn a_malformed_workspace_mount_is_a_warning_not_a_failure() {
+        let resolved = ResolvedConfig {
+            workspace_mount: Some("this is not a mount".to_string()),
+            ..Default::default()
+        };
+        // The session is still usable via host-path mirroring, so this must not be fatal.
+        let runtime = apply_trust(&resolved, &cfg_with(false));
+        assert!(runtime.mounts.is_empty());
+    }
+
+    #[test]
+    fn update_remote_user_uid_defaults_to_true() {
+        let runtime = apply_trust(&ResolvedConfig::default(), &cfg_with(false));
+        assert!(runtime.update_remote_user_uid, "the spec's default on Linux");
+
+        let off = ResolvedConfig { update_remote_user_uid: Some(false), ..Default::default() };
+        assert!(!apply_trust(&off, &cfg_with(false)).update_remote_user_uid);
     }
 
     #[test]
