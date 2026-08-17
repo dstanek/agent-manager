@@ -1,0 +1,89 @@
+name: Integration
+
+# The tests that need infrastructure the ordinary suite deliberately does without: the reference
+# implementation, a real registry, a real Compose provider, the network. They are selected by
+# cargo feature rather than `--ignored` — see CLAUDE.md — so this job is mostly about standing
+# the infrastructure up and then asking for the right features.
+#
+# Separate from ci.yml on purpose. ci.yml runs on any change under src/, finishes in a couple of
+# minutes, and should stay that way; this one builds real images against real registries and is
+# only worth running when the code it covers changes.
+#
+# This job is what keeps the integration tier honest. Tests that exist but never run are worse
+# than no tests, because the coverage looks real: the differential suite caught nothing for weeks
+# for exactly that reason. For that to hold, this job has to be **required** on PRs touching
+# these paths — a branch-protection setting, not something this file can assert.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/devcontainer/**'
+      - 'src/compose.rs'
+      # The feature flags that select these tests live here.
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/test-registry.sh'
+      - 'tests/fixtures/registry/**'
+      - 'tests/fixtures/tarball/**'
+      - '.github/workflows/integration.yml'
+  # So a maintainer can run the tier against main without opening a pull request.
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    # The differential tests build real images: about four minutes for the current set on a warm
+    # runner, and every one of them is a cold cache here. The cap is generous rather than tight
+    # so a slow registry does not read as a broken change.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install the reference Dev Containers CLI
+        run: |
+          # Pinned: these tests assert that am agrees with a specific implementation, so an
+          # unpinned CLI turns an upstream release into a failure on a pull request that changed
+          # nothing related. Note that the dev container does *not* pin it — it is installed
+          # there by hand — so a local run and this job can disagree until that is fixed.
+          # renovate: datasource=npm depName=@devcontainers/cli
+          DEVCONTAINER_VERSION=0.88.0
+          npm install -g "@devcontainers/cli@${DEVCONTAINER_VERSION}"
+          devcontainer --version
+
+      # Docker Hub's anonymous pull limit is per runner IP and shared with every other job on
+      # that IP, so `registry:2`, `httpd:2` and `debian:bookworm-slim` are the likeliest source
+      # of an intermittent failure here that has nothing to do with the change under test. If it
+      # starts biting, authenticate to Hub with docker/login-action or mirror those three; the
+      # ghcr.io and mcr.microsoft.com pulls this job also makes are not limited that way.
+      - name: Start the local registries
+        # Publishes the purpose-built Features — one declaring dependsOn, one behind htpasswd —
+        # that no public registry offers. Also does a real `docker login`, which is the point of
+        # the private half: the test proves am finds the credential the runtime wrote.
+        run: ./scripts/test-registry.sh up
+
+      - name: Integration tests
+        env:
+          # The runtime's layer cache can finish a "passing" differential run in seconds without
+          # building anything, which is a green tick for work that never happened.
+          AM_TEST_NO_CACHE: '1'
+          # The tarball fixture is served from the repository over GitHub's own HTTPS. Point it
+          # at *this* pull request's head rather than main, or a PR that changes the fixture
+          # tests the version already merged. Works for forks too, since raw serves public ones.
+          AM_TARBALL_FIXTURE_URL: >-
+            https://raw.githubusercontent.com/${{ github.event.pull_request.head.repo.full_name
+            || github.repository }}/${{ github.event.pull_request.head.sha || github.sha
+            }}/tests/fixtures/tarball/tarball-only.tgz
+        run: cargo test --features integration
+
+      - name: Stop the local registries
+        if: always()
+        run: ./scripts/test-registry.sh down
