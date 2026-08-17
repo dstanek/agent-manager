@@ -994,6 +994,113 @@ async fn given_outside_mount_config(world: &mut AmWorld) {
     .expect("write label file");
 }
 
+/// Write a config and a matching metadata label in one go.
+///
+/// `privileged`, `capAdd` and `securityOpt` are all label-carried properties, so — exactly like
+/// `mounts` — they reach the run path through the image's metadata rather than a re-read of the
+/// config. The mock builder never computes a label, so both halves are written here.
+fn write_config_and_label(world: &mut AmWorld, config_body: &str, label_body: &str) {
+    world.write_devcontainer_config(&format!(
+        r#"{{"name":"test","image":"debian:bookworm",{config_body}}}"#
+    ));
+    let label = world
+        .mock_label_file
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    fs::write(label, format!(r#"[{{"remoteUser":"vscode",{label_body}}}]"#))
+        .expect("write label file");
+}
+
+#[given("the repo has a devcontainer config asking for privileged")]
+async fn given_privileged_config(world: &mut AmWorld) {
+    write_config_and_label(world, r#""privileged":true"#, r#""privileged":true"#);
+}
+
+#[given("the repo has a devcontainer config asking for capAdd")]
+async fn given_cap_add_config(world: &mut AmWorld) {
+    write_config_and_label(
+        world,
+        r#""capAdd":["SYS_PTRACE"]"#,
+        r#""capAdd":["SYS_PTRACE"]"#,
+    );
+}
+
+#[given("the repo has a devcontainer config asking for securityOpt")]
+async fn given_security_opt_config(world: &mut AmWorld) {
+    write_config_and_label(
+        world,
+        r#""securityOpt":["seccomp=unconfined"]"#,
+        r#""securityOpt":["seccomp=unconfined"]"#,
+    );
+}
+
+/// A `workspaceMount` naming the session worktree itself — the legitimate use, which must keep
+/// working with no consent flag at all, or the property is unusable for what it is for.
+#[given("the repo has a devcontainer config with a workspaceMount of the worktree")]
+async fn given_internal_workspace_mount_config(world: &mut AmWorld) {
+    let worktree = world.project_path().join(".am/worktrees/my-feature");
+    let spec = format!(
+        "source={},target=/workspaces/app,type=bind",
+        worktree.display()
+    );
+    write_config_and_label(
+        world,
+        &format!(r#""workspaceMount":"{spec}","workspaceFolder":"/workspaces/app""#),
+        // workspaceMount is a devcontainer.json-only property — the label does not carry it —
+        // so the label here just supplies the remote user the run path expects.
+        r#""init":false"#,
+    );
+}
+
+/// The same property pointed somewhere else entirely, which is the loophole worth testing:
+/// `workspaceMount` must not be a way around the policy the other mounts go through.
+#[given("the repo has a devcontainer config with a workspaceMount outside the worktree")]
+async fn given_external_workspace_mount_config(world: &mut AmWorld) {
+    let outside = world
+        .project_path()
+        .parent()
+        .expect("project dir has a parent")
+        .join("outside-workspace");
+    fs::create_dir_all(&outside).expect("create the outside-the-worktree directory");
+    let spec = format!("source={},target=/workspaces/app,type=bind", outside.display());
+    write_config_and_label(
+        world,
+        &format!(r#""workspaceMount":"{spec}","workspaceFolder":"/workspaces/app""#),
+        r#""init":false"#,
+    );
+}
+
+/// `initializeCommand` in its array form: argv, run without a shell.
+///
+/// The sentinel name contains a character a shell would treat specially, so a regression that
+/// routes argv through `sh -c` writes a differently-named file and the assertion fails.
+#[given("the repo has a devcontainer config with an argv initializeCommand")]
+async fn given_argv_initialize_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm",
+            "initializeCommand":["touch","argv;ran"]}"#,
+    );
+}
+
+/// The object form: named members, run concurrently, the group failing if any member fails.
+#[given("the repo has a devcontainer config with a named initializeCommand")]
+async fn given_named_initialize_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm",
+            "initializeCommand":{"one":"touch member-one","two":"touch member-two"}}"#,
+    );
+}
+
+/// One member fails, the other succeeds — the group must fail, and the failure must name the
+/// member so the user knows which half of a parallel group went wrong.
+#[given("the repo has a devcontainer config with a failing named initializeCommand")]
+async fn given_failing_named_initialize_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm",
+            "initializeCommand":{"good":"touch good-member","bad":"exit 3"}}"#,
+    );
+}
+
 #[when(expr = "I run {string}")]
 async fn when_run(world: &mut AmWorld, cmd: String) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
