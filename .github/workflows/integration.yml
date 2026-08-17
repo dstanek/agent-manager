@@ -50,10 +50,11 @@ jobs:
 
       - name: Install the reference Dev Containers CLI
         run: |
-          # Pinned: these tests assert that am agrees with a specific implementation, so an
-          # unpinned CLI turns an upstream release into a failure on a pull request that changed
-          # nothing related. Note that the dev container does *not* pin it — it is installed
-          # there by hand — so a local run and this job can disagree until that is fixed.
+          # Pinned, and kept in step with .devcontainer/Dockerfile: these tests assert that am
+          # agrees with a specific implementation, so an unpinned CLI turns an upstream release
+          # into a failure on a pull request that changed nothing related — and a local run that
+          # disagrees with this job is worse than either. Both carry a renovate comment, so they
+          # are bumped together.
           # renovate: datasource=npm depName=@devcontainers/cli
           DEVCONTAINER_VERSION=0.88.0
           npm install -g "@devcontainers/cli@${DEVCONTAINER_VERSION}"

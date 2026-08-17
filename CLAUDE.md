@@ -36,9 +36,12 @@ make build-copilot       # Build Copilot Docker image
   proves it. What must stay in a tier rather than move to a fixture: anything whose value is
   agreement with the real reference implementation. `.github/workflows/integration.yml` runs
   the whole tier on pull requests touching `src/devcontainer/**`, `src/compose.rs`, the
-  fixtures or the harness — it pins `@devcontainers/cli`, which the dev container does not,
-  so a local differential run can disagree with CI until the same pin lands in
-  `.devcontainer/Dockerfile`.
+  fixtures or the harness. It and `.devcontainer/Dockerfile` pin the same
+  `@devcontainers/cli` version, each with a renovate comment so they bump together — a local
+  differential run and CI comparing against different reference implementations would make
+  both results meaningless. The dev container installs it from the published tarball rather
+  than with `npm install -g`, because node arrives via a Feature that runs *after* the
+  image is built; the package is self-contained, so only `node` itself resolves at run time.
 - Most registry behaviour needs no infrastructure at all: `src/devcontainer/native/test_registry.rs`
   serves Features over HTTP from inside the test process, including a bearer challenge, Basic auth,
   and content that deliberately does not match its digest. It also records request paths, which is
