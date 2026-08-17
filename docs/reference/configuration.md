@@ -272,7 +272,7 @@ reference CLI rejects too, and it is reported as the error it is.
 |---|---|---|---|---|
 | `path` | path | `""` | Explicit `devcontainer.json`, relative to the session worktree; unset means discover | Any path inside the worktree |
 | `agent_install` | string | `"auto"` | How the agent gets into the image | `"feature"`, `"bootstrap"`, `"none"`, `"auto"` |
-| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, and `runArgs` are honoured | `true`, `false` |
+| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, `securityOpt`, and `runArgs` are honoured | `true`, `false` |
 | `skip_lifecycle` | boolean | `false` | Skip `postCreateCommand` and the other in-container hooks | `true`, `false` |
 | `home` | path | `""` | Override the container home derived from `remoteUser` | Any absolute path |
 | `extra_features` | table | `{}` | Extra Features to inject at build time, as `id = options-JSON` | e.g. `"ghcr.io/devcontainers/features/node:1" = "{}"` |
@@ -303,8 +303,8 @@ image, and an unchanged config skips the build entirely.
     Of the six lifecycle hooks, `initializeCommand` is the only one that runs outside the
     container — on your machine, with your privileges — and `devcontainer.json` is
     repo-controlled code that arrives with a `git pull`. `am` refuses to run it unless
-    `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, and `runArgs`;
-    without it those are dropped with a note rather than failing the session.
+    `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, `securityOpt`, and
+    `runArgs`; without it those are dropped with a note rather than failing the session.
 
 **Lifecycle hooks.** `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, and
 `postStartCommand` run inside the container before the agent starts. Because `am` runs

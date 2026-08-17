@@ -1435,7 +1435,7 @@ pub fn apply_trust(
         init: resolved.init,
         privileged: false,
         cap_add: Vec::new(),
-        security_opt: resolved.security_opt.clone(),
+        security_opt: Vec::new(),
         run_args: Vec::new(),
         workdir: resolved.workspace_folder.clone(),
         entrypoints: resolved.entrypoints.clone(),
@@ -1495,6 +1495,7 @@ pub fn apply_trust(
     if allow {
         runtime.privileged = resolved.privileged;
         runtime.cap_add = resolved.cap_add.clone();
+        runtime.security_opt = resolved.security_opt.clone();
         runtime.run_args = resolved.run_args.clone();
     } else {
         let note = color::note_prefix(color::enabled(color::Stream::Stderr));
@@ -1508,6 +1509,12 @@ pub fn apply_trust(
             eprintln!(
                 "{note} not granting capabilities requested by this devcontainer: {}",
                 resolved.cap_add.join(", ")
+            );
+        }
+        if !resolved.security_opt.is_empty() {
+            eprintln!(
+                "{note} not granting security options requested by this devcontainer: {}",
+                resolved.security_opt.join(", ")
             );
         }
         if !resolved.run_args.is_empty() {
@@ -2674,6 +2681,7 @@ mod tests {
         let runtime = apply_trust(&escalating(), &cfg_with(false));
         assert!(!runtime.privileged);
         assert!(runtime.cap_add.is_empty());
+        assert!(runtime.security_opt.is_empty());
         assert!(runtime.run_args.is_empty());
     }
 
@@ -2682,16 +2690,16 @@ mod tests {
         let runtime = apply_trust(&escalating(), &cfg_with(true));
         assert!(runtime.privileged);
         assert_eq!(runtime.cap_add, vec!["SYS_ADMIN".to_string()]);
+        assert_eq!(runtime.security_opt, vec!["label=disable".to_string()]);
         assert_eq!(runtime.run_args, vec!["--network=host".to_string()]);
     }
 
     #[test]
     fn trust_gate_keeps_non_escalating_settings_either_way() {
-        // init and securityOpt come from ordinary Features (sshd, docker-outside-of-docker)
-        // and do not hand the container new authority over the host.
+        // init comes from ordinary Features (sshd, docker-outside-of-docker) and does not
+        // hand the container new authority over the host.
         let runtime = apply_trust(&escalating(), &cfg_with(false));
         assert!(runtime.init);
-        assert_eq!(runtime.security_opt, vec!["label=disable".to_string()]);
     }
 
     #[test]

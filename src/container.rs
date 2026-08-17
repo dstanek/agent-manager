@@ -2125,6 +2125,7 @@ mod tests {
         let joined = dc_run(&DevcontainerRuntime::default(), tmp.path());
         assert!(!joined.contains("--privileged"));
         assert!(!joined.contains("--cap-add"));
+        assert!(!joined.contains("--security-opt"));
         assert!(!joined.contains("--init"));
     }
 
