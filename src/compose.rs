@@ -970,6 +970,94 @@ mod tests {
     }
 
     #[test]
+    fn override_document_drops_an_untrusted_devcontainer_bind_mount() {
+        // Exercises the same trust policy (`devcontainer::apply_trust`) as
+        // `container::build_run_command`'s equivalent test — the run-command and Compose
+        // paths must agree on what a devcontainer is allowed to bind-mount.
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mounts = ContainerMounts {
+            worktree_host: worktree.clone(),
+            vcs_host: worktree.join(".git"),
+            colocated_git_host: None,
+            gitconfig_host: tmp.path().join("gitconfig"),
+            ssh_host: tmp.path().join("ssh"),
+            ssh_agent_sock: None,
+            agent_auth: Vec::new(),
+            container_home: "/home/vscode".to_string(),
+        };
+
+        let resolved = crate::devcontainer::ResolvedConfig {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some(outside.to_string_lossy().into_owned()),
+                target: "/host-secret".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        // Default config: allow_host_commands is false.
+        let dc = crate::devcontainer::apply_trust(
+            &resolved,
+            &crate::config::Config::default(),
+            &worktree,
+        );
+
+        let doc = override_document(&runtime(), "app", "img", &mounts, &[], &[], &dc);
+        let volumes = doc["services"]["app"]["volumes"].as_array().unwrap();
+        assert!(
+            !volumes.iter().any(|v| v.as_str().unwrap().contains("/host-secret")),
+            "untrusted bind mount must not reach the compose override: {volumes:?}"
+        );
+    }
+
+    #[test]
+    fn override_document_keeps_a_worktree_internal_devcontainer_bind_mount() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let sub = worktree.join("data");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mounts = ContainerMounts {
+            worktree_host: worktree.clone(),
+            vcs_host: worktree.join(".git"),
+            colocated_git_host: None,
+            gitconfig_host: tmp.path().join("gitconfig"),
+            ssh_host: tmp.path().join("ssh"),
+            ssh_agent_sock: None,
+            agent_auth: Vec::new(),
+            container_home: "/home/vscode".to_string(),
+        };
+
+        let resolved = crate::devcontainer::ResolvedConfig {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some(sub.to_string_lossy().into_owned()),
+                target: "/data".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        let dc = crate::devcontainer::apply_trust(
+            &resolved,
+            &crate::config::Config::default(),
+            &worktree,
+        );
+
+        let doc = override_document(&runtime(), "app", "img", &mounts, &[], &[], &dc);
+        let volumes = doc["services"]["app"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes.iter().any(|v| v.as_str().unwrap().starts_with(&format!(
+                "{}:/data",
+                sub.to_string_lossy()
+            ))),
+            "worktree-internal bind mount should reach the compose override: {volumes:?}"
+        );
+    }
+
+    #[test]
     fn exec_runs_the_agent_in_the_named_service() {
         let mut args =
             compose_args(&subcommand_provider(), &all_files(&compose()), "am-feat");

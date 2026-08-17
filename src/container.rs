@@ -1924,6 +1924,91 @@ mod tests {
     }
 
     #[test]
+    fn build_run_command_drops_an_untrusted_devcontainer_bind_mount() {
+        // Exercises the same trust policy (`devcontainer::apply_trust`) that
+        // `compose::override_document` is exercised against below — the run-command and
+        // Compose paths must agree on what a devcontainer is allowed to bind-mount.
+        let tmp = TempDir::new().unwrap();
+        let mounts = make_mounts(tmp.path());
+        let worktree = mounts.worktree_host.clone();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let resolved = crate::devcontainer::ResolvedConfig {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some(outside.to_string_lossy().into_owned()),
+                target: "/host-secret".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        // Default config: allow_host_commands is false.
+        let dc = crate::devcontainer::apply_trust(
+            &resolved,
+            &crate::config::Config::default(),
+            &worktree,
+        );
+
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        let joined = cmd.join(" ");
+        assert!(
+            !joined.contains("/host-secret") && !joined.contains(&outside.to_string_lossy().into_owned()),
+            "untrusted bind mount must not reach the run command: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_run_command_keeps_a_worktree_internal_devcontainer_bind_mount() {
+        let tmp = TempDir::new().unwrap();
+        let mounts = make_mounts(tmp.path());
+        let worktree = mounts.worktree_host.clone();
+        let sub = worktree.join("data");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let resolved = crate::devcontainer::ResolvedConfig {
+            mounts: vec![crate::devcontainer::NormalizedMount {
+                source: Some(sub.to_string_lossy().into_owned()),
+                target: "/data".to_string(),
+                kind: "bind".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        let dc = crate::devcontainer::apply_trust(
+            &resolved,
+            &crate::config::Config::default(),
+            &worktree,
+        );
+
+        let cmd = build_run_command(
+            &docker_runtime(),
+            "ubuntu:25.10",
+            &mounts,
+            &[],
+            &[],
+            &NetworkMode::Full,
+            "am-feat",
+            &dc,
+        );
+        let joined = cmd.join(" ");
+        assert!(
+            joined.contains(&format!("{}:/data", sub.to_string_lossy())),
+            "worktree-internal bind mount should reach the run command: {joined}"
+        );
+    }
+
+    #[test]
     fn build_run_command_mounts_use_host_paths() {
         let tmp = TempDir::new().unwrap();
         let mounts = make_mounts(tmp.path());

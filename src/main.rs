@@ -1149,7 +1149,7 @@ fn plan_devcontainer(
         .unwrap_or_else(|| cfg.container.user.clone());
     let home = container::container_home(&user, cfg.devcontainer.home.as_deref());
 
-    let trusted = devcontainer::apply_trust(&resolved, cfg);
+    let trusted = devcontainer::apply_trust(&resolved, cfg, worktree);
     let agent_auth = match agent {
         Some(agent) => container::preflight_agent_auth(agent, &home)?,
         None => container::AgentAuth::default(),
