@@ -1832,6 +1832,121 @@ user = "../root"
         assert!(!config.devcontainer.allow_host_mounts);
     }
 
+    // ── Precedence across the layers ─────────────────────────────────────────
+    //
+    // Documented order, lowest to highest: compiled-in default, global file, project file,
+    // environment. Individual keys are tested elsewhere; what these cover is the *layering*
+    // itself, and specifically the case that a naive `if value { … }` merge gets wrong — a
+    // higher layer setting something back to `false`.
+
+    /// A project file must be able to turn OFF what the global file turned on. A merge that
+    /// only propagates `true` leaves the user unable to opt out per-repository, and the failure
+    /// is silent: the flag simply stays on.
+    #[test]
+    fn a_project_config_can_turn_off_what_the_global_config_turned_on() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&[
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        ]);
+        for var in [
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        ] {
+            std::env::remove_var(var);
+        }
+        let tmp = TempDir::new().unwrap();
+        let global = write_toml(
+            tmp.path(),
+            "global.toml",
+            "[devcontainer]\nallow_host_commands = true\nallow_runtime_escalation = true\n",
+        );
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[devcontainer]\nallow_runtime_escalation = false\n",
+        );
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+
+        assert!(
+            config.devcontainer.allow_host_commands,
+            "a key the project file does not mention keeps the global value"
+        );
+        assert!(
+            !config.devcontainer.allow_runtime_escalation,
+            "an explicit false in the project file must win over the global true"
+        );
+    }
+
+    /// The environment is the highest layer, and must also be able to say `false`.
+    #[test]
+    fn the_environment_overrides_both_files_including_an_explicit_false() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&[
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        ]);
+        let tmp = TempDir::new().unwrap();
+        let global = write_toml(
+            tmp.path(),
+            "global.toml",
+            "[devcontainer]\nallow_host_mounts = false\n",
+        );
+        let project = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[devcontainer]\nallow_host_commands = true\nallow_host_mounts = true\n",
+        );
+        std::env::set_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS", "false");
+        std::env::set_var("AM_DEVCONTAINER_ALLOW_HOST_MOUNTS", "true");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION");
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+
+        assert!(
+            !config.devcontainer.allow_host_commands,
+            "the environment must be able to revoke consent a file granted"
+        );
+        assert!(
+            config.devcontainer.allow_host_mounts,
+            "the environment must be able to grant what the global file denied"
+        );
+        assert!(
+            !config.devcontainer.allow_runtime_escalation,
+            "a flag nobody set stays at its compiled-in default"
+        );
+    }
+
+    /// The project layer wins over the global one for ordinary values too, not only booleans —
+    /// and a global value survives where the project file is silent.
+    #[test]
+    fn the_project_layer_wins_per_key_rather_than_wholesale() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_MODE"]);
+        std::env::remove_var("AM_AGENT");
+        std::env::remove_var("AM_CONTAINER_MODE");
+        let tmp = TempDir::new().unwrap();
+        let global = write_toml(
+            tmp.path(),
+            "global.toml",
+            "[defaults]\nagent = \"copilot\"\n\n[container]\nmode = \"devcontainer\"\n",
+        );
+        let project = write_toml(tmp.path(), "project.toml", "[defaults]\nagent = \"claude\"\n");
+
+        let config = load_with_global(Some(&global), Some(&project)).unwrap();
+
+        assert_eq!(config.agent.as_deref(), Some("claude"), "project wins for the key it sets");
+        assert_eq!(
+            config.container.mode,
+            ContainerMode::Devcontainer,
+            "a table the project file also has must not discard the global's other keys"
+        );
+    }
+
     #[test]
     fn extra_features_merge_rather_than_replace() {
         // A project adding one Feature should not have to restate the global set.
