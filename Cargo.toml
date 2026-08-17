@@ -42,6 +42,31 @@ unused = "warn"
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Test tiers. Every one of these is empty of code — they exist only to select tests that need
+# something the ordinary suite does not, so that `cargo test` is always runnable anywhere and a
+# developer can opt into exactly the infrastructure they have. See CLAUDE.md for what each needs
+# and how to stand it up.
+[features]
+default = []
+# The whole integration tier, for CI.
+integration = [
+    "integration-cli",
+    "integration-registry",
+    "integration-network",
+    "integration-compose",
+]
+# @devcontainers/cli on PATH, a container runtime, and network access for real Feature and base
+# image pulls. These are the differential tests: they compare am's output against the reference
+# implementation's, which is the one thing a fixture cannot stand in for.
+integration-cli = []
+# The local registries from scripts/test-registry.sh, including one behind htpasswd that the
+# runtime has logged in to.
+integration-registry = []
+# Public network access only — no daemon, no local services.
+integration-network = []
+# A working Compose provider (`docker compose`, or a standalone docker-compose).
+integration-compose = []
+
 [dev-dependencies]
 tempfile = "3"
 cucumber = "0.23"

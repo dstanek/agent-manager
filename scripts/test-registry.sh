@@ -14,7 +14,7 @@
 #
 # Then:
 #
-#   cargo test --bin am -- --ignored
+#   cargo test --features integration-registry
 #
 # Requires a container runtime and the reference CLI (`npm install -g @devcontainers/cli`),
 # which is a *test* dependency — `am` itself never runs it.
@@ -154,7 +154,8 @@ up() {
     echo "  localhost:${REGISTRY_PORT}/amtest/needs-base:1.0.0  declares dependsOn"
     echo "  localhost:${PRIVATE_PORT}/amtest/base:1.0.0        the same, behind basic auth"
     echo
-    echo "Run the tests that need it:  cargo test --bin am -- --ignored"
+    echo "Run the tests that need it:  cargo test --features integration-registry"
+    echo "  (add --features integration-cli for the differential dependsOn test)"
 }
 
 down() {

@@ -1038,7 +1038,10 @@ mod tests {
     /// It is that the *label* is, because the label is the entire contract between whichever
     /// builder ran and everything downstream of it.
     #[test]
-    #[ignore = "needs a container runtime and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI, a runtime, and real image pulls"
+    )]
     fn native_build_label_matches_the_reference_cli() {
         assert_matches_reference(
             include_str!("../../../tests/fixtures/devcontainer/native/git-devcontainer.json"),
@@ -1052,7 +1055,10 @@ mod tests {
     /// with an `installsAfter` relationship between them, and a `${localWorkspaceFolder}` that
     /// must survive Docker's own variable expansion to be substituted later by the run path.
     #[test]
-    #[ignore = "needs a container runtime and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI, a runtime, and real image pulls"
+    )]
     fn native_build_matches_the_cli_with_features_and_an_inherited_label() {
         assert_matches_reference(
             include_str!("../../../tests/fixtures/devcontainer/native/features-devcontainer.json"),
@@ -1070,7 +1076,10 @@ mod tests {
     /// loudly if the two lists are ever conflated again. It also covers `forwardPorts` and
     /// `portsAttributes` reaching the label at all, which they previously did not.
     #[test]
-    #[ignore = "needs a container runtime and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI, a runtime, and real image pulls"
+    )]
     fn native_build_matches_the_cli_across_the_config_metadata_schema() {
         assert_matches_reference(
             include_str!("../../../tests/fixtures/devcontainer/native/ports-devcontainer.json"),
@@ -1088,7 +1097,10 @@ mod tests {
     /// environment. That is why this test asserts `Config.Env` as well, and why the bug went
     /// unnoticed: a Feature installed a toolchain and left it off `PATH`.
     #[test]
-    #[ignore = "needs a container runtime and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI, a runtime, and real image pulls"
+    )]
     fn native_build_matches_the_cli_for_feature_env_and_hooks() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/devcontainer/native");
         let image = "am-dc-native-difftest-env";
@@ -1133,7 +1145,10 @@ mod tests {
     /// exec'ing into the service — is covered by the cucumber scenarios, which can drive it
     /// against a mock runtime because nothing about it needs a real container.
     #[test]
-    #[ignore = "needs a container runtime and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI, a runtime, and real image pulls"
+    )]
     fn native_build_matches_the_cli_for_a_compose_service() {
         assert_matches_reference_with(
             include_str!("../../../tests/fixtures/devcontainer/native/compose-devcontainer.json"),
@@ -1164,7 +1179,10 @@ mod tests {
     /// into the lockfile — so this is what proves the two agree on what a Feature *is*, which
     /// no label comparison can show.
     #[test]
-    #[ignore = "needs the reference CLI and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI and real Feature pulls"
+    )]
     fn install_order_matches_the_reference_cli_resolver() {
         assert_order_matches_reference(include_str!(
             "../../../tests/fixtures/devcontainer/native/two-chains-devcontainer.json"
@@ -1177,7 +1195,10 @@ mod tests {
     /// inside a round, and it *splits* a round — deferring lower-priority Features that were
     /// otherwise ready. This fixture raises `common-utils`, which is the splitting case.
     #[test]
-    #[ignore = "needs the reference CLI and network access"]
+    #[cfg_attr(
+        not(feature = "integration-cli"),
+        ignore = "needs --features integration-cli — the reference CLI and real Feature pulls"
+    )]
     fn override_install_order_matches_the_reference_cli_resolver() {
         assert_order_matches_reference(include_str!(
             "../../../tests/fixtures/devcontainer/native/override-order-devcontainer.json"
@@ -1323,7 +1344,10 @@ mod tests {
     /// `scripts/test-registry.sh` publishes purpose-built Features to a local registry; this
     /// resolves a config using them through both implementations and compares.
     #[test]
-    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
+    #[cfg_attr(
+        not(all(feature = "integration-cli", feature = "integration-registry")),
+        ignore = "needs --features integration-cli --features integration-registry — the reference CLI plus scripts/test-registry.sh"
+    )]
     fn depends_on_matches_the_reference_cli_resolver() {
         assert_order_matches_reference(include_str!(
             "../../../tests/fixtures/devcontainer/native/depends-on-devcontainer.json"

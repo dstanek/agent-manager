@@ -1113,7 +1113,10 @@ mod tests {
     /// see `tests/fixtures/tarball/README.md`. That makes this the one Feature path with no
     /// local harness to start; the ignore is about the network, not about infrastructure.
     #[test]
-    #[ignore = "fetches the fixture tarball over the network"]
+    #[cfg_attr(
+        not(feature = "integration-network"),
+        ignore = "needs --features integration-network — a public HTTPS fetch of the committed fixture"
+    )]
     fn a_feature_tarball_is_fetched_and_unpacked_over_https() {
         let url = std::env::var("AM_TARBALL_FIXTURE_URL").unwrap_or_else(|_| {
             "https://raw.githubusercontent.com/dstanek/agent-manager/main/\
@@ -1144,7 +1147,10 @@ mod tests {
     /// The anonymous request first is what keeps the test honest: without it, a registry that
     /// had quietly stopped requiring auth would let the second half pass on its own.
     #[test]
-    #[ignore = "needs the local test registries — see scripts/test-registry.sh"]
+    #[cfg_attr(
+        not(feature = "integration-registry"),
+        ignore = "needs --features integration-registry — scripts/test-registry.sh, including a real docker login"
+    )]
     fn a_private_registry_is_read_with_the_runtimes_stored_credentials() {
         let feature = parse_ref("localhost:5001/amtest/base:1.0.0");
         let url = "http://localhost:5001/v2/amtest/base/manifests/1.0.0";
