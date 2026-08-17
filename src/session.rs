@@ -421,6 +421,117 @@ mod tests {
         assert_eq!(c.mode, ContainerMode::Image);
     }
 
+    // ── Concurrent writes to the global store ────────────────────────────────
+    //
+    // The store is one file shared by every session in every repository, and every mutation is
+    // a read-modify-write. Two `am` invocations overlapping — a start while another start is
+    // finishing, a destroy during an attach — is ordinary use, not an edge case. What stands
+    // between that and a lost record is `lock_global_sessions`, and nothing exercised it.
+    //
+    // Threads rather than processes: `lock_exclusive` is an `flock`, taken on a handle opened
+    // per call, so two threads contend exactly as two processes would. The env is set before
+    // any thread starts, since it is process-global.
+
+    /// Every concurrent add must survive. A lost update — two writers reading the same list and
+    /// each saving their own version of it — is the failure this guards, and it would leave a
+    /// perfectly valid JSON file that is simply missing sessions.
+    #[test]
+    fn concurrent_adds_all_survive() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+        let repo = tmp.path().join("repo");
+
+        const WRITERS: usize = 8;
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let repo = repo.clone();
+                    scope.spawn(move || {
+                        add_session_global(make_session_for_repo(&format!("feat-{i}"), &repo))
+                            .err()
+                            .map(|e| format!("feat-{i}: {e}"))
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().expect("writer thread")).collect()
+        });
+
+        assert!(failures.is_empty(), "concurrent adds reported errors: {failures:?}");
+        let loaded = load_all_sessions().expect("the store must still parse");
+        assert_eq!(
+            loaded.len(),
+            WRITERS,
+            "records were lost to a concurrent write: {:?}",
+            loaded.iter().map(|s| &s.slug).collect::<Vec<_>>()
+        );
+    }
+
+    /// Uniqueness has to hold under contention too: two writers racing on the *same* slug must
+    /// not both win, or `am` ends up with two sessions it cannot tell apart.
+    #[test]
+    fn concurrent_adds_of_one_slug_leave_exactly_one() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+        let repo = tmp.path().join("repo");
+
+        const WRITERS: usize = 6;
+        let succeeded = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    let repo = repo.clone();
+                    scope.spawn(move || add_session_global(make_session_for_repo("feat", &repo)).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("writer thread"))
+                .filter(|claimed| *claimed)
+                .count()
+        });
+
+        assert_eq!(succeeded, 1, "exactly one writer may claim a slug");
+        let loaded = load_all_sessions().unwrap();
+        assert_eq!(loaded.len(), 1, "got: {:?}", loaded.iter().map(|s| &s.slug).collect::<Vec<_>>());
+    }
+
+    /// Removals racing against unrelated updates must not take an innocent record with them.
+    #[test]
+    fn a_concurrent_remove_leaves_unrelated_sessions_alone() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("XDG_STATE_HOME", tmp.path());
+        let repo = tmp.path().join("repo");
+
+        for slug in ["keep-a", "doomed", "keep-b"] {
+            add_session_global(make_session_for_repo(slug, &repo)).unwrap();
+        }
+
+        std::thread::scope(|scope| {
+            let r = repo.clone();
+            scope.spawn(move || remove_session_global(&r, "doomed").expect("remove"));
+            let r = repo.clone();
+            scope.spawn(move || {
+                let mut s = make_session_for_repo("keep-a", &r);
+                s.agent = Some("claude".to_string());
+                update_session_global(s).expect("update");
+            });
+        });
+
+        let loaded = load_all_sessions().expect("the store must still parse");
+        let slugs: Vec<&str> = loaded.iter().map(|s| s.slug.as_str()).collect();
+        assert!(!slugs.contains(&"doomed"), "the removal did not take effect: {slugs:?}");
+        assert!(slugs.contains(&"keep-a"), "an unrelated session was lost: {slugs:?}");
+        assert!(slugs.contains(&"keep-b"), "an unrelated session was lost: {slugs:?}");
+        // The update must have survived the concurrent removal rewriting the same file.
+        let updated = loaded.iter().find(|s| s.slug == "keep-a").unwrap();
+        assert_eq!(updated.agent.as_deref(), Some("claude"));
+    }
+
     #[test]
     fn agent_roundtrips_json() {
         let _guard = ENV_MUTEX.lock().unwrap();
