@@ -1386,18 +1386,37 @@ pub fn check_host_commands(json: &DevcontainerJson, allowed: bool) -> Result<()>
 /// `Path::canonicalize` requires the path to exist, but a bind mount source is not required
 /// to — the runtime creates a missing directory on start, and a config asking for a fresh
 /// subdirectory under the worktree is ordinary, not suspicious. So a non-existent source is
-/// not automatically *safe* either: walk up to the nearest existing ancestor, canonicalize
-/// that (resolving any symlink placed there), then re-append the still-missing suffix
-/// literally. Nothing below an existing ancestor can be a symlink, because the filesystem has
-/// nothing there yet, so this is exact rather than a heuristic.
+/// not automatically *safe* either: walk up to the nearest ancestor that is there — a real
+/// file or directory, or a symlink even if it dangles — canonicalize that (resolving any
+/// symlink placed there), then re-append the still-missing suffix literally. Nothing below
+/// that ancestor can itself be a symlink, because the filesystem has nothing there yet, so
+/// this is exact rather than a heuristic.
 ///
-/// Returns `None` when even that walk cannot pin the path down (for example a path built so
-/// that a literal `..` survives past the point anything on disk exists). That failure is
-/// treated as untrusted by the caller — the safe direction, since the alternative is guessing.
+/// The walk tests each component with [`std::fs::symlink_metadata`], not [`Path::exists`]:
+/// `exists` follows a symlink and reports `false` when its target is missing, which would let
+/// the walk step *past* a dangling symlink as though it were an ordinary absent directory — a
+/// repo could then commit a symlink under the worktree pointing at a host path that does not
+/// exist yet, and it would be treated as a legitimate fresh subdirectory instead of the escape
+/// it is. `symlink_metadata` sees the link itself and stops the walk there instead; the
+/// `canonicalize` below then fails on it (its target does not resolve), which this function
+/// already treats as untrusted.
+///
+/// Returns `None` when the walk cannot pin the path down at all — a dangling symlink, or a
+/// path built so that a literal `..` survives past the point anything on disk exists. That
+/// failure is treated as untrusted by the caller, the safe direction, since the alternative is
+/// guessing. This is also why a dangling symlink whose target *would* land inside the worktree
+/// is still dropped rather than allowed: the decision is made from what is on disk now, and a
+/// target that does not exist yet cannot be shown to be one or the other.
+///
+/// This is a time-of-check decision: it inspects the filesystem at plan time, and the runtime
+/// resolves the same path again when it actually creates the container. A worktree a
+/// repository's own build step can rewrite between those two moments — swapping a plain
+/// directory for a symlink after `am` has already judged it trustworthy — is a TOCTOU gap this
+/// function does not close.
 fn resolve_for_trust(path: &Path) -> Option<PathBuf> {
     let mut current = path;
     let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
-    while !current.exists() {
+    while std::fs::symlink_metadata(current).is_err() {
         let name = current.file_name()?;
         suffix.push(name);
         current = current.parent()?;
@@ -2880,6 +2899,56 @@ mod tests {
         };
         let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
         assert!(runtime.mounts.is_empty(), "a symlink must not launder a path out of the worktree");
+    }
+
+    #[test]
+    fn mount_trust_drops_a_dangling_symlink_pointing_outside_the_worktree() {
+        // `Path::exists` follows symlinks and reports `false` for a dangling one — which, if
+        // `resolve_for_trust` used it to decide "not there yet, must be a fresh subdirectory",
+        // would step past a symlink a repo committed pointing at a host path that does not
+        // exist *yet* (say, a directory under `$HOME/.config` the target user hasn't created),
+        // and treat it as an ordinary worktree-internal path once the runtime creates it. This
+        // is the regression `symlink_metadata` (rather than `exists`) in the walk closes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside_target = tmp.path().join("outside").join("not-created-yet");
+        let link = worktree.join("dangling-escape");
+        std::os::unix::fs::symlink(&outside_target, &link).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&link.to_string_lossy(), "/escape")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(
+            runtime.mounts.is_empty(),
+            "a dangling symlink must not be treated as a fresh worktree-internal path"
+        );
+    }
+
+    #[test]
+    fn mount_trust_drops_a_dangling_symlink_even_when_its_target_would_be_inside_the_worktree() {
+        // Deliberate, not incidental: the decision is made from what is on disk right now, and
+        // a target that does not exist yet cannot be shown to resolve inside the worktree —
+        // only that the *literal* path of the link's target would. Failing closed here costs
+        // nothing (the runtime creates the real, safe path once the mount source is an
+        // ordinary missing directory rather than a symlink), and treating "would resolve
+        // inside" as good enough is exactly the reasoning the escaping case must not get away
+        // with.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let inside_target = worktree.join("not-created-yet");
+        let link = worktree.join("dangling-internal");
+        std::os::unix::fs::symlink(&inside_target, &link).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&link.to_string_lossy(), "/maybe-fine")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty(), "a dangling symlink is judged untrusted regardless of where its target would land");
     }
 
     #[test]
