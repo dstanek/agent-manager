@@ -3314,6 +3314,101 @@ mod tests {
         assert!(runtime.mounts.is_empty());
     }
 
+    // ── Mount trust: every form a config can write ───────────────────────────
+    //
+    // The policy runs on `NormalizedMount`, after both the string and object forms have been
+    // parsed. These drive it from the raw label JSON instead, because that is where the forms
+    // are still distinguishable: a filter accidentally keyed on one spelling, or an alias that
+    // fails to parse and silently yields a mount with no source, would pass every test that
+    // constructs a `NormalizedMount` by hand.
+
+    /// The object form, written with the `src`/`dst` aliases the reference CLI copies verbatim.
+    #[test]
+    fn mount_trust_judges_the_object_form_including_its_aliases() {
+        let snippets: Vec<MetadataSnippet> = serde_json::from_str(
+            r#"[{"mounts":[{"type":"bind","src":"/","dst":"/host"}]}]"#,
+        )
+        .unwrap();
+        let resolved = merge(&snippets).unwrap();
+        assert_eq!(resolved.mounts.len(), 1, "the aliased object form must parse at all");
+
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
+        assert!(
+            runtime.mounts.is_empty(),
+            "the object form must go through the same gate: {:?}",
+            runtime.mounts
+        );
+    }
+
+    /// The string form, with every alias the parser accepts for source and target.
+    #[test]
+    fn mount_trust_judges_the_string_form_including_its_aliases() {
+        let snippets: Vec<MetadataSnippet> =
+            serde_json::from_str(r#"[{"mounts":["type=bind,src=/,dst=/host"]}]"#).unwrap();
+        let resolved = merge(&snippets).unwrap();
+        assert_eq!(resolved.mounts.len(), 1);
+
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
+        assert!(runtime.mounts.is_empty(), "got: {:?}", runtime.mounts);
+    }
+
+    /// Read-only does not buy trust. It narrows the damage to disclosure rather than
+    /// modification, and disclosure of an arbitrary host path is the thing being prevented.
+    #[test]
+    fn mount_trust_drops_a_read_only_bind_from_outside_the_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![NormalizedMount {
+                source: Some(elsewhere.to_string_lossy().into_owned()),
+                target: "/host".to_string(),
+                kind: "bind".to_string(),
+                read_only: true,
+            }],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty(), "read-only is still host exposure");
+    }
+
+    /// A relative source is resolved by the *runtime*, against a working directory that is not
+    /// the worktree — so it cannot be shown to be inside it and must fail closed.
+    #[test]
+    fn mount_trust_drops_a_relative_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind("some/relative/path", "/host")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty(), "got: {:?}", runtime.mounts);
+    }
+
+    /// Only *binds* are restricted. A volume's source names a runtime-managed volume, not a
+    /// host path, even when it is spelled like one — so it is allowed, and the runtime creates
+    /// a volume named `/host` rather than exposing that directory.
+    #[test]
+    fn mount_trust_does_not_restrict_a_volume_whose_name_looks_like_a_path() {
+        let resolved = ResolvedConfig {
+            mounts: vec![NormalizedMount {
+                source: Some("/host".to_string()),
+                target: "/v".to_string(),
+                kind: "volume".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
+        assert_eq!(runtime.mounts.len(), 1, "a volume is not a host bind and is not restricted");
+    }
+
     // ── Lifecycle hooks ───────────────────────────────────────────────────────
 
     fn with_hooks() -> ResolvedConfig {

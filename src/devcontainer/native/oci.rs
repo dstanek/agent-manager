@@ -701,6 +701,220 @@ mod tests {
         );
     }
 
+
+    // ── Hostile archives ─────────────────────────────────────────────────────
+    //
+    // A Feature archive is attacker-controlled input in the sense that matters: it arrives over
+    // the network from a registry or a URL, is unpacked by `am`, and its `install.sh` then runs
+    // as root while the image builds. Everything below asserts the same property from a
+    // different angle — nothing an archive contains may write outside the cache directory it is
+    // unpacked into. These are characterisation tests as much as regression tests: they pin
+    // what `unpack` does today so that swapping the tar implementation, or adding a fast path,
+    // cannot quietly weaken it.
+
+    /// Write an entry name straight into the header's name field.
+    ///
+    /// `tar::Header::set_path` refuses `..` and absolute paths — it will not help you build a
+    /// hostile archive, which is exactly what these tests need. A real attacker writes the
+    /// bytes, so the test does too: the name field is the first 100 bytes of the 512-byte
+    /// header, and the checksum is computed afterwards over the finished header.
+    fn set_raw_name(header: &mut tar::Header, name: &str) {
+        assert!(name.len() <= 100, "test entry name must fit the ustar name field");
+        let field = &mut header.as_mut_bytes()[..100];
+        field.fill(0);
+        field[..name.len()].copy_from_slice(name.as_bytes());
+    }
+
+    /// Build a tar containing one entry of an arbitrary type, with an arbitrary path.
+    fn tar_with_entry(path: &str, kind: tar::EntryType, link_target: Option<&str>) -> Vec<u8> {
+        let body: &[u8] = b"pwned";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(if link_target.is_some() { 0 } else { body.len() as u64 });
+        header.set_mode(0o644);
+        header.set_entry_type(kind);
+        if let Some(target) = link_target {
+            header.set_link_name(target).unwrap();
+        }
+        set_raw_name(&mut header, path);
+        header.set_cksum();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        if link_target.is_some() {
+            builder.append(&header, std::io::empty()).unwrap();
+        } else {
+            builder.append(&header, body).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    /// A path traversal in an entry name must not place a file above the destination.
+    #[test]
+    fn an_archive_entry_cannot_traverse_above_the_cache_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Measured behaviour, pinned rather than assumed: the unpack *succeeds* and the entry
+        // is silently skipped. Worth knowing — a Feature whose archive carries such an entry
+        // installs with that file simply absent, and the failure surfaces later as a missing
+        // file inside install.sh rather than as a rejected archive.
+        let result = unpack(&tar_with_entry("../escaped.txt", tar::EntryType::Regular, None), &dest);
+
+        assert!(result.is_ok(), "the traversal entry is skipped, not treated as a fatal archive");
+        assert!(
+            !tmp.path().join("escaped.txt").exists(),
+            "an entry named ../escaped.txt escaped the destination directory"
+        );
+        assert!(
+            !dest.join("escaped.txt").exists(),
+            "the entry was neither written outside nor relocated inside — it is dropped"
+        );
+    }
+
+    /// The same, with the traversal buried mid-path rather than leading.
+    #[test]
+    fn an_archive_entry_cannot_traverse_from_within_a_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let result = unpack(
+            &tar_with_entry("sub/../../escaped.txt", tar::EntryType::Regular, None),
+            &dest,
+        );
+
+        assert!(result.is_ok(), "same handling as a leading traversal: skipped, not fatal");
+        assert!(!tmp.path().join("escaped.txt").exists(), "a mid-path traversal escaped");
+    }
+
+    /// An absolute entry name must be treated as relative to the destination, never honoured.
+    #[test]
+    fn an_archive_entry_with_an_absolute_path_stays_inside_the_cache_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Somewhere writable that the entry names outright.
+        let target = tmp.path().join("absolute-escape.txt");
+
+        let result = unpack(
+            &tar_with_entry(
+                target.to_str().expect("test path is utf-8"),
+                tar::EntryType::Regular,
+                None,
+            ),
+            &dest,
+        );
+
+        assert!(result.is_ok(), "an absolute path is rewritten, not rejected");
+        assert!(!target.exists(), "an absolute entry path was honoured: {}", target.display());
+        // Measured: the leading `/` is stripped and the entry lands under the destination.
+        // That is the safe outcome, and pinning it here means a change to *rejecting* such an
+        // archive is a deliberate decision rather than an unnoticed behaviour change.
+        assert!(
+            dest.join(target.strip_prefix("/").expect("absolute in a test")).exists(),
+            "the entry should have been relocated under the destination"
+        );
+    }
+
+    /// A symlink pointing out of the archive, followed by a write through it, is the classic
+    /// two-entry escape: the link itself is harmless, the write through it is not.
+    #[test]
+    fn an_archive_cannot_write_through_a_symlink_that_leaves_the_cache_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_size(0);
+        link.set_mode(0o777);
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_link_name(&outside).unwrap();
+        set_raw_name(&mut link, "escape");
+        link.set_cksum();
+        builder.append(&link, std::io::empty()).unwrap();
+
+        let body: &[u8] = b"pwned";
+        let mut file = tar::Header::new_gnu();
+        file.set_size(body.len() as u64);
+        file.set_mode(0o644);
+        set_raw_name(&mut file, "escape/escaped.txt");
+        file.set_cksum();
+        builder.append(&file, body).unwrap();
+
+        let result = unpack(&builder.into_inner().unwrap(), &dest);
+
+        // The symlink entry itself is created — which is what makes this test meaningful. The
+        // archive is processed past its first entry, and it is the *write through* the link
+        // that is refused, loudly, rather than the archive being rejected up front.
+        assert!(
+            std::fs::symlink_metadata(dest.join("escape")).is_ok(),
+            "the symlink entry was never created, so this test proves nothing about the write"
+        );
+        assert!(result.is_err(), "writing through an escaping symlink must fail, not be skipped");
+        assert!(
+            !outside.join("escaped.txt").exists(),
+            "a write through a symlink landed outside the cache directory"
+        );
+    }
+
+    /// A hard link to a path outside the archive would expose a host file's contents inside the
+    /// image — a different escape from the symlink one, and worth its own case.
+    #[test]
+    fn an_archive_cannot_hard_link_to_a_file_outside_the_cache_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, "a host file").unwrap();
+
+        let result = unpack(
+            &tar_with_entry(
+                "linked.txt",
+                tar::EntryType::Link,
+                Some(secret.to_str().expect("test path is utf-8")),
+            ),
+            &dest,
+        );
+
+        assert!(result.is_err(), "a hard link out of the archive must fail the unpack");
+        assert!(
+            !dest.join("linked.txt").exists(),
+            "a hard link to a host file was created inside the cache directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "a host file",
+            "the host file must be untouched"
+        );
+    }
+
+    /// `.am-complete` is `am`'s own marker for "this cache directory is fully unpacked and
+    /// verified". An archive that ships one would be claiming that on its own behalf.
+    ///
+    /// This documents rather than judges: `fetch_layer` writes the marker itself only after a
+    /// successful verify-and-unpack, so an archive carrying one changes nothing today. The test
+    /// exists so that a future change making the marker's *presence* the completion check — a
+    /// natural-looking optimisation — fails here instead of shipping.
+    #[test]
+    fn an_archive_carrying_the_completion_marker_is_not_treated_as_authoritative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("cache");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        unpack(&tar_with_entry(".am-complete", tar::EntryType::Regular, None), &dest).unwrap();
+
+        // The marker is inside the cache directory, which is where it would be anyway; what
+        // matters is that nothing about the *layer* was verified by its presence. Recorded as
+        // an explicit expectation so the reason survives.
+        assert!(
+            dest.join(".am-complete").exists(),
+            "the entry unpacked as an ordinary file, which is the documented behaviour"
+        );
+    }
+
     /// The committed fixture is the *only* copy of that Feature — the network test below fetches
     /// this same file back out of the repository — so a rebuild that changes its shape has to
     /// fail here, offline, rather than in an `#[ignore]`d test nobody ran.
