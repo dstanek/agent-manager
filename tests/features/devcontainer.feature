@@ -134,6 +134,120 @@ Feature: Dev container sessions
     And the output contains "ignoring runArgs"
     And the mock tmux log does not contain "--network=host"
 
+  # The other three runtime-escalation options, each through the public CLI rather than only
+  # through apply_trust's return value: the gate is only real if nothing downstream emits them.
+  Scenario: privileged is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for privileged
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not granting it"
+    And the output contains "allow_runtime_escalation"
+    And the mock tmux log does not contain "--privileged"
+
+  Scenario: an allowed privileged reaches the container runtime
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for privileged
+    And a project config containing "[devcontainer]\nallow_runtime_escalation = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "--privileged"
+
+  Scenario: capAdd is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for capAdd
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not granting capabilities"
+    And the mock tmux log does not contain "SYS_PTRACE"
+
+  Scenario: an allowed capAdd reaches the container runtime
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for capAdd
+    And a project config containing "[devcontainer]\nallow_runtime_escalation = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "SYS_PTRACE"
+
+  # seccomp=unconfined is the example that matters: it removes the syscall filter entirely.
+  Scenario: securityOpt is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for securityOpt
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not granting security options"
+    And the mock tmux log does not contain "seccomp=unconfined"
+
+  Scenario: an allowed securityOpt reaches the container runtime
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config asking for securityOpt
+    And a project config containing "[devcontainer]\nallow_runtime_escalation = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "seccomp=unconfined"
+
+  # workspaceMount naming the worktree is the property's whole purpose, and must keep working
+  # with no consent at all — a policy that broke it would be a policy nobody could adopt.
+  Scenario: a workspaceMount of the session worktree needs no consent
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a workspaceMount of the worktree
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    # The mount, not the workdir: workspaceFolder puts "/workspaces/app" in the command on its
+    # own, so asserting on the target alone would pass with the mount dropped. The `:` pins it
+    # to a -v argument.
+    And the mock tmux log contains ":/workspaces/app:rw"
+    And the output does not contain "not mounting"
+
+  # ...and pointing it elsewhere must not be a way around the policy the other mounts go through.
+  Scenario: a workspaceMount outside the worktree is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a workspaceMount outside the worktree
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not mounting"
+    And the mock tmux log does not contain "outside-workspace"
+
+  Scenario: an allowed workspaceMount outside the worktree is honoured
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a workspaceMount outside the worktree
+    And a project config containing "[devcontainer]\nallow_host_mounts = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "outside-workspace"
+
+  # The array form is argv, executed without a shell. The sentinel's name carries a `;` so a
+  # regression that routes argv through `sh -c` would split it and write a different file.
+  Scenario: an argv initializeCommand runs without a shell
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with an argv initializeCommand
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the file ".am/worktrees/my-feature/argv;ran" exists
+
+  # The object form runs its members concurrently; both must actually run.
+  Scenario: a named initializeCommand runs every member
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a named initializeCommand
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the file ".am/worktrees/my-feature/member-one" exists
+    And the file ".am/worktrees/my-feature/member-two" exists
+
+  # One failing member fails the group, names which one, and rolls the worktree back — the
+  # sibling member having already run is exactly why the failure must not be swallowed.
+  Scenario: a failing member of a named initializeCommand stops the session
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a failing named initializeCommand
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command fails
+    And the output contains "bad"
+    And the worktree ".am/worktrees/my-feature" does not exist
+    And the session file does not contain "my-feature"
+
   # A bind mount whose source resolves outside the session worktree is a direct escape from
   # the isolation am exists to provide, gated by its own flag.
   Scenario: a bind mount outside the worktree is dropped by default
