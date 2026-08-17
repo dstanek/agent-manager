@@ -34,7 +34,11 @@ make build-copilot       # Build Copilot Docker image
   exactly the infrastructure they have. The tests still *compile* in every configuration, which is
   what keeps them from rotting — `cargo clippy --all-targets --all-features` is the check that
   proves it. What must stay in a tier rather than move to a fixture: anything whose value is
-  agreement with the real reference implementation.
+  agreement with the real reference implementation. `.github/workflows/integration.yml` runs
+  the whole tier on pull requests touching `src/devcontainer/**`, `src/compose.rs`, the
+  fixtures or the harness — it pins `@devcontainers/cli`, which the dev container does not,
+  so a local differential run can disagree with CI until the same pin lands in
+  `.devcontainer/Dockerfile`.
 - Most registry behaviour needs no infrastructure at all: `src/devcontainer/native/test_registry.rs`
   serves Features over HTTP from inside the test process, including a bearer challenge, Basic auth,
   and content that deliberately does not match its digest. It also records request paths, which is
