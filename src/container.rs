@@ -1944,7 +1944,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        // Default config: allow_host_commands is false.
+        // Default config: allow_host_mounts is false.
         let dc = crate::devcontainer::apply_trust(
             &resolved,
             &crate::config::Config::default(),

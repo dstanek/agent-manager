@@ -678,21 +678,21 @@ fn check_devcontainer_mode(
     }
 }
 /// Constructs `am` will refuse or drop unless explicitly allowed.
+///
+/// `initializeCommand` is gated by `allow_host_commands`; `runArgs` is one of the runtime
+/// escalation options and is gated by `allow_runtime_escalation` — the two flags are
+/// independent, so each is reported and hinted at separately.
 fn check_gated_constructs(report: &mut Report, cfg: &Config, json: &devcontainer::DevcontainerJson) {
     if cfg.devcontainer.allow_host_commands {
-        // Everything below is permitted; say so once rather than per-construct.
-        if json.initialize_command.is_some() || !json.run_args.is_empty() {
+        if json.initialize_command.is_some() {
             report.checks.push(Check::warn(
                 ENVIRONMENT,
-                "host commands",
+                "initializeCommand",
                 "allowed (devcontainer.allow_host_commands = true)",
                 "initializeCommand runs on your host, outside the container",
             ));
         }
-        return;
-    }
-
-    if json.initialize_command.is_some() {
+    } else if json.initialize_command.is_some() {
         report.checks.push(Check::fail(
             ENVIRONMENT,
             "initializeCommand",
@@ -700,12 +700,22 @@ fn check_gated_constructs(report: &mut Report, cfg: &Config, json: &devcontainer
             "read the command, then set devcontainer.allow_host_commands = true to allow it",
         ));
     }
-    if !json.run_args.is_empty() {
+
+    if cfg.devcontainer.allow_runtime_escalation {
+        if !json.run_args.is_empty() {
+            report.checks.push(Check::warn(
+                ENVIRONMENT,
+                "runArgs",
+                "allowed (devcontainer.allow_runtime_escalation = true)",
+                format!("{} will be passed to the container runtime", json.run_args.join(" ")),
+            ));
+        }
+    } else if !json.run_args.is_empty() {
         report.checks.push(Check::warn(
             ENVIRONMENT,
             "runArgs",
             format!("{} will be ignored", json.run_args.join(" ")),
-            "set devcontainer.allow_host_commands = true to apply them",
+            "set devcontainer.allow_runtime_escalation = true to apply them",
         ));
     }
 }
@@ -1302,6 +1312,77 @@ mod tests {
         let hint = check.hint.unwrap();
         assert!(hint.contains("am setup --agent"), "{hint}");
         assert!(hint.contains("defaults.agent"), "{hint}");
+    }
+
+    // ── Gated constructs ─────────────────────────────────────────────────────
+
+    #[test]
+    fn run_args_is_reported_as_ignored_by_default() {
+        let mut report = Report::default();
+        let cfg = Config::default();
+        let json = devcontainer::DevcontainerJson {
+            run_args: vec!["--network=host".to_string()],
+            ..Default::default()
+        };
+        check_gated_constructs(&mut report, &cfg, &json);
+
+        let check = find(&report, "runArgs");
+        assert_eq!(check.status, Status::Warn);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("allow_runtime_escalation"), "{hint}");
+    }
+
+    #[test]
+    fn run_args_is_reported_as_allowed_when_escalation_is_opted_in() {
+        let mut report = Report::default();
+        let mut cfg = Config::default();
+        cfg.devcontainer.allow_runtime_escalation = true;
+        let json = devcontainer::DevcontainerJson {
+            run_args: vec!["--network=host".to_string()],
+            ..Default::default()
+        };
+        check_gated_constructs(&mut report, &cfg, &json);
+
+        let check = find(&report, "runArgs");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("allow_runtime_escalation"), "{}", check.detail);
+    }
+
+    #[test]
+    fn allow_host_commands_alone_does_not_grant_run_args() {
+        // The two flags are independent: allow_host_commands only covers initializeCommand,
+        // not runArgs (a runtime-escalation option).
+        let mut report = Report::default();
+        let mut cfg = Config::default();
+        cfg.devcontainer.allow_host_commands = true;
+        let json = devcontainer::DevcontainerJson {
+            run_args: vec!["--network=host".to_string()],
+            ..Default::default()
+        };
+        check_gated_constructs(&mut report, &cfg, &json);
+
+        let check = find(&report, "runArgs");
+        assert_eq!(check.status, Status::Warn);
+        let hint = check.hint.unwrap();
+        assert!(hint.contains("allow_runtime_escalation"), "{hint}");
+        assert!(!hint.contains("allow_host_commands"), "{hint}");
+    }
+
+    #[test]
+    fn allow_runtime_escalation_alone_does_not_grant_initialize_command() {
+        let mut report = Report::default();
+        let mut cfg = Config::default();
+        cfg.devcontainer.allow_runtime_escalation = true;
+        let json = devcontainer::DevcontainerJson {
+            initialize_command: Some(
+                serde_json::from_str(r#""./setup.sh""#).unwrap(),
+            ),
+            ..Default::default()
+        };
+        check_gated_constructs(&mut report, &cfg, &json);
+
+        let check = find(&report, "initializeCommand");
+        assert_eq!(check.status, Status::Fail);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

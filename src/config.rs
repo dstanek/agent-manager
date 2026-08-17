@@ -180,6 +180,14 @@ pub struct DevcontainerConfig {
     /// Whether `initializeCommand` may run on the host. Off by default —
     /// `am` exists to isolate agents, and this is repo-controlled code.
     pub allow_host_commands: bool,
+    /// Whether `privileged`, `capAdd`, `securityOpt`, and `runArgs` are honoured. Off by
+    /// default — these hand the container new authority over the host's kernel, independent
+    /// of whether host commands are trusted.
+    pub allow_runtime_escalation: bool,
+    /// Whether a repo-declared bind mount (or `workspaceMount`) whose source resolves outside
+    /// the session worktree is honoured. Off by default — an arbitrary host path is a direct
+    /// escape from the isolation `am` exists to provide.
+    pub allow_host_mounts: bool,
     /// Skip every in-container lifecycle hook.
     pub skip_lifecycle: bool,
     /// Override the container home derived from `remoteUser`/`containerUser`.
@@ -341,6 +349,8 @@ struct FileDevcontainer {
     path: Option<PathBuf>,
     agent_install: Option<AgentInstall>,
     allow_host_commands: Option<bool>,
+    allow_runtime_escalation: Option<bool>,
+    allow_host_mounts: Option<bool>,
     skip_lifecycle: Option<bool>,
     home: Option<PathBuf>,
     extra_features: Option<HashMap<String, String>>,
@@ -493,6 +503,14 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
         file.devcontainer.allow_host_commands,
     );
     apply_opt(
+        &mut base.devcontainer.allow_runtime_escalation,
+        file.devcontainer.allow_runtime_escalation,
+    );
+    apply_opt(
+        &mut base.devcontainer.allow_host_mounts,
+        file.devcontainer.allow_host_mounts,
+    );
+    apply_opt(
         &mut base.devcontainer.skip_lifecycle,
         file.devcontainer.skip_lifecycle,
     );
@@ -580,6 +598,8 @@ pub fn render_project_config_skeleton() -> &'static str {
 # path = ""                  # explicit devcontainer.json, relative to the worktree
 # agent_install = "auto"     # "feature" | "bootstrap" | "none" | "auto"
 # allow_host_commands = false # let initializeCommand run on the HOST — off by default
+# allow_runtime_escalation = false # let privileged, capAdd, securityOpt, and runArgs apply
+# allow_host_mounts = false  # honour a bind mount whose source is outside the worktree
 # skip_lifecycle = false     # skip postCreateCommand and friends
 
 [attach]
@@ -611,7 +631,8 @@ pub fn global_config_template() -> &'static str {
 #   AM_TMUX_AGENT_PANE, AM_TMUX_SPLIT, AM_TMUX_SPLIT_PERCENT
 #   AM_CONTAINER_ENABLED, AM_CONTAINER_MODE, AM_CONTAINER_RUNTIME, AM_CONTAINER_IMAGE,
 #   AM_CONTAINER_NETWORK, AM_CONTAINER_SSH_AGENT, AM_CONTAINER_USER
-#   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS
+#   AM_DEVCONTAINER_PATH, AM_DEVCONTAINER_AGENT_INSTALL, AM_DEVCONTAINER_ALLOW_HOST_COMMANDS,
+#   AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION, AM_DEVCONTAINER_ALLOW_HOST_MOUNTS
 #   AM_FEATURE_CACHE (where am's own builder caches downloaded Features)
 
 [defaults]
@@ -665,6 +686,10 @@ agent_install = "auto"         # how the agent gets into the image:
                                #   "auto"      — feature if one is mapped, else bootstrap
 allow_host_commands = false    # let initializeCommand run on YOUR HOST, outside the container.
                                # Off by default: devcontainer.json is repo-controlled code.
+allow_runtime_escalation = false # let privileged, capAdd, securityOpt, and runArgs apply —
+                               # these hand the container new authority over the host's kernel.
+allow_host_mounts = false      # honour a repo-declared bind mount (or workspaceMount) whose
+                               # source resolves outside the session worktree.
 skip_lifecycle = false         # skip postCreateCommand and the other in-container hooks
 # home = ""                    # override the container home derived from remoteUser
 
@@ -789,6 +814,20 @@ fn apply_env_vars(config: &mut Config) -> Result<()> {
         match val.to_lowercase().as_str() {
             "true" | "1" | "yes" => config.devcontainer.allow_host_commands = true,
             "false" | "0" | "no" => config.devcontainer.allow_host_commands = false,
+            _ => {}
+        }
+    }
+    if let Ok(val) = std::env::var("AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION") {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => config.devcontainer.allow_runtime_escalation = true,
+            "false" | "0" | "no" => config.devcontainer.allow_runtime_escalation = false,
+            _ => {}
+        }
+    }
+    if let Ok(val) = std::env::var("AM_DEVCONTAINER_ALLOW_HOST_MOUNTS") {
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => config.devcontainer.allow_host_mounts = true,
+            "false" | "0" | "no" => config.devcontainer.allow_host_mounts = false,
             _ => {}
         }
     }
@@ -1708,12 +1747,20 @@ user = "../root"
     #[test]
     fn devcontainer_defaults_are_conservative() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let _env = EnvGuard::save(&["AM_DEVCONTAINER_ALLOW_HOST_COMMANDS"]);
+        let _env = EnvGuard::save(&[
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        ]);
         std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_MOUNTS");
 
         let config = load_with_global(None, None).unwrap();
 
         assert!(!config.devcontainer.allow_host_commands);
+        assert!(!config.devcontainer.allow_runtime_escalation);
+        assert!(!config.devcontainer.allow_host_mounts);
         assert!(!config.devcontainer.skip_lifecycle);
         assert_eq!(config.devcontainer.agent_install, AgentInstall::Auto);
     }
@@ -1725,10 +1772,14 @@ user = "../root"
             "AM_DEVCONTAINER_PATH",
             "AM_DEVCONTAINER_AGENT_INSTALL",
             "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
         ]);
         std::env::remove_var("AM_DEVCONTAINER_PATH");
         std::env::remove_var("AM_DEVCONTAINER_AGENT_INSTALL");
         std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_MOUNTS");
         let tmp = TempDir::new().unwrap();
         let path = write_toml(
             tmp.path(),
@@ -1736,7 +1787,9 @@ user = "../root"
             "[devcontainer]\n\
              path = \".devcontainer/custom.json\"\n\
              agent_install = \"bootstrap\"\n\
-             allow_host_commands = true\n",
+             allow_host_commands = true\n\
+             allow_runtime_escalation = true\n\
+             allow_host_mounts = true\n",
         );
 
         let config = load_with_global(None, Some(&path)).unwrap();
@@ -1747,6 +1800,36 @@ user = "../root"
         );
         assert_eq!(config.devcontainer.agent_install, AgentInstall::Bootstrap);
         assert!(config.devcontainer.allow_host_commands);
+        assert!(config.devcontainer.allow_runtime_escalation);
+        assert!(config.devcontainer.allow_host_mounts);
+    }
+
+    #[test]
+    fn devcontainer_trust_flags_are_independent() {
+        // Setting one must not silently grant the others — that is the entire point of the
+        // split. See devcontainer.rs's own independence tests for the runtime behaviour this
+        // config shape feeds into.
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let _env = EnvGuard::save(&[
+            "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+            "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+            "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        ]);
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_COMMANDS");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION");
+        std::env::remove_var("AM_DEVCONTAINER_ALLOW_HOST_MOUNTS");
+        let tmp = TempDir::new().unwrap();
+        let path = write_toml(
+            tmp.path(),
+            "project.toml",
+            "[devcontainer]\nallow_host_commands = true\n",
+        );
+
+        let config = load_with_global(None, Some(&path)).unwrap();
+
+        assert!(config.devcontainer.allow_host_commands);
+        assert!(!config.devcontainer.allow_runtime_escalation);
+        assert!(!config.devcontainer.allow_host_mounts);
     }
 
     #[test]

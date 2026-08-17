@@ -753,14 +753,16 @@ Follow-ups the native builder left behind:
       the session before any image work starts and rolls back the worktree, the same as a failed
       build. `skip_lifecycle` does not reach it: that flag is documented, and named, as skipping
       the in-container hooks, and this is the one hook that is not one of those.
-- [ ] **`allow_host_commands` now gates five things, not one** — `initializeCommand`
-      (a host command, matching the name) plus `privileged`, `capAdd`, `securityOpt`, `runArgs`,
-      and now untrusted bind mounts (runtime escalation and isolation-boundary decisions, not
-      host execution). A review of the `securityOpt` fix flagged the name as no longer
-      describing what it controls, and suggested either renaming it to something reflecting
-      broad runtime privilege consent or splitting host execution and runtime/mount escalation
-      into separate flags. Deferred: a config key rename is a breaking change and deserves its
-      own discussion, not a rider on a security fix.
+- [x] **`allow_host_commands` now gates five things, not one.** Done 2026-08-17. Split into
+      three independent flags: `allow_host_commands` (narrowed to `initializeCommand` only),
+      `allow_runtime_escalation` (new — `privileged`, `capAdd`, `securityOpt`, `runArgs`), and
+      `allow_host_mounts` (new — a bind mount or `workspaceMount` whose source resolves outside
+      the session worktree). This is a breaking change: a config that set
+      `allow_host_commands = true` keeps `initializeCommand` but silently stops granting the
+      other five, which now shows as the existing "not granting …" notes at session start — no
+      compatibility shim or migration error, by design. Every user-facing note now names the
+      flag that actually grants the thing it is warning about. `am doctor` reports all three
+      independently.
 - [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
       until `am` writes one on its first build. Self-correcting, and now documented in the
       configuration reference; kept open only because the first build of a fresh checkout is
