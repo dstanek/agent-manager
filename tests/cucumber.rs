@@ -757,6 +757,54 @@ async fn given_session_file_no_agent(world: &mut AmWorld) {
     fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).expect("rewrite sessions.json");
 }
 
+/// Point a recorded session at a repository that no longer exists — a checkout deleted or
+/// moved while its session record lived on in the global store.
+#[given(expr = "the session {string} points at a repository that no longer exists")]
+async fn given_session_with_missing_repo(world: &mut AmWorld, slug: String) {
+    let path = world.global_sessions_path();
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("sessions.json not found at {path:?}"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).expect("sessions.json should be valid JSON");
+    if let Some(sessions) = value.get_mut("sessions").and_then(|v| v.as_array_mut()) {
+        for session in sessions {
+            if session.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
+                if let Some(obj) = session.as_object_mut() {
+                    obj.insert(
+                        "repo_root".to_string(),
+                        serde_json::Value::String("/nonexistent/repo".to_string()),
+                    );
+                }
+            }
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).expect("rewrite sessions.json");
+}
+
+/// A session record missing keys that were added after it was written. Everything optional is
+/// stripped, leaving only what the oldest supported record shape carried.
+#[given(expr = "the session {string} is missing its optional fields")]
+async fn given_session_missing_optional_fields(world: &mut AmWorld, slug: String) {
+    let path = world.global_sessions_path();
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("sessions.json not found at {path:?}"));
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).expect("sessions.json should be valid JSON");
+    if let Some(sessions) = value.get_mut("sessions").and_then(|v| v.as_array_mut()) {
+        for session in sessions {
+            if session.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
+                if let Some(obj) = session.as_object_mut() {
+                    for key in ["agent", "container", "auto", "tmux_window_id",
+                                "original_window_name", "original_shell_dir"] {
+                        obj.remove(key);
+                    }
+                }
+            }
+        }
+    }
+    fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).expect("rewrite sessions.json");
+}
+
 #[given("I am using a mock container runtime")]
 async fn given_mock_container(world: &mut AmWorld) {
     world.setup_mock_podman();

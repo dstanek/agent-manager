@@ -1180,6 +1180,89 @@ mod tests {
         ));
     }
 
+    // ── Lockfile lifecycle against a real registry ───────────────────────────
+
+    /// Resolving writes a lockfile that pins what was actually fetched.
+    ///
+    /// Unit tests cover the file's *format*; this covers the part only a registry can answer —
+    /// that the digest recorded is the manifest digest the registry served, and that it is
+    /// recorded under the id the config wrote rather than some normalised variant, which is
+    /// what a later build looks it up by.
+    #[test]
+    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
+    fn resolving_records_the_fetched_digest_in_the_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let id = "localhost:5000/amtest/base:1.0.0";
+
+        let requested = vec![RequestedFeature {
+            reference: oci::parse_ref(id),
+            options: BTreeMap::new(),
+        }];
+        let empty = super::super::lock::Lockfile::default();
+        let mut written = super::super::lock::Lockfile::default();
+        resolve_graph(requested, &config_dir, &empty, &mut written).expect("resolve");
+
+        let entry = written
+            .features
+            .get(id)
+            .unwrap_or_else(|| panic!("nothing recorded for {id}: {:?}", written.features));
+        assert!(
+            entry.integrity.starts_with("sha256:"),
+            "integrity must be a digest: {}",
+            entry.integrity
+        );
+        assert!(
+            entry.resolved.starts_with("localhost:5000/amtest/base@sha256:"),
+            "resolved must qualify the id with the digest: {}",
+            entry.resolved
+        );
+        assert_eq!(
+            written.digest_for(id).map(str::to_string),
+            Some(entry.integrity.clone()),
+            "the digest a later build looks up must be the one just fetched"
+        );
+    }
+
+    /// A lockfile that pins a digest the registry will not serve must fail the build.
+    ///
+    /// This is the assertion that proves the lockfile is *consulted* rather than merely
+    /// written: with a bogus pin, resolution has to ask the registry for content that does not
+    /// exist and refuse, instead of quietly resolving the tag and carrying on. Without it, a
+    /// build could satisfy a lockfile it never read.
+    #[test]
+    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
+    fn a_lockfile_pinning_an_unavailable_digest_fails_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let id = "localhost:5000/amtest/base:1.0.0";
+
+        let mut pinned = super::super::lock::Lockfile::default();
+        pinned.insert(
+            id,
+            super::super::lock::LockEntry {
+                version: Some("1.0.0".to_string()),
+                resolved: format!("localhost:5000/amtest/base@sha256:{}", "0".repeat(64)),
+                integrity: format!("sha256:{}", "0".repeat(64)),
+                depends_on: Vec::new(),
+            },
+        );
+
+        let requested = vec![RequestedFeature {
+            reference: oci::parse_ref(id),
+            options: BTreeMap::new(),
+        }];
+        let mut written = super::super::lock::Lockfile::default();
+        let err = resolve_graph(requested, &config_dir, &pinned, &mut written)
+            .expect_err("a pin the registry cannot serve must not resolve to the tag instead");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("0000000000") || text.to_lowercase().contains("not found"),
+            "the failure should name the digest it could not get: {text}"
+        );
+    }
+
     /// The `dependsOn` differential test, which needs Features that actually declare one.
     ///
     /// Nothing in the common registries does, which is why this went unverified for so long.
