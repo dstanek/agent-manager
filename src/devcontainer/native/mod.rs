@@ -15,6 +15,10 @@ pub mod auth;
 pub mod dockerfile;
 pub mod feature;
 pub mod oci;
+/// An OCI registry that runs inside the test process — see the module's own docs for what it
+/// replaces and, more importantly, what it deliberately does not.
+#[cfg(test)]
+mod test_registry;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1180,87 +1184,137 @@ mod tests {
         ));
     }
 
-    // ── Lockfile lifecycle against a real registry ───────────────────────────
+    // ── Lockfile lifecycle, against the in-process registry ──────────────────
+    //
+    // These needed a published Feature and a reachable registry until the fixture existed. They
+    // now run on every `cargo test`, which matters more than it sounds: the lockfile is what
+    // decides *which code* gets installed and run as root during a build.
 
-    /// Resolving writes a lockfile that pins what was actually fetched.
-    ///
-    /// Unit tests cover the file's *format*; this covers the part only a registry can answer —
-    /// that the digest recorded is the manifest digest the registry served, and that it is
-    /// recorded under the id the config wrote rather than some normalised variant, which is
-    /// what a later build looks it up by.
+    use super::test_registry::{FakeRegistry, Feature as FixtureFeature};
+
+    /// Resolving records the digest that was actually served, under the id the config wrote —
+    /// which is the key a later build looks it up by.
     #[test]
-    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
     fn resolving_records_the_fetched_digest_in_the_lockfile() {
+        let _cache = super::test_registry::CacheDir::new();
+        let registry = FakeRegistry::with_feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"));
+        let id = registry.id("amtest/base", "1.0.0");
         let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().to_path_buf();
-        let id = "localhost:5000/amtest/base:1.0.0";
 
         let requested = vec![RequestedFeature {
-            reference: oci::parse_ref(id),
+            reference: oci::parse_ref(&id),
             options: BTreeMap::new(),
         }];
         let empty = super::super::lock::Lockfile::default();
         let mut written = super::super::lock::Lockfile::default();
-        resolve_graph(requested, &config_dir, &empty, &mut written).expect("resolve");
+        resolve_graph(requested, tmp.path(), &empty, &mut written).expect("resolve");
 
         let entry = written
             .features
-            .get(id)
+            .get(&id)
             .unwrap_or_else(|| panic!("nothing recorded for {id}: {:?}", written.features));
-        assert!(
-            entry.integrity.starts_with("sha256:"),
-            "integrity must be a digest: {}",
-            entry.integrity
+        assert_eq!(
+            entry.integrity,
+            registry.feature("amtest/base").manifest_digest(),
+            "the integrity recorded must be the manifest digest the registry served"
         );
         assert!(
-            entry.resolved.starts_with("localhost:5000/amtest/base@sha256:"),
-            "resolved must qualify the id with the digest: {}",
+            entry.resolved.ends_with(&format!("@{}", entry.integrity)),
+            "resolved must qualify the id with that digest: {}",
             entry.resolved
         );
-        assert_eq!(
-            written.digest_for(id).map(str::to_string),
-            Some(entry.integrity.clone()),
-            "the digest a later build looks up must be the one just fetched"
+        // The counterpart to the locked test below: with nothing pinned, the tag is what gets
+        // asked for. Without this, "the tag was not requested" over there could hold for a
+        // build that made no request at all.
+        assert!(
+            registry.requested("/manifests/1.0.0"),
+            "an unpinned build asks for the tag: {:?}",
+            registry.requests()
         );
     }
 
-    /// A lockfile that pins a digest the registry will not serve must fail the build.
+    /// A build with a lockfile must ask the registry for the *pinned digest*, not the tag.
     ///
-    /// This is the assertion that proves the lockfile is *consulted* rather than merely
-    /// written: with a bogus pin, resolution has to ask the registry for content that does not
-    /// exist and refuse, instead of quietly resolving the tag and carrying on. Without it, a
-    /// build could satisfy a lockfile it never read.
+    /// This is the assertion the real-registry version could not make, and it is the whole
+    /// point of a lockfile: without it a build can satisfy a lockfile it never consulted, and
+    /// two people building the same config get different Features whenever the tag has moved.
     #[test]
-    #[ignore = "needs the local test registry — see scripts/test-registry.sh"]
-    fn a_lockfile_pinning_an_unavailable_digest_fails_the_build() {
+    fn a_locked_build_requests_the_pinned_digest_rather_than_the_tag() {
+        let _cache = super::test_registry::CacheDir::new();
+        let feature = FixtureFeature::simple("amtest/base", "1.0.0", "base");
+        let digest = feature.manifest_digest().to_string();
+        let registry = FakeRegistry::with_feature(feature);
+        let id = registry.id("amtest/base", "1.0.0");
         let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().to_path_buf();
-        let id = "localhost:5000/amtest/base:1.0.0";
 
-        let mut pinned = super::super::lock::Lockfile::default();
-        pinned.insert(
-            id,
+        let mut lock = super::super::lock::Lockfile::default();
+        lock.insert(
+            &id,
             super::super::lock::LockEntry {
                 version: Some("1.0.0".to_string()),
-                resolved: format!("localhost:5000/amtest/base@sha256:{}", "0".repeat(64)),
-                integrity: format!("sha256:{}", "0".repeat(64)),
+                resolved: format!("{}/amtest/base@{digest}", registry.host()),
+                integrity: digest.clone(),
                 depends_on: Vec::new(),
             },
         );
 
         let requested = vec![RequestedFeature {
-            reference: oci::parse_ref(id),
+            reference: oci::parse_ref(&id),
             options: BTreeMap::new(),
         }];
         let mut written = super::super::lock::Lockfile::default();
-        let err = resolve_graph(requested, &config_dir, &pinned, &mut written)
-            .expect_err("a pin the registry cannot serve must not resolve to the tag instead");
+        resolve_graph(requested, tmp.path(), &lock, &mut written).expect("resolve");
 
-        let text = err.to_string();
         assert!(
-            text.contains("0000000000") || text.to_lowercase().contains("not found"),
-            "the failure should name the digest it could not get: {text}"
+            registry.requested(&format!("/manifests/{digest}")),
+            "the pinned digest was never requested: {:?}",
+            registry.requests()
         );
+        assert!(
+            !registry.requested("/manifests/1.0.0"),
+            "the tag was requested despite a lockfile pinning a digest: {:?}",
+            registry.requests()
+        );
+    }
+
+    /// `dependsOn` resolved over the wire: a config naming one Feature installs two.
+    ///
+    /// There is already an offline version of this over local Features. This one is different
+    /// in the part that matters — the dependency is declared in a *manifest annotation* fetched
+    /// from a registry, which is the path every real config takes and the one the resolver's
+    /// worklist actually walks.
+    #[test]
+    fn depends_on_over_a_registry_pulls_in_a_feature_the_config_never_named() {
+        let _cache = super::test_registry::CacheDir::new();
+        let registry = FakeRegistry::builder()
+            .feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"))
+            // The dependency has to name the base by an id carrying this registry's port, which
+            // only exists once the listener is bound.
+            .start_with(|host| {
+                vec![FixtureFeature::new(
+                    "amtest/needs-base",
+                    "1.0.0",
+                    &format!(
+                        r#"{{"id":"needs-base","version":"1.0.0","dependsOn":{{"{host}/amtest/base:1.0.0":{{}}}}}}"#
+                    ),
+                )]
+            });
+        let tmp = tempfile::tempdir().unwrap();
+
+        let requested = vec![RequestedFeature {
+            reference: oci::parse_ref(&registry.id("amtest/needs-base", "1.0.0")),
+            options: BTreeMap::new(),
+        }];
+        let empty = super::super::lock::Lockfile::default();
+        let mut written = super::super::lock::Lockfile::default();
+        let resolved = resolve_graph(requested, tmp.path(), &empty, &mut written).expect("resolve");
+
+        let ids: Vec<String> = resolved.iter().map(|(f, _)| f.reference.raw.clone()).collect();
+        assert_eq!(ids.len(), 2, "the dependency should have been pulled in: {ids:?}");
+        assert!(ids.iter().any(|i| i.contains("needs-base")), "{ids:?}");
+        assert!(ids.iter().any(|i| i.ends_with("amtest/base:1.0.0")), "{ids:?}");
+        // Both must be recorded, or a later locked build would re-resolve the dependency's tag.
+        assert_eq!(written.features.len(), 2, "lockfile entries: {:?}", written.features);
     }
 
     /// The `dependsOn` differential test, which needs Features that actually declare one.

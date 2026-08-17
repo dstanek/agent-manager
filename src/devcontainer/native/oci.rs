@@ -949,69 +949,161 @@ mod tests {
         assert!(err.contains(&actual), "must show the actual digest: {err}");
     }
 
-    /// Answers exactly one HTTP request with a canned body, then closes. Enough to exercise
-    /// `get_with_auth` against a registry that returns content not matching what was requested
-    /// by digest, without a real registry or an HTTP-mocking dependency.
-    fn respond_once(body: Vec<u8>) -> std::net::SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(&body);
-            }
-        });
-        addr
+    // ── Against the in-process registry ──────────────────────────────────────
+    //
+    // These used to need a container, a published Feature and a working host network. They
+    // now need a TcpListener. See `test_registry` for what that does and does not replace.
+
+    use super::super::test_registry::{
+        base64_encode, Auth, CacheDir, EnvVarGuard, FakeRegistry, Fault, Feature as FixtureFeature,
+    };
+
+    /// The whole anonymous path: manifest, its annotation, and the layer behind it.
+    #[test]
+    fn a_feature_is_fetched_from_a_registry_end_to_end() {
+        let _cache = CacheDir::new();
+        let registry = FakeRegistry::with_feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"));
+        let feature = parse_ref(&registry.id("amtest/base", "1.0.0"));
+
+        let manifest = fetch_manifest(&feature).expect("fetch manifest");
+        assert_eq!(manifest.digest, registry.feature("amtest/base").manifest_digest());
+        assert_eq!(
+            manifest.feature_metadata(),
+            Some(registry.feature("amtest/base").metadata()),
+            "the metadata annotation must survive the round trip"
+        );
+
+        let layer = manifest.feature_layer().expect("a Feature layer");
+        let dir = fetch_layer(&feature, layer, &oci_cache_root()).expect("fetch layer");
+        assert!(dir.join("devcontainer-feature.json").is_file());
+        assert!(dir.join("install.sh").is_file());
     }
 
-    /// A digest-pinned manifest reference — the lockfile's whole mechanism — asks a registry for
-    /// specific content by address. A registry that answers with something else must be refused,
-    /// not installed: this is the case the review that prompted this test found unguarded.
+    fn oci_cache_root() -> PathBuf {
+        cache_root()
+    }
+
+    /// A registry that answers 401 with a bearer challenge must be followed to its token
+    /// endpoint and retried — the flow ghcr and Docker Hub both use.
+    #[test]
+    fn a_bearer_challenge_is_followed_to_the_token_endpoint() {
+        let _cache = CacheDir::new();
+        let registry = FakeRegistry::builder()
+            .feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"))
+            .auth(Auth::Bearer { token: "fixture-token".to_string(), require_credentials: false })
+            .start();
+        let feature = parse_ref(&registry.id("amtest/base", "1.0.0"));
+
+        fetch_manifest(&feature).expect("the challenge should have been followed");
+
+        assert!(
+            registry.requested("/token"),
+            "the token endpoint was never called: {:?}",
+            registry.requests()
+        );
+    }
+
+    /// Basic credentials come from the auth file `docker login`/`podman login` write.
+    ///
+    /// The registry demands Basic and the credential is only ever written to a file — never
+    /// handed to `am` directly — so this exercises the lookup, not just the header. It is the
+    /// half of the private-registry story that needs no real registry; a genuine `docker login`
+    /// against a genuine htpasswd registry stays in the integration tier.
+    #[test]
+    fn basic_credentials_are_read_from_the_auth_file_when_the_registry_demands_them() {
+        let _cache = CacheDir::new();
+        let registry = FakeRegistry::builder()
+            .feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"))
+            .auth(Auth::Basic { user: "amtest".to_string(), password: "hunter2".to_string() })
+            .start();
+
+        let home = tempfile::tempdir().unwrap();
+        let auth_path = home.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            format!(
+                r#"{{"auths":{{"{host}":{{"auth":"{encoded}"}}}}}}"#,
+                host = registry.host(),
+                encoded = base64_encode(b"amtest:hunter2"),
+            ),
+        )
+        .unwrap();
+        // Set before the first lookup: credentials are memoised per registry, and each fixture
+        // binds its own port, so no other test's cache entry can satisfy this one.
+        let _env = EnvVarGuard::set("REGISTRY_AUTH_FILE", &auth_path);
+
+        let feature = parse_ref(&registry.id("amtest/base", "1.0.0"));
+        fetch_manifest(&feature).expect("the stored credential should have been found and sent");
+    }
+
+    /// The same registry, with no credential to find, must fail rather than half-succeed.
+    #[test]
+    fn a_registry_demanding_basic_fails_clearly_with_no_credentials() {
+        let _cache = CacheDir::new();
+        let registry = FakeRegistry::builder()
+            .feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"))
+            .auth(Auth::Basic { user: "amtest".to_string(), password: "hunter2".to_string() })
+            .start();
+        let empty = tempfile::tempdir().unwrap();
+        let auth_path = empty.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"auths":{}}"#).unwrap();
+        let _env = EnvVarGuard::set("REGISTRY_AUTH_FILE", &auth_path);
+
+        let feature = parse_ref(&registry.id("amtest/base", "1.0.0"));
+        let err = fetch_manifest(&feature).unwrap_err().to_string();
+
+        assert!(
+            err.contains(&registry.host()),
+            "the error should name the registry that refused: {err}"
+        );
+        assert!(
+            !err.contains("hunter2"),
+            "no credential material may appear in an error: {err}"
+        );
+    }
+
+    /// A manifest whose bytes do not hash to the digest that addressed them must be refused.
+    ///
+    /// The fixture serves *valid JSON* with the wrong bytes on purpose: a client that only
+    /// notices corruption by failing to parse would pass this while installing whatever it was
+    /// sent.
     #[test]
     fn a_manifest_that_does_not_match_its_pinned_digest_is_rejected() {
-        let addr = respond_once(br#"{"layers":[],"annotations":{}}"#.to_vec());
-        let feature = parse_ref(&format!(
-            "127.0.0.1:{}/some/feature@sha256:{}",
-            addr.port(),
-            "0".repeat(64)
-        ));
+        let _cache = CacheDir::new();
+        let good = FixtureFeature::simple("amtest/base", "1.0.0", "base");
+        let digest = good.manifest_digest().to_string();
+        let registry = FakeRegistry::builder()
+            .feature(good)
+            .fault(Fault::CorruptManifest)
+            .start();
+        let feature = parse_ref(&registry.id_at_digest("amtest/base", &digest));
         assert!(feature.digest.is_some(), "must be read as digest-pinned");
 
         let err = fetch_manifest(&feature).unwrap_err().to_string();
         assert!(err.contains("failed integrity verification"), "got: {err}");
-        assert!(err.contains(&format!("sha256:{}", "0".repeat(64))), "got: {err}");
+        assert!(err.contains(&digest), "the error must name the digest asked for: {err}");
     }
 
-    /// A blob request is always content-addressed, so unlike the manifest this has no "no digest
-    /// pinned" escape hatch — every layer must be verified. On a mismatch, nothing may be cached:
-    /// a later successful build must not find a stale, wrong directory sitting under its digest.
+    /// The same for a layer, which is always digest-addressed — and nothing may be cached.
     #[test]
     fn a_layer_that_does_not_match_its_digest_is_rejected_and_never_cached() {
-        let addr = respond_once(b"not the bytes the manifest promised".to_vec());
-        let feature = parse_ref(&format!("127.0.0.1:{}/some/feature:1", addr.port()));
+        let _cache = CacheDir::new();
+        let registry = FakeRegistry::builder()
+            .feature(FixtureFeature::simple("amtest/base", "1.0.0", "base"))
+            .fault(Fault::CorruptBlob)
+            .start();
+        let feature = parse_ref(&registry.id("amtest/base", "1.0.0"));
         let layer = Layer {
             media_type: "application/vnd.devcontainers.layer.v1+tar".to_string(),
-            digest: format!("sha256:{}", "0".repeat(64)),
+            digest: registry.feature("amtest/base").layer_digest().to_string(),
         };
         let cache = tempfile::tempdir().unwrap();
 
         let err = fetch_layer(&feature, &layer, cache.path()).unwrap_err().to_string();
-        assert!(err.contains("failed integrity verification"), "got: {err}");
 
+        assert!(err.contains("failed integrity verification"), "got: {err}");
         let cached_dir = cache.path().join(layer.digest.replace(':', "-"));
         assert!(!cached_dir.exists(), "a mismatched layer must not be cached at all");
-        assert!(
-            !cached_dir.join(".am-complete").exists(),
-            "must never be marked complete"
-        );
     }
 
     /// The direct-tarball path, end to end: fetch over real HTTPS, unpack, hash.
