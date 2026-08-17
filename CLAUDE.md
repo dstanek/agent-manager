@@ -25,6 +25,20 @@ make build-copilot       # Build Copilot Docker image
 - Tests mutating env vars use a mutex to serialize execution
 - The `cucumber` crate's `{string}` capture does not unescape *any* backslash sequence — not `\"`, not `\x1b`, not `\n` inside a `Then`/`And` assertion (as opposed to a `Given .. containing "..."` step, whose handler unescapes manually before writing a file — see e.g. `given_project_config`). A step written as `does not contain "agent = \"codex\""` or `does not contain "\x1b[2m"` compares against the literal backslash characters, which real output never contains, so it passes whether or not the thing it's meant to catch is present — a silently vacuous assertion (confirmed twice: once for `\"`, once for `\x1b` in `init.feature`, which stayed green through injected dimming it was written to catch). Fixes differ by what's being escaped: a double quote in the *expected* text — use single-quoted Gherkin strings (`does not contain 'agent = "codex"'`); an ANSI escape byte — compare the real `\u{1b}` byte in a dedicated Rust step function instead of through `{string}` (see `then_output_contains_dimmed_line`/`then_output_contains_plain_line`/`then_output_contains_note_line` in `tests/cucumber.rs`, and force color on for the scenario via `Given I have set env "NO_COLOR" to ""` + `And I have set env "CLICOLOR_FORCE" to "1"`, since the harness's default `NO_COLOR=1` never emits color to check in the first place).
 - The pty-based interactive test harness (`run_am_pty` in `tests/cucumber.rs`) gives `am` a real pty via `script`; a scripted input line missing its trailing `\n` leaves the child blocked forever in canonical-mode `read()` rather than failing fast.
+- Tests that need infrastructure are selected by cargo feature, not by `--ignored`: `integration-cli`
+  (the reference CLI, a runtime, real image pulls), `integration-registry` (the local registries
+  from `scripts/test-registry.sh`), `integration-network` (a public HTTPS fetch), and
+  `integration-compose` (a working Compose provider); `integration` turns on all four, and
+  `make test-integration*` wraps them. Without the feature the test is `#[ignore]`d with a message
+  naming the feature it wants, so `cargo test` is runnable anywhere and a developer opts into
+  exactly the infrastructure they have. The tests still *compile* in every configuration, which is
+  what keeps them from rotting — `cargo clippy --all-targets --all-features` is the check that
+  proves it. What must stay in a tier rather than move to a fixture: anything whose value is
+  agreement with the real reference implementation.
+- Most registry behaviour needs no infrastructure at all: `src/devcontainer/native/test_registry.rs`
+  serves Features over HTTP from inside the test process, including a bearer challenge, Basic auth,
+  and content that deliberately does not match its digest. It also records request paths, which is
+  how a test can tell a build that consulted its lockfile from one that resolved the tag.
 - Some Feature paths cannot be tested against the public registries at all — nothing published
   there declares `dependsOn`, and none of them is private. `scripts/test-registry.sh up` stands
   up what those tests need: a local `registry:2` with `tests/fixtures/registry/*` published to
@@ -45,7 +59,7 @@ make build-copilot       # Build Copilot Docker image
 - The tarball Feature fixture is committed and served over GitHub's HTTPS rather than locally:
   `ureq` verifies against a bundled root store, so no locally issued certificate can be trusted,
   and `am` accepts no other scheme. See `tests/fixtures/tarball/README.md`.
-- The `devcontainer.metadata` label is the entire contract between the two image builders, so the `#[ignore]`d differential tests in `src/devcontainer/native/mod.rs` are what keep `am`'s own builder honest: they build the same config both ways and compare the label. Run them with `cargo test --bin am -- --ignored` (needs Docker, network, and the reference CLI on `PATH`). Set `AM_TEST_NO_CACHE=1` when the result matters — the runtime's layer cache survives `builder prune -af` and will finish a "passing" run in a couple of seconds without building anything. For anything about **install order**, reach for `devcontainer features resolve-dependencies` instead: it prints the CLI's resolved order without building, so the check costs a few manifest GETs rather than minutes.
+- The `devcontainer.metadata` label is the entire contract between the two image builders, so the `#[ignore]`d differential tests in `src/devcontainer/native/mod.rs` are what keep `am`'s own builder honest: they build the same config both ways and compare the label. Run them with `cargo test --features integration-cli` (needs Docker, network, and the reference CLI on `PATH`). Set `AM_TEST_NO_CACHE=1` when the result matters — the runtime's layer cache survives `builder prune -af` and will finish a "passing" run in a couple of seconds without building anything. For anything about **install order**, reach for `devcontainer features resolve-dependencies` instead: it prints the CLI's resolved order without building, so the check costs a few manifest GETs rather than minutes.
 - `run_am`/`run_am_with_input`/`run_am_pty` all set `NO_COLOR=1` on the child unconditionally, since `color::enabled` honours a developer's ambient `CLICOLOR_FORCE=1` even for a piped stdout. Without it, a `contains`/`does not contain` assertion on a severity-prefixed line (e.g. `Note: ...`) passes in a plain environment but fails the moment a developer has `CLICOLOR_FORCE=1` set — CI stays green, so it looks like *their* change broke something.
 
 **After every code change:** run `cargo test` and `cargo clippy --all-targets -- -D warnings`. Fix any failures before proceeding. `--all-targets` matters — without it clippy skips test code, which is what CI lints.

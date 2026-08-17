@@ -809,7 +809,10 @@ mod tests {
     /// vs `--workdir`, `cap_add` vs `--cap-add`, environment as a map rather than a list. Only
     /// the real tool can say. Ignored by default because it needs a container runtime.
     #[test]
-    #[ignore = "needs a container runtime"]
+    #[cfg_attr(
+        not(feature = "integration-compose"),
+        ignore = "needs --features integration-compose — a working Compose provider"
+    )]
     fn the_generated_override_satisfies_composes_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("docker-compose.yml");
