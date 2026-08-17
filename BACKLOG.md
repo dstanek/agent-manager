@@ -736,6 +736,23 @@ Follow-ups the native builder left behind:
       the identical policy rather than being a way around it. `am`'s own mounts (worktree, VCS
       data, credentials) never go through this — they come from `ContainerMounts`, not the
       devcontainer config, and were not touched.
+- [x] **Opted-in `initializeCommand` was never executed.** Done 2026-08-17.
+      `check_host_commands` stopped refusing the config once `allow_host_commands = true`, but
+      nothing then ran the command — `plan_devcontainer` went straight from the check to image
+      naming, and `initializeCommand` is deliberately absent from the metadata label, so the
+      normal in-container hook path could never pick it up either. A devcontainer that relied on
+      host preparation — generating a file the build expects, fetching a host-side artifact —
+      silently ran with that step skipped, which is worse than the refusal it replaced: the user
+      had explicitly opted in and had no sign anything was missing. `run_initialize_command` now
+      runs it for real, after the worktree exists and before any image work, with the worktree as
+      its working directory: a shell string through `sh -c`, an array as `argv` with no shell in
+      between (quoting an element through a shell would reopen the injection the array form
+      exists to avoid), and a named object's members concurrently, failing the step if any one of
+      them does — the same semantics the in-container hooks already give the other lifecycle
+      properties, translated to host processes instead of a shell script. A non-zero exit fails
+      the session before any image work starts and rolls back the worktree, the same as a failed
+      build. `skip_lifecycle` does not reach it: that flag is documented, and named, as skipping
+      the in-container hooks, and this is the one hook that is not one of those.
 - [ ] **`allow_host_commands` now gates five things, not one** — `initializeCommand`
       (a host command, matching the name) plus `privileged`, `capAdd`, `securityOpt`, `runArgs`,
       and now untrusted bind mounts (runtime escalation and isolation-boundary decisions, not

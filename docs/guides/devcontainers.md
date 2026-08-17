@@ -169,6 +169,19 @@ otherwise:
 allow_host_commands = true
 ```
 
+With the flag set, `am` runs it for real: after the session worktree is created, before the
+image is built, with the worktree as its working directory. A shell string runs through `sh
+-c`; an array runs as `argv` with no shell in between, so an element containing `&&` or a
+space reaches the program literally rather than being reinterpreted — the reason the array
+form exists at all; an object runs its named members concurrently and fails the step if any
+one of them does. A non-zero exit stops the session before any image work starts, and rolls
+back the worktree the same way a failed build does. `am` prints a note naming
+`initializeCommand` immediately before running it, since this is the one point in a session
+start that runs outside every isolation boundary `am` otherwise provides.
+
+`devcontainer.skip_lifecycle` does not reach this hook: it is documented as skipping the
+in-container hooks, and `initializeCommand` is deliberately the one that is not one of those.
+
 The delegated build cannot run it either: `devcontainer build` neither executes
 `initializeCommand` nor records it in the image, so the only host-side execution in
 devcontainer mode is `am`'s own.

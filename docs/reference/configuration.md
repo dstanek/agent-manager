@@ -306,6 +306,12 @@ image, and an unchanged config skips the build entirely.
     `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, `securityOpt`, and
     `runArgs`; without it those are dropped with a note rather than failing the session.
 
+    With the flag set, `am` runs the command after the session worktree exists and before any
+    image build, with the worktree as its working directory. A non-zero exit fails the session
+    start and rolls back the worktree, the same as a failed build. `skip_lifecycle` does not
+    suppress it — that flag is scoped to the in-container hooks below, and this is the one hook
+    that is not one of those.
+
 !!! danger "`mounts` and `workspaceMount` can name arbitrary host paths"
     A config's `mounts` (and any a Feature contributes) are bind mounts by default and
     read-write unless marked otherwise — `{"type": "bind", "source": "/", "target": "/host"}`
