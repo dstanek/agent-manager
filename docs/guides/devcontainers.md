@@ -158,7 +158,8 @@ publish conflict.
 ## Trust
 
 A `devcontainer.json` is code, it lives in the repo, and it arrives with a `git pull` — while
-`am` exists to *isolate* agents. Two things follow.
+`am` exists to *isolate* agents. Three things follow, each gated by its own flag: opting into
+one does not opt into the others.
 
 **`initializeCommand` runs on your host.** It is the one lifecycle hook that executes outside
 the container, on your machine, with your privileges. `am` refuses to run it unless you say
@@ -187,20 +188,33 @@ The delegated build cannot run it either: `devcontainer build` neither executes
 devcontainer mode is `am`'s own.
 
 **Escalating options are dropped, not honoured.** `privileged`, `capAdd`, `securityOpt`, and
-`runArgs` are ignored by default, with a note on stderr saying what was skipped. The same
-`allow_host_commands` flag grants them. Dropping rather than failing is deliberate — most
-containers work fine without `privileged`, and refusing to start over a capability the
-session may not need would be worse than starting without it.
+`runArgs` are ignored by default, with a note on stderr saying what was skipped:
+
+```toml
+[devcontainer]
+allow_runtime_escalation = true
+```
+
+Dropping rather than failing is deliberate — most containers work fine without `privileged`,
+and refusing to start over a capability the session may not need would be worse than starting
+without it. This is a separate flag from `allow_host_commands` above: opting a repo's
+`initializeCommand` in does not also opt its `privileged` request in.
 
 **A bind mount outside the worktree is dropped too.** `mounts` — from `devcontainer.json` or a
 Feature — and `workspaceMount` are otherwise just handed to the container runtime, and a bind
 mount's source can name *any* host path: `{"type": "bind", "source": "/", "target": "/host"}`
 is a valid mount and would give the container read-write access to your whole filesystem.
-Without `allow_host_commands = true`, `am` only keeps a bind mount whose source resolves —
-after symlinks and `${...}` substitution — inside the session worktree; everything else is
-dropped with a note naming the source. Named volumes and `tmpfs` mounts carry no host path, so
-they are always kept. This is the same gate as the escalating options above, and the same
-`allow_host_commands` flag opts back in.
+Without
+
+```toml
+[devcontainer]
+allow_host_mounts = true
+```
+
+`am` only keeps a bind mount whose source resolves — after symlinks and `${...}` substitution —
+inside the session worktree; everything else is dropped with a note naming the source. Named
+volumes and `tmpfs` mounts carry no host path, so they are always kept. This is a third,
+independent gate: neither `allow_host_commands` nor `allow_runtime_escalation` grants it.
 
 Note also what devcontainer mode means for credentials: `~/.ssh` and your agent's config get
 mounted into an image the *repo* defines. That is the same exposure as a custom

@@ -949,6 +949,51 @@ async fn given_initialize_command_failing_config(world: &mut AmWorld) {
     );
 }
 
+/// `runArgs` is one of the runtime-escalation options (`privileged`, `capAdd`, `securityOpt`,
+/// `runArgs`) gated by `allow_runtime_escalation` — distinct from `allow_host_commands`, which
+/// covers `initializeCommand` only.
+#[given("the repo has a devcontainer config with runArgs")]
+async fn given_run_args_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        r#"{"name":"test","image":"debian:bookworm","runArgs":["--network=host"]}"#,
+    );
+}
+
+/// A bind mount whose source resolves outside the session worktree, gated by
+/// `allow_host_mounts` — distinct from both `allow_host_commands` and
+/// `allow_runtime_escalation`. The source has to be a real, absolute path computed at test time
+/// (a sibling of the project directory, so it is outside the worktree under it), since the config
+/// itself is committed to git and cannot embed a path that does not exist until the test runs.
+///
+/// Like the userEnvProbe and postAttachCommand steps, `mounts` reaches the run path through the
+/// image's metadata label, not by re-reading the config — the mock builder never actually
+/// computes one from the config it's handed, so the label has to be written by hand here too.
+#[given("the repo has a devcontainer config with a mount outside the worktree")]
+async fn given_outside_mount_config(world: &mut AmWorld) {
+    let outside = world
+        .project_path()
+        .parent()
+        .expect("project dir has a parent")
+        .join("outside-secret");
+    fs::create_dir_all(&outside).expect("create the outside-the-worktree directory");
+    let mount_spec = format!("source={},target=/host-secret,type=bind", outside.display());
+    let config = format!(
+        r#"{{"name":"test","image":"debian:bookworm","mounts":["{mount_spec}"]}}"#,
+    );
+    world.write_devcontainer_config(&config);
+    let label = world
+        .mock_label_file
+        .as_ref()
+        .expect("mock container runtime was not set up for this scenario");
+    fs::write(
+        label,
+        format!(
+            r#"[{{"entrypoint":"/usr/local/share/init.sh","remoteUser":"vscode","mounts":["{mount_spec}"]}}]"#
+        ),
+    )
+    .expect("write label file");
+}
+
 #[when(expr = "I run {string}")]
 async fn when_run(world: &mut AmWorld, cmd: String) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();

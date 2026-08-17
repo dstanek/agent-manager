@@ -104,6 +104,65 @@ Feature: Dev container sessions
     And the worktree ".am/worktrees/my-feature" does not exist
     And the session file does not contain "my-feature"
 
+  # runArgs is a runtime-escalation option (alongside privileged, capAdd, securityOpt), gated
+  # by its own flag — not the one that gates initializeCommand.
+  Scenario: runArgs is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with runArgs
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "ignoring runArgs"
+    And the output contains "allow_runtime_escalation"
+    And the mock tmux log does not contain "--network=host"
+
+  Scenario: an allowed runArgs is passed to the container runtime
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with runArgs
+    And a project config containing "[devcontainer]\nallow_runtime_escalation = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "--network=host"
+
+  # allow_host_commands alone must not also grant the runtime-escalation options — the whole
+  # point of splitting what used to be one flag into three.
+  Scenario: allow_host_commands alone does not grant runArgs
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with runArgs
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "ignoring runArgs"
+    And the mock tmux log does not contain "--network=host"
+
+  # A bind mount whose source resolves outside the session worktree is a direct escape from
+  # the isolation am exists to provide, gated by its own flag.
+  Scenario: a bind mount outside the worktree is dropped by default
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a mount outside the worktree
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not mounting"
+    And the output contains "allow_host_mounts"
+    And the mock tmux log does not contain "/host-secret"
+
+  Scenario: an allowed outside-worktree mount is passed to the container runtime
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a mount outside the worktree
+    And a project config containing "[devcontainer]\nallow_host_mounts = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the mock tmux log contains "/host-secret"
+
+  # allow_runtime_escalation alone must not also grant an outside-worktree mount.
+  Scenario: allow_runtime_escalation alone does not grant an outside-worktree mount
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with a mount outside the worktree
+    And a project config containing "[devcontainer]\nallow_runtime_escalation = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "not mounting"
+    And the mock tmux log does not contain "/host-secret"
+
   # container.mode defaults to "auto", so a repo that describes its environment gets it
   # used with no configuration at all. This is the scenario that would catch the default
   # being flipped back by accident.

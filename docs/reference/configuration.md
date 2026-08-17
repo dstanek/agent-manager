@@ -117,6 +117,8 @@ Environment variables override both the global and project configs and are usefu
 | `AM_DEVCONTAINER_PATH` | `devcontainer.path` | path relative to the worktree | `AM_DEVCONTAINER_PATH=.devcontainer/ci.json` |
 | `AM_DEVCONTAINER_AGENT_INSTALL` | `devcontainer.agent_install` | `feature`, `bootstrap`, `none`, `auto` | `AM_DEVCONTAINER_AGENT_INSTALL=none` |
 | `AM_DEVCONTAINER_ALLOW_HOST_COMMANDS` | `devcontainer.allow_host_commands` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_DEVCONTAINER_ALLOW_HOST_COMMANDS=true` |
+| `AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION` | `devcontainer.allow_runtime_escalation` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION=true` |
+| `AM_DEVCONTAINER_ALLOW_HOST_MOUNTS` | `devcontainer.allow_host_mounts` | `true`/`1`/`yes`, `false`/`0`/`no` | `AM_DEVCONTAINER_ALLOW_HOST_MOUNTS=true` |
 | `CLAUDE_CONFIG_DIR` | (none) | directory path | `CLAUDE_CONFIG_DIR=/custom/.claude` |
 
 !!! note "Mount path customization"
@@ -272,7 +274,9 @@ reference CLI rejects too, and it is reported as the error it is.
 |---|---|---|---|---|
 | `path` | path | `""` | Explicit `devcontainer.json`, relative to the session worktree; unset means discover | Any path inside the worktree |
 | `agent_install` | string | `"auto"` | How the agent gets into the image | `"feature"`, `"bootstrap"`, `"none"`, `"auto"` |
-| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, `securityOpt`, `runArgs`, and bind mounts to a host path outside the worktree are honoured | `true`, `false` |
+| `allow_host_commands` | boolean | `false` | Whether `initializeCommand` may run on the host | `true`, `false` |
+| `allow_runtime_escalation` | boolean | `false` | Whether `privileged`, `capAdd`, `securityOpt`, and `runArgs` are honoured | `true`, `false` |
+| `allow_host_mounts` | boolean | `false` | Whether a bind mount (or `workspaceMount`) whose source resolves outside the session worktree is honoured | `true`, `false` |
 | `skip_lifecycle` | boolean | `false` | Skip `postCreateCommand` and the other in-container hooks | `true`, `false` |
 | `home` | path | `""` | Override the container home derived from `remoteUser` | Any absolute path |
 | `extra_features` | table | `{}` | Extra Features to inject at build time, as `id = options-JSON` | e.g. `"ghcr.io/devcontainers/features/node:1" = "{}"` |
@@ -303,8 +307,9 @@ image, and an unchanged config skips the build entirely.
     Of the six lifecycle hooks, `initializeCommand` is the only one that runs outside the
     container — on your machine, with your privileges — and `devcontainer.json` is
     repo-controlled code that arrives with a `git pull`. `am` refuses to run it unless
-    `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, `securityOpt`, and
-    `runArgs`; without it those are dropped with a note rather than failing the session.
+    `allow_host_commands = true`. `privileged`, `capAdd`, `securityOpt`, `runArgs`, and
+    untrusted bind mounts are separate, independent gates — see below — so opting into
+    `initializeCommand` does not also opt into any of those.
 
     With the flag set, `am` runs the command after the session worktree exists and before any
     image build, with the worktree as its working directory. A non-zero exit fails the session
@@ -312,16 +317,26 @@ image, and an unchanged config skips the build entirely.
     suppress it — that flag is scoped to the in-container hooks below, and this is the one hook
     that is not one of those.
 
+!!! danger "`privileged`, `capAdd`, `securityOpt`, and `runArgs` hand the container new authority"
+    These four options widen what the container can do to the host's kernel, independent of
+    whether `initializeCommand` is trusted. `am` drops them by default, with a note on stderr
+    naming what was skipped, unless `allow_runtime_escalation = true`. Dropping rather than
+    failing is deliberate — most containers still work without `privileged`, and refusing to
+    start over a capability the session may not even need would be worse than starting without
+    it.
+
 !!! danger "`mounts` and `workspaceMount` can name arbitrary host paths"
     A config's `mounts` (and any a Feature contributes) are bind mounts by default and
     read-write unless marked otherwise — `{"type": "bind", "source": "/", "target": "/host"}`
     is valid `devcontainer.json`, and would hand a container read-write access to the whole
-    host filesystem. Without `allow_host_commands = true`, `am` only honours a bind mount whose
+    host filesystem. Without `allow_host_mounts = true`, `am` only honours a bind mount whose
     source resolves (after following symlinks and any `${...}` substitution) inside the
     session worktree; everything else — the host's `$HOME`, a sibling repository, `/` itself —
     is dropped with a note naming the source and the setting that would allow it. Named
     volumes and `tmpfs` mounts expose no host path, so they are never gated. `workspaceMount`
     goes through the same check: it can safely repoint the worktree, but not any other path.
+    This is a separate gate from `allow_host_commands` and `allow_runtime_escalation` above —
+    trusting one does not trust the others.
 
 **Lifecycle hooks.** `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, and
 `postStartCommand` run inside the container before the agent starts. Because `am` runs

@@ -1285,6 +1285,8 @@ pub fn render_global_config_skeleton() -> &'static str {
 # cli = "devcontainer"        # CLI binary name or path
 # agent_install = "auto"      # "feature" | "bootstrap" | "none" | "auto"
 # allow_host_commands = false # let initializeCommand run on YOUR HOST — off by default
+# allow_runtime_escalation = false # let privileged, capAdd, securityOpt, and runArgs apply
+# allow_host_mounts = false   # honour a bind mount whose source is outside the worktree
 # skip_lifecycle = false      # skip postCreateCommand and the other in-container hooks
 "#
 }

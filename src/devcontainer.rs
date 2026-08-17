@@ -1536,7 +1536,7 @@ fn resolve_for_trust(path: &Path) -> Option<PathBuf> {
 }
 
 /// Whether a repo-declared bind mount's source may be honoured without
-/// `devcontainer.allow_host_commands`.
+/// `devcontainer.allow_host_mounts`.
 ///
 /// Trusted means its canonical location sits inside the session worktree — `am`'s own mounts
 /// (worktree, VCS data, credentials) do not go through this at all, so this is only ever
@@ -1584,7 +1584,7 @@ fn filter_untrusted_mounts(
             }
             eprintln!(
                 "{note} not mounting {source} from this devcontainer — it is outside the \
-                 session worktree. Set devcontainer.allow_host_commands = true if you trust \
+                 session worktree. Set devcontainer.allow_host_mounts = true if you trust \
                  this repository's config and want to allow it."
             );
             false
@@ -1603,7 +1603,8 @@ pub fn apply_trust(
     cfg: &crate::config::Config,
     worktree: &Path,
 ) -> crate::container::DevcontainerRuntime {
-    let allow = cfg.devcontainer.allow_host_commands;
+    let allow_escalation = cfg.devcontainer.allow_runtime_escalation;
+    let allow_mounts = cfg.devcontainer.allow_host_mounts;
     let mut env: Vec<(String, String)> = resolved
         .container_env
         .iter()
@@ -1643,7 +1644,7 @@ pub fn apply_trust(
     }
     // Applied after workspaceMount is folded in, so a substituted external path cannot use it
     // as a loophole around the same policy every other repo-declared bind mount is subject to.
-    let mounts = filter_untrusted_mounts(mounts, worktree, allow);
+    let mounts = filter_untrusted_mounts(mounts, worktree, allow_mounts);
 
     let mut runtime = crate::container::DevcontainerRuntime {
         env,
@@ -1708,7 +1709,7 @@ pub fn apply_trust(
         );
     }
 
-    if allow {
+    if allow_escalation {
         runtime.privileged = resolved.privileged;
         runtime.cap_add = resolved.cap_add.clone();
         runtime.security_opt = resolved.security_opt.clone();
@@ -1718,24 +1719,27 @@ pub fn apply_trust(
         if resolved.privileged {
             eprintln!(
                 "{note} this devcontainer asks for --privileged; am is not granting it. \
-                 Set devcontainer.allow_host_commands = true to allow it."
+                 Set devcontainer.allow_runtime_escalation = true to allow it."
             );
         }
         if !resolved.cap_add.is_empty() {
             eprintln!(
-                "{note} not granting capabilities requested by this devcontainer: {}",
+                "{note} not granting capabilities requested by this devcontainer: {}. \
+                 Set devcontainer.allow_runtime_escalation = true to allow it.",
                 resolved.cap_add.join(", ")
             );
         }
         if !resolved.security_opt.is_empty() {
             eprintln!(
-                "{note} not granting security options requested by this devcontainer: {}",
+                "{note} not granting security options requested by this devcontainer: {}. \
+                 Set devcontainer.allow_runtime_escalation = true to allow it.",
                 resolved.security_opt.join(", ")
             );
         }
         if !resolved.run_args.is_empty() {
             eprintln!(
-                "{note} ignoring runArgs from this devcontainer: {}",
+                "{note} ignoring runArgs from this devcontainer: {}. Set \
+                 devcontainer.allow_runtime_escalation = true to allow it.",
                 resolved.run_args.join(" ")
             );
         }
@@ -2957,9 +2961,14 @@ mod tests {
         }
     }
 
+    /// A config with `allow_runtime_escalation` and `allow_host_mounts` both set to `allow` —
+    /// the shape most tests want, since they are testing one gate at a time and do not care
+    /// about the other. Tests proving the flags are independent build a `Config` directly
+    /// instead, so that only one flag is ever true.
     fn cfg_with(allow: bool) -> crate::config::Config {
         let mut cfg = crate::config::Config::default();
-        cfg.devcontainer.allow_host_commands = allow;
+        cfg.devcontainer.allow_runtime_escalation = allow;
+        cfg.devcontainer.allow_host_mounts = allow;
         cfg
     }
 
@@ -2987,6 +2996,86 @@ mod tests {
         // hand the container new authority over the host.
         let runtime = apply_trust(&escalating(), &cfg_with(false), Path::new("/worktree"));
         assert!(runtime.init);
+    }
+
+    // ── Flag independence ────────────────────────────────────────────────────
+    //
+    // `allow_host_commands`, `allow_runtime_escalation`, and `allow_host_mounts` used to be one
+    // flag. Each of these proves that granting one of the three grants nothing the other two
+    // are responsible for.
+
+    #[test]
+    fn allow_host_commands_alone_grants_neither_escalation_nor_mounts() {
+        let mut cfg = crate::config::Config::default();
+        cfg.devcontainer.allow_host_commands = true;
+
+        let escalation_runtime = apply_trust(&escalating(), &cfg, Path::new("/worktree"));
+        assert!(!escalation_runtime.privileged);
+        assert!(escalation_runtime.cap_add.is_empty());
+        assert!(escalation_runtime.security_opt.is_empty());
+        assert!(escalation_runtime.run_args.is_empty());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&outside.to_string_lossy(), "/escape")],
+            ..Default::default()
+        };
+        let mount_runtime = apply_trust(&resolved, &cfg, &worktree);
+        assert!(
+            mount_runtime.mounts.is_empty(),
+            "allow_host_commands alone must not grant an outside-worktree mount"
+        );
+    }
+
+    #[test]
+    fn allow_runtime_escalation_alone_grants_neither_host_commands_nor_mounts() {
+        let mut cfg = crate::config::Config::default();
+        cfg.devcontainer.allow_runtime_escalation = true;
+
+        // initializeCommand execution is gated by check_host_commands, called with the
+        // allow_host_commands field specifically — not by anything apply_trust decides.
+        let json = parse_config_str(r#"{"initializeCommand":"./setup.sh"}"#).unwrap();
+        assert!(
+            check_host_commands(&json, cfg.devcontainer.allow_host_commands).is_err(),
+            "allow_runtime_escalation alone must not grant initializeCommand execution"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&outside.to_string_lossy(), "/escape")],
+            ..Default::default()
+        };
+        let mount_runtime = apply_trust(&resolved, &cfg, &worktree);
+        assert!(
+            mount_runtime.mounts.is_empty(),
+            "allow_runtime_escalation alone must not grant an outside-worktree mount"
+        );
+    }
+
+    #[test]
+    fn allow_host_mounts_alone_grants_neither_host_commands_nor_escalation() {
+        let mut cfg = crate::config::Config::default();
+        cfg.devcontainer.allow_host_mounts = true;
+
+        let json = parse_config_str(r#"{"initializeCommand":"./setup.sh"}"#).unwrap();
+        assert!(
+            check_host_commands(&json, cfg.devcontainer.allow_host_commands).is_err(),
+            "allow_host_mounts alone must not grant initializeCommand execution"
+        );
+
+        let runtime = apply_trust(&escalating(), &cfg, Path::new("/worktree"));
+        assert!(!runtime.privileged);
+        assert!(runtime.cap_add.is_empty());
+        assert!(runtime.security_opt.is_empty());
+        assert!(runtime.run_args.is_empty());
     }
 
     #[test]
