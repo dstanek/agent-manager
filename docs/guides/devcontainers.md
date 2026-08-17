@@ -179,6 +179,16 @@ devcontainer mode is `am`'s own.
 containers work fine without `privileged`, and refusing to start over a capability the
 session may not need would be worse than starting without it.
 
+**A bind mount outside the worktree is dropped too.** `mounts` — from `devcontainer.json` or a
+Feature — and `workspaceMount` are otherwise just handed to the container runtime, and a bind
+mount's source can name *any* host path: `{"type": "bind", "source": "/", "target": "/host"}`
+is a valid mount and would give the container read-write access to your whole filesystem.
+Without `allow_host_commands = true`, `am` only keeps a bind mount whose source resolves —
+after symlinks and `${...}` substitution — inside the session worktree; everything else is
+dropped with a note naming the source. Named volumes and `tmpfs` mounts carry no host path, so
+they are always kept. This is the same gate as the escalating options above, and the same
+`allow_host_commands` flag opts back in.
+
 Note also what devcontainer mode means for credentials: `~/.ssh` and your agent's config get
 mounted into an image the *repo* defines. That is the same exposure as a custom
 `container.image`, but it becomes the common path rather than an escape hatch.

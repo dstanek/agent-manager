@@ -272,7 +272,7 @@ reference CLI rejects too, and it is reported as the error it is.
 |---|---|---|---|---|
 | `path` | path | `""` | Explicit `devcontainer.json`, relative to the session worktree; unset means discover | Any path inside the worktree |
 | `agent_install` | string | `"auto"` | How the agent gets into the image | `"feature"`, `"bootstrap"`, `"none"`, `"auto"` |
-| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, `securityOpt`, and `runArgs` are honoured | `true`, `false` |
+| `allow_host_commands` | boolean | `false` | Whether `initializeCommand`, `privileged`, `capAdd`, `securityOpt`, `runArgs`, and bind mounts to a host path outside the worktree are honoured | `true`, `false` |
 | `skip_lifecycle` | boolean | `false` | Skip `postCreateCommand` and the other in-container hooks | `true`, `false` |
 | `home` | path | `""` | Override the container home derived from `remoteUser` | Any absolute path |
 | `extra_features` | table | `{}` | Extra Features to inject at build time, as `id = options-JSON` | e.g. `"ghcr.io/devcontainers/features/node:1" = "{}"` |
@@ -305,6 +305,17 @@ image, and an unchanged config skips the build entirely.
     repo-controlled code that arrives with a `git pull`. `am` refuses to run it unless
     `allow_host_commands = true`. The same flag gates `privileged`, `capAdd`, `securityOpt`, and
     `runArgs`; without it those are dropped with a note rather than failing the session.
+
+!!! danger "`mounts` and `workspaceMount` can name arbitrary host paths"
+    A config's `mounts` (and any a Feature contributes) are bind mounts by default and
+    read-write unless marked otherwise — `{"type": "bind", "source": "/", "target": "/host"}`
+    is valid `devcontainer.json`, and would hand a container read-write access to the whole
+    host filesystem. Without `allow_host_commands = true`, `am` only honours a bind mount whose
+    source resolves (after following symlinks and any `${...}` substitution) inside the
+    session worktree; everything else — the host's `$HOME`, a sibling repository, `/` itself —
+    is dropped with a note naming the source and the setting that would allow it. Named
+    volumes and `tmpfs` mounts expose no host path, so they are never gated. `workspaceMount`
+    goes through the same check: it can safely repoint the worktree, but not any other path.
 
 **Lifecycle hooks.** `onCreateCommand`, `updateContentCommand`, `postCreateCommand`, and
 `postStartCommand` run inside the container before the agent starts. Because `am` runs

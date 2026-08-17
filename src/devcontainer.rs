@@ -1380,6 +1380,92 @@ pub fn check_host_commands(json: &DevcontainerJson, allowed: bool) -> Result<()>
     Ok(())
 }
 
+/// Resolve `path` to a canonical form for a trust decision, even when it (or a trailing part
+/// of it) does not exist yet.
+///
+/// `Path::canonicalize` requires the path to exist, but a bind mount source is not required
+/// to — the runtime creates a missing directory on start, and a config asking for a fresh
+/// subdirectory under the worktree is ordinary, not suspicious. So a non-existent source is
+/// not automatically *safe* either: walk up to the nearest existing ancestor, canonicalize
+/// that (resolving any symlink placed there), then re-append the still-missing suffix
+/// literally. Nothing below an existing ancestor can be a symlink, because the filesystem has
+/// nothing there yet, so this is exact rather than a heuristic.
+///
+/// Returns `None` when even that walk cannot pin the path down (for example a path built so
+/// that a literal `..` survives past the point anything on disk exists). That failure is
+/// treated as untrusted by the caller — the safe direction, since the alternative is guessing.
+fn resolve_for_trust(path: &Path) -> Option<PathBuf> {
+    let mut current = path;
+    let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
+    while !current.exists() {
+        let name = current.file_name()?;
+        suffix.push(name);
+        current = current.parent()?;
+    }
+    let mut resolved = current.canonicalize().ok()?;
+    for name in suffix.into_iter().rev() {
+        resolved.push(name);
+    }
+    Some(resolved)
+}
+
+/// Whether a repo-declared bind mount's source may be honoured without
+/// `devcontainer.allow_host_commands`.
+///
+/// Trusted means its canonical location sits inside the session worktree — `am`'s own mounts
+/// (worktree, VCS data, credentials) do not go through this at all, so this is only ever
+/// judging a path a repository asked for.
+fn bind_source_is_trusted(source: &str, worktree_canonical: &Path) -> bool {
+    match resolve_for_trust(Path::new(source)) {
+        Some(resolved) => resolved.starts_with(worktree_canonical),
+        None => false,
+    }
+}
+
+/// Drop repo-declared bind mounts whose source resolves outside the session worktree, unless
+/// the user has opted in.
+///
+/// Named volumes and tmpfs mounts name no host path, so they carry no risk and always pass
+/// through. A repository config is untrusted input — the same reason `initializeCommand` is
+/// refused by [`check_host_commands`] and `privileged`/`capAdd`/`runArgs`/`securityOpt` are
+/// gated just below — and an arbitrary bind mount is a direct escape from the isolation `am`
+/// exists to provide. Dropping rather than refusing to start matches how the other escalating
+/// options are handled: most configs still work without a mount they didn't strictly need.
+fn filter_untrusted_mounts(
+    mounts: Vec<NormalizedMount>,
+    worktree: &Path,
+    allow: bool,
+) -> Vec<NormalizedMount> {
+    if allow {
+        return mounts;
+    }
+    // Mirrors `resolve_for_trust`'s own fallback: a worktree that cannot be canonicalized
+    // (a test fixture that never touches disk, say) is compared literally rather than
+    // treated as an automatic pass or fail.
+    let worktree_canonical = resolve_for_trust(worktree).unwrap_or_else(|| worktree.to_path_buf());
+    let note = color::note_prefix(color::enabled(color::Stream::Stderr));
+    mounts
+        .into_iter()
+        .filter(|m| {
+            if m.kind != "bind" {
+                return true;
+            }
+            // A source-less bind is meaningless and already dropped downstream; nothing to
+            // judge here.
+            let Some(source) = &m.source else { return true };
+            if bind_source_is_trusted(source, &worktree_canonical) {
+                return true;
+            }
+            eprintln!(
+                "{note} not mounting {source} from this devcontainer — it is outside the \
+                 session worktree. Set devcontainer.allow_host_commands = true if you trust \
+                 this repository's config and want to allow it."
+            );
+            false
+        })
+        .collect()
+}
+
 /// Translate a resolved config into runtime settings, dropping options `am` will not grant.
 ///
 /// Escalating options come from a file in the repo, so they are opt-in rather than
@@ -1389,6 +1475,7 @@ pub fn check_host_commands(json: &DevcontainerJson, allowed: bool) -> Result<()>
 pub fn apply_trust(
     resolved: &ResolvedConfig,
     cfg: &crate::config::Config,
+    worktree: &Path,
 ) -> crate::container::DevcontainerRuntime {
     let allow = cfg.devcontainer.allow_host_commands;
     let mut env: Vec<(String, String)> = resolved
@@ -1428,6 +1515,9 @@ pub fn apply_trust(
             ),
         }
     }
+    // Applied after workspaceMount is folded in, so a substituted external path cannot use it
+    // as a loophole around the same policy every other repo-declared bind mount is subject to.
+    let mounts = filter_untrusted_mounts(mounts, worktree, allow);
 
     let mut runtime = crate::container::DevcontainerRuntime {
         env,
@@ -2097,7 +2187,9 @@ mod tests {
             ),
             ..Default::default()
         };
-        let runtime = apply_trust(&resolved, &cfg_with(false));
+        // workspaceMount's source is the session worktree here, which is what makes it a
+        // trusted mount under the default (non-opted-in) trust policy.
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/host/repo"));
         let found = runtime
             .mounts
             .iter()
@@ -2120,7 +2212,9 @@ mod tests {
             ),
             ..Default::default()
         };
-        let runtime = apply_trust(&resolved, &cfg_with(false));
+        // "/other" is the surviving mount (the target collision means workspaceMount's own
+        // push is skipped), so it must be the one the trust policy is judging.
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/other"));
         let same: Vec<_> =
             runtime.mounts.iter().filter(|m| m.target == "/workspaces/app").collect();
         assert_eq!(same.len(), 1, "two mounts on one target is a runtime error");
@@ -2134,17 +2228,20 @@ mod tests {
             ..Default::default()
         };
         // The session is still usable via host-path mirroring, so this must not be fatal.
-        let runtime = apply_trust(&resolved, &cfg_with(false));
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
         assert!(runtime.mounts.is_empty());
     }
 
     #[test]
     fn update_remote_user_uid_defaults_to_true() {
-        let runtime = apply_trust(&ResolvedConfig::default(), &cfg_with(false));
+        let runtime =
+            apply_trust(&ResolvedConfig::default(), &cfg_with(false), Path::new("/worktree"));
         assert!(runtime.update_remote_user_uid, "the spec's default on Linux");
 
         let off = ResolvedConfig { update_remote_user_uid: Some(false), ..Default::default() };
-        assert!(!apply_trust(&off, &cfg_with(false)).update_remote_user_uid);
+        assert!(
+            !apply_trust(&off, &cfg_with(false), Path::new("/worktree")).update_remote_user_uid
+        );
     }
 
     #[test]
@@ -2567,7 +2664,8 @@ mod tests {
         )
         .unwrap())
         .unwrap();
-        let runtime = apply_trust(&resolved, &crate::config::Config::default());
+        let runtime =
+            apply_trust(&resolved, &crate::config::Config::default(), Path::new("/worktree"));
         assert_eq!(runtime.ports, vec![ForwardedPort::Own(8080)]);
     }
 
@@ -2678,7 +2776,7 @@ mod tests {
 
     #[test]
     fn trust_gate_drops_escalating_options_by_default() {
-        let runtime = apply_trust(&escalating(), &cfg_with(false));
+        let runtime = apply_trust(&escalating(), &cfg_with(false), Path::new("/worktree"));
         assert!(!runtime.privileged);
         assert!(runtime.cap_add.is_empty());
         assert!(runtime.security_opt.is_empty());
@@ -2687,7 +2785,7 @@ mod tests {
 
     #[test]
     fn trust_gate_grants_escalating_options_when_opted_in() {
-        let runtime = apply_trust(&escalating(), &cfg_with(true));
+        let runtime = apply_trust(&escalating(), &cfg_with(true), Path::new("/worktree"));
         assert!(runtime.privileged);
         assert_eq!(runtime.cap_add, vec!["SYS_ADMIN".to_string()]);
         assert_eq!(runtime.security_opt, vec!["label=disable".to_string()]);
@@ -2698,7 +2796,7 @@ mod tests {
     fn trust_gate_keeps_non_escalating_settings_either_way() {
         // init comes from ordinary Features (sshd, docker-outside-of-docker) and does not
         // hand the container new authority over the host.
-        let runtime = apply_trust(&escalating(), &cfg_with(false));
+        let runtime = apply_trust(&escalating(), &cfg_with(false), Path::new("/worktree"));
         assert!(runtime.init);
     }
 
@@ -2709,9 +2807,183 @@ mod tests {
             .container_env
             .insert("A".to_string(), "1".to_string());
         resolved.remote_env.insert("B".to_string(), Some("2".to_string()));
-        let runtime = apply_trust(&resolved, &cfg_with(false));
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
         assert!(runtime.env.contains(&("A".to_string(), "1".to_string())));
         assert!(runtime.env.contains(&("B".to_string(), "2".to_string())));
+    }
+
+    // ── Mount trust ──────────────────────────────────────────────────────────
+
+    fn bind(source: &str, target: &str) -> NormalizedMount {
+        NormalizedMount {
+            source: Some(source.to_string()),
+            target: target.to_string(),
+            kind: "bind".to_string(),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn mount_trust_drops_a_bind_of_the_host_root() {
+        let resolved = ResolvedConfig { mounts: vec![bind("/", "/host")], ..Default::default() };
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
+        assert!(runtime.mounts.is_empty(), "must not mount the host root: {:?}", runtime.mounts);
+    }
+
+    #[test]
+    fn mount_trust_drops_a_path_under_home_outside_the_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&home.to_string_lossy(), "/host-home")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty());
+    }
+
+    #[test]
+    fn mount_trust_drops_a_sibling_repository_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("repo-a");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let sibling = tmp.path().join("repo-b");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&sibling.to_string_lossy(), "/other-repo")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty());
+    }
+
+    #[test]
+    fn mount_trust_drops_a_symlink_that_escapes_the_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // A symlink living *inside* the worktree, but resolving outside it — the point of
+        // canonicalizing before deciding rather than trusting the literal path.
+        let link = worktree.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&link.to_string_lossy(), "/escape")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty(), "a symlink must not launder a path out of the worktree");
+    }
+
+    #[test]
+    fn mount_trust_drops_a_dotdot_traversal_out_of_the_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(tmp.path().join("secret")).unwrap();
+        let traversal = worktree.join("../secret");
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&traversal.to_string_lossy(), "/secret")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty());
+    }
+
+    #[test]
+    fn mount_trust_allows_a_worktree_internal_bind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let sub = worktree.join("data");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&sub.to_string_lossy(), "/data")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert_eq!(runtime.mounts.len(), 1);
+        assert_eq!(runtime.mounts[0].target, "/data");
+    }
+
+    #[test]
+    fn mount_trust_allows_a_worktree_internal_bind_that_does_not_exist_yet() {
+        // The runtime creates a missing bind source on start, so a not-yet-existing
+        // subdirectory under the worktree is exactly as legitimate as an existing one — the
+        // reason `resolve_for_trust` walks up to the nearest existing ancestor instead of
+        // treating "does not exist" as automatically untrusted.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let not_yet = worktree.join("build-cache");
+
+        let resolved = ResolvedConfig {
+            mounts: vec![bind(&not_yet.to_string_lossy(), "/cache")],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert_eq!(runtime.mounts.len(), 1);
+    }
+
+    #[test]
+    fn mount_trust_always_allows_named_volumes_and_tmpfs() {
+        // Neither names a host path, so neither is something the trust policy needs to judge.
+        let resolved = ResolvedConfig {
+            mounts: vec![
+                NormalizedMount {
+                    source: Some("my-volume".to_string()),
+                    target: "/data".to_string(),
+                    kind: "volume".to_string(),
+                    read_only: false,
+                },
+                NormalizedMount {
+                    source: None,
+                    target: "/tmp/scratch".to_string(),
+                    kind: "tmpfs".to_string(),
+                    read_only: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), Path::new("/worktree"));
+        assert_eq!(runtime.mounts.len(), 2);
+    }
+
+    #[test]
+    fn mount_trust_honours_every_bind_when_opted_in() {
+        let resolved = ResolvedConfig { mounts: vec![bind("/", "/host")], ..Default::default() };
+        let runtime = apply_trust(&resolved, &cfg_with(true), Path::new("/worktree"));
+        assert_eq!(runtime.mounts.len(), 1);
+        assert_eq!(runtime.mounts[0].source.as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn mount_trust_drops_a_workspace_mount_pointed_outside_the_worktree() {
+        // workspaceMount is folded into the same list the other mounts go through, so it must
+        // be judged by the same policy rather than being a way around it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let resolved = ResolvedConfig {
+            workspace_mount: Some(format!(
+                "source={},target=/workspaces/app,type=bind",
+                elsewhere.to_string_lossy()
+            )),
+            ..Default::default()
+        };
+        let runtime = apply_trust(&resolved, &cfg_with(false), &worktree);
+        assert!(runtime.mounts.is_empty());
     }
 
     // ── Lifecycle hooks ───────────────────────────────────────────────────────

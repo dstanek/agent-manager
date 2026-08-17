@@ -719,13 +719,31 @@ Follow-ups the native builder left behind:
       it through. `security_opt` is now initialized empty and populated only inside the
       `allow` branch, alongside the others, with a dropped-options note matching their wording
       when it is not granted.
-- [ ] **`allow_host_commands` now gates four things, not one** — `initializeCommand`
-      (a host command, matching the name) plus `privileged`, `capAdd`, `securityOpt`, and
-      `runArgs` (runtime escalation, not host execution). A review of the `securityOpt` fix
-      flagged the name as no longer describing what it controls, and suggested either renaming
-      it to something reflecting broad runtime privilege consent or splitting host execution
-      and runtime escalation into separate flags. Deferred: a config key rename is a breaking
-      change and deserves its own discussion, not a rider on a security fix.
+- [x] **Repository config could bind arbitrary host paths.** Done 2026-08-17. `mounts` (from
+      `devcontainer.json` or a Feature) and `workspaceMount` were merged, substituted, and
+      copied straight onto the runtime with no trust decision at all — unlike `privileged` and
+      friends, there was no gate to miss. A config as small as
+      `{"mounts": ["source=/,target=/host"]}` produced a read-write bind of the host root, and
+      the default `container.mode = "auto"` means devcontainer mode picks up such a config
+      without the user asking for it. `apply_trust` now takes the session worktree and, without
+      `allow_host_commands = true`, keeps a bind mount only when its source resolves inside it —
+      canonicalized, so a symlink or a `${...}`-substituted `..` cannot launder a path out, and
+      a source that does not exist yet (the runtime creates it on start) is judged by its
+      nearest existing ancestor rather than treated as automatically safe. Everything else is
+      dropped with a note naming the source, the same non-fatal shape as the other escalating
+      options. Named volumes and `tmpfs` mounts expose no host path and are never gated.
+      `workspaceMount` is folded into the same list before the check runs, so it is judged by
+      the identical policy rather than being a way around it. `am`'s own mounts (worktree, VCS
+      data, credentials) never go through this — they come from `ContainerMounts`, not the
+      devcontainer config, and were not touched.
+- [ ] **`allow_host_commands` now gates five things, not one** — `initializeCommand`
+      (a host command, matching the name) plus `privileged`, `capAdd`, `securityOpt`, `runArgs`,
+      and now untrusted bind mounts (runtime escalation and isolation-boundary decisions, not
+      host execution). A review of the `securityOpt` fix flagged the name as no longer
+      describing what it controls, and suggested either renaming it to something reflecting
+      broad runtime privilege consent or splitting host execution and runtime/mount escalation
+      into separate flags. Deferred: a config key rename is a breaking change and deserves its
+      own discussion, not a rider on a security fix.
 - [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
       until `am` writes one on its first build. Self-correcting, and now documented in the
       configuration reference; kept open only because the first build of a fresh checkout is
