@@ -46,6 +46,9 @@ pub enum AmError {
     #[error("devcontainer build failed: {0}")]
     DevcontainerBuildFailed(String),
 
+    #[error("{0}")]
+    HostCommandFailed(String),
+
     #[error("config error: {0}")]
     ConfigError(String),
 

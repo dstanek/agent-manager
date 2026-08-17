@@ -931,6 +931,24 @@ async fn given_initialize_command_config(world: &mut AmWorld) {
     );
 }
 
+/// A permitted `initializeCommand` that leaves evidence it ran, and where: the host, in the
+/// session worktree.
+#[given("the repo has a devcontainer config with an initializeCommand that writes a sentinel")]
+async fn given_initialize_command_sentinel_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\"name\":\"test\",\"image\":\"debian:bookworm\",\
+         \"initializeCommand\":\"printf initialized > .am-initialize-ran\"}",
+    );
+}
+
+/// A permitted `initializeCommand` that fails, to drive the rollback scenario.
+#[given("the repo has a devcontainer config with an initializeCommand that fails")]
+async fn given_initialize_command_failing_config(world: &mut AmWorld) {
+    world.write_devcontainer_config(
+        "{\"name\":\"test\",\"image\":\"debian:bookworm\",\"initializeCommand\":\"exit 1\"}",
+    );
+}
+
 #[when(expr = "I run {string}")]
 async fn when_run(world: &mut AmWorld, cmd: String) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();

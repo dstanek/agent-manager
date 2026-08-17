@@ -81,6 +81,29 @@ Feature: Dev container sessions
     And the output contains "runs on your host"
     And the output contains "allow_host_commands"
 
+  # The opt-in is meant to actually run the command, not just stop refusing the config.
+  Scenario: an allowed initializeCommand runs on the host, in the session worktree
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with an initializeCommand that writes a sentinel
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command succeeds
+    And the output contains "running initializeCommand on your host"
+    And the file ".am/worktrees/my-feature/.am-initialize-ran" exists
+    And the file ".am/worktrees/my-feature/.am-initialize-ran" contains "initialized"
+
+  # A non-zero initializeCommand is a failed preflight step, same as a failed build: the
+  # session never starts and the worktree it would have used is not left behind.
+  Scenario: a failing initializeCommand stops the session and rolls back the worktree
+    Given I am using am's own devcontainer builder
+    And the repo has a devcontainer config with an initializeCommand that fails
+    And a project config containing "[devcontainer]\nallow_host_commands = true\n"
+    When I run "am start my-feature" with env "AM_CONTAINER_MODE" = "devcontainer"
+    Then the command fails
+    And the output contains "initializeCommand"
+    And the worktree ".am/worktrees/my-feature" does not exist
+    And the session file does not contain "my-feature"
+
   # container.mode defaults to "auto", so a repo that describes its environment gets it
   # used with no configuration at all. This is the scenario that would catch the default
   # being flipped back by accident.

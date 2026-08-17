@@ -1380,6 +1380,113 @@ pub fn check_host_commands(json: &DevcontainerJson, allowed: bool) -> Result<()>
     Ok(())
 }
 
+/// Run `initializeCommand` on the host, in `worktree`.
+///
+/// Reached only once [`check_host_commands`] has let a config with `initializeCommand`
+/// through, which means `devcontainer.allow_host_commands` is set — the caller does not
+/// need to check that again here. Every other hook becomes a shell snippet exec'd into the
+/// container ([`Command::to_shell`]), but this one runs on the host, so the array form is
+/// spawned directly rather than flattened through a shell: quoting an argv element into a
+/// shell string is exactly the injection risk the array form exists to avoid, and turning it
+/// into one here would defeat the point of offering it.
+///
+/// `devcontainer.skip_lifecycle` does not reach this hook — it is documented, and named, as
+/// skipping the *in-container* hooks, and `initializeCommand` runs on the host, outside the
+/// container entirely.
+pub fn run_initialize_command(cmd: &LifecycleCommand, worktree: &Path) -> Result<()> {
+    let note = color::note_prefix(color::enabled(color::Stream::Stderr));
+    eprintln!(
+        "{note} running initializeCommand on your host — outside every isolation boundary am \
+         otherwise provides. devcontainer.allow_host_commands is set, so this repo's config is \
+         trusted to run with your privileges."
+    );
+    match cmd {
+        LifecycleCommand::Shell(script) => run_host_shell(script, worktree),
+        LifecycleCommand::Argv(argv) => run_host_argv(argv, worktree),
+        LifecycleCommand::Named(map) => run_host_named(map, worktree),
+    }
+}
+
+fn host_command_failed(what: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+    AmError::HostCommandFailed(format!("initializeCommand {what}: {detail}")).into()
+}
+
+fn require_success(status: std::process::ExitStatus) -> Result<()> {
+    if !status.success() {
+        return Err(host_command_failed("failed", status));
+    }
+    Ok(())
+}
+
+/// A shell string: the spec runs it through a shell, so pipes and `&&` are intentional.
+fn run_host_shell(script: &str, worktree: &Path) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .current_dir(worktree)
+        .status()
+        .map_err(|e| host_command_failed("could not start", e))?;
+    require_success(status)
+}
+
+/// An argv array: exec'd directly, no shell in between.
+fn run_host_argv(argv: &[String], worktree: &Path) -> Result<()> {
+    let Some((program, args)) = argv.split_first() else {
+        return Ok(()); // an empty array is nothing to run
+    };
+    let status = std::process::Command::new(program)
+        .args(args)
+        .current_dir(worktree)
+        .status()
+        .map_err(|e| host_command_failed("could not start", e))?;
+    require_success(status)
+}
+
+/// A named group: every member spawned before any of them is waited on, so they run
+/// genuinely concurrently, then every member is waited on regardless of an earlier failure so
+/// the group fails on *any* member rather than only the last one — the same shape
+/// [`parallel_script`] gives the in-container hooks, done here as host processes instead of a
+/// backgrounded shell script.
+fn run_host_named(map: &BTreeMap<String, NamedCommand>, worktree: &Path) -> Result<()> {
+    let mut children = Vec::with_capacity(map.len());
+    for (name, member) in map {
+        let mut command = match member {
+            NamedCommand::Shell(script) => {
+                let mut c = std::process::Command::new("sh");
+                c.arg("-c").arg(script);
+                c
+            }
+            NamedCommand::Argv(argv) => {
+                let Some((program, args)) = argv.split_first() else { continue };
+                let mut c = std::process::Command::new(program);
+                c.args(args);
+                c
+            }
+        };
+        let child = command
+            .current_dir(worktree)
+            .spawn()
+            .map_err(|e| host_command_failed(&format!("could not start '{name}'"), e))?;
+        children.push((name, child));
+    }
+    let mut failed = Vec::new();
+    for (name, mut child) in children {
+        let status = child
+            .wait()
+            .map_err(|e| host_command_failed(&format!("could not wait for '{name}'"), e))?;
+        if !status.success() {
+            failed.push(name.clone());
+        }
+    }
+    if !failed.is_empty() {
+        return Err(host_command_failed(
+            "failed",
+            format!("{} did not succeed", failed.join(", ")),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve `path` to a canonical form for a trust decision, even when it (or a trailing part
 /// of it) does not exist yet.
 ///
@@ -2772,6 +2879,69 @@ mod tests {
     fn config_without_initialize_command_passes_either_way() {
         let json = parse_config_str(r#"{"image":"debian"}"#).unwrap();
         assert!(check_host_commands(&json, false).is_ok());
+    }
+
+    #[test]
+    fn shell_form_initialize_command_runs_on_the_host_in_the_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cmd = LifecycleCommand::Shell("pwd > out.txt".to_string());
+        run_initialize_command(&cmd, tmp.path()).unwrap();
+        let recorded = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
+        // Canonicalize both sides: on macOS $TMPDIR is itself a symlink, so `pwd` and
+        // `tmp.path()` can differ only in that respect.
+        assert_eq!(
+            std::fs::canonicalize(recorded.trim()).unwrap(),
+            std::fs::canonicalize(tmp.path()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn shell_form_initialize_command_failure_is_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cmd = LifecycleCommand::Shell("exit 7".to_string());
+        let err = run_initialize_command(&cmd, tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("initializeCommand"));
+    }
+
+    #[test]
+    fn argv_form_initialize_command_runs_without_a_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A shell metacharacter in an argv element must reach the program literally, not be
+        // interpreted — that is the entire reason the array form exists.
+        let cmd = LifecycleCommand::Argv(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf %s \"$1\" > out.txt".to_string(),
+            "--".to_string(),
+            "a && b".to_string(),
+        ]);
+        run_initialize_command(&cmd, tmp.path()).unwrap();
+        let recorded = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
+        assert_eq!(recorded, "a && b");
+    }
+
+    #[test]
+    fn named_form_initialize_command_runs_every_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cmd: LifecycleCommand = serde_json::from_str(
+            r#"{"one":"echo one > one.txt","two":"echo two > two.txt"}"#,
+        )
+        .unwrap();
+        run_initialize_command(&cmd, tmp.path()).unwrap();
+        assert!(tmp.path().join("one.txt").exists());
+        assert!(tmp.path().join("two.txt").exists());
+    }
+
+    #[test]
+    fn named_form_initialize_command_fails_if_any_member_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cmd: LifecycleCommand =
+            serde_json::from_str(r#"{"good":"echo ok > ok.txt","bad":"exit 1"}"#).unwrap();
+        let err = run_initialize_command(&cmd, tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("bad"));
+        // The other member still ran — a named group runs its members concurrently, it does
+        // not stop the rest the moment one fails.
+        assert!(tmp.path().join("ok.txt").exists());
     }
 
     // ── Trust gate ────────────────────────────────────────────────────────────

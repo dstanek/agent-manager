@@ -1091,6 +1091,13 @@ fn plan_devcontainer(
     let json = devcontainer::parse_config(config_path)?;
     devcontainer::check_supported(&json)?;
     devcontainer::check_host_commands(&json, cfg.devcontainer.allow_host_commands)?;
+    // `check_host_commands` has already refused a config that defines this without opting
+    // in, so reaching here with a command present means the opt-in is set. Runs before any
+    // image work: initializeCommand is meant to prepare the host side of a build, e.g.
+    // generating a file the Dockerfile expects to find.
+    if let Some(cmd) = &json.initialize_command {
+        devcontainer::run_initialize_command(cmd, worktree)?;
+    }
 
     let injected = injected_features(cfg, agent_name);
     let image = devcontainer::image_name(config_path, &injected)?;
