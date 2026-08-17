@@ -934,6 +934,42 @@ mod tests {
     }
 
     #[test]
+    fn security_opt_is_written_only_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mounts = ContainerMounts {
+            worktree_host: tmp.path().to_path_buf(),
+            vcs_host: tmp.path().join(".git"),
+            colocated_git_host: None,
+            gitconfig_host: tmp.path().join("gitconfig"),
+            ssh_host: tmp.path().join("ssh"),
+            ssh_agent_sock: None,
+            agent_auth: Vec::new(),
+            container_home: "/home/vscode".to_string(),
+        };
+
+        // Absent by default — this is `apply_trust`'s job to gate, but the emission side
+        // must not add the key on its own either.
+        let doc = override_document(
+            &runtime(),
+            "app",
+            "img",
+            &mounts,
+            &[],
+            &[],
+            &DevcontainerRuntime::default(),
+        );
+        assert!(doc["services"]["app"].as_object().unwrap().get("security_opt").is_none());
+
+        // Present once the trust gate has admitted it into the runtime.
+        let dc = DevcontainerRuntime {
+            security_opt: vec!["label=disable".to_string()],
+            ..DevcontainerRuntime::default()
+        };
+        let doc = override_document(&runtime(), "app", "img", &mounts, &[], &[], &dc);
+        assert_eq!(doc["services"]["app"]["security_opt"], json!(["label=disable"]));
+    }
+
+    #[test]
     fn exec_runs_the_agent_in_the_named_service() {
         let mut args =
             compose_args(&subcommand_provider(), &all_files(&compose()), "am-feat");

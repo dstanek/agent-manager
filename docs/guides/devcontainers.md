@@ -173,8 +173,8 @@ The delegated build cannot run it either: `devcontainer build` neither executes
 `initializeCommand` nor records it in the image, so the only host-side execution in
 devcontainer mode is `am`'s own.
 
-**Escalating options are dropped, not honoured.** `privileged`, `capAdd`, and `runArgs` are
-ignored by default, with a note on stderr saying what was skipped. The same
+**Escalating options are dropped, not honoured.** `privileged`, `capAdd`, `securityOpt`, and
+`runArgs` are ignored by default, with a note on stderr saying what was skipped. The same
 `allow_host_commands` flag grants them. Dropping rather than failing is deliberate — most
 containers work fine without `privileged`, and refusing to start over a capability the
 session may not need would be worse than starting without it.

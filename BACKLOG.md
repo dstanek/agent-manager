@@ -710,6 +710,22 @@ Follow-ups the native builder left behind:
       tag-addressed fetch has no digest yet to compare against. A mismatch fails the build
       before anything is written to the Feature cache — no partial directory, no
       `.am-complete`.
+- [x] **`securityOpt` was applied without trust approval.** Done 2026-08-17. `apply_trust`
+      copied `resolved.security_opt` onto the runtime unconditionally, before the `if allow`
+      branch that gates `privileged`, `capAdd`, and `runArgs` — so a repo-declared
+      `devcontainer.json` could hand the container something like `seccomp=unconfined`
+      regardless of `allow_host_commands`, and both emission paths (`container::build_run_command`'s
+      `--security-opt`, `compose::override_document`'s `security_opt` key) faithfully passed
+      it through. `security_opt` is now initialized empty and populated only inside the
+      `allow` branch, alongside the others, with a dropped-options note matching their wording
+      when it is not granted.
+- [ ] **`allow_host_commands` now gates four things, not one** — `initializeCommand`
+      (a host command, matching the name) plus `privileged`, `capAdd`, `securityOpt`, and
+      `runArgs` (runtime escalation, not host execution). A review of the `securityOpt` fix
+      flagged the name as no longer describing what it controls, and suggested either renaming
+      it to something reflecting broad runtime privilege consent or splitting host execution
+      and runtime escalation into separate flags. Deferred: a config key rename is a breaking
+      change and deserves its own discussion, not a rider on a security fix.
 - [ ] **A repo with no lockfile still cannot detect a moved tag** — there is nothing to hash
       until `am` writes one on its first build. Self-correcting, and now documented in the
       configuration reference; kept open only because the first build of a fresh checkout is
