@@ -31,6 +31,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::color;
 use crate::command::{run_built_command, run_built_command_output};
 use crate::config::NetworkMode;
 use crate::container::{
@@ -554,6 +555,62 @@ pub fn down(runtime_bin: &Path, compose: &SessionCompose) -> Result<()> {
         .with_context(|| "stopping the compose project")
 }
 
+/// A started compose project that is not yet owned by a recorded session.
+///
+/// `compose::up` runs while `am start` is still assembling the plan — deliberately, so a project
+/// that cannot start surfaces as an `am start` error rather than a dead tmux pane. But several
+/// things that can fail come after it: creating the tmux window, and writing the session record
+/// itself. Without this guard a failure there left the containers and the network running with
+/// nothing to find them by, since `am destroy` discovers projects through the session record
+/// that was never written. The tmux path is not hypothetical — a window-name collision is its
+/// most likely cause, and the error it raises tells the user to run `am destroy <slug>`, which
+/// at that moment cannot help them.
+///
+/// The shape mirrors [`crate::worktree::WorktreeGuard`], and the two are committed together.
+pub struct ComposeGuard {
+    runtime_bin: PathBuf,
+    compose: SessionCompose,
+    committed: bool,
+}
+
+impl ComposeGuard {
+    /// Bring the project up and guard it until the session that owns it is recorded.
+    pub fn up(runtime_bin: &Path, compose: &SessionCompose) -> Result<Self> {
+        up(runtime_bin, compose)?;
+        Ok(Self {
+            runtime_bin: runtime_bin.to_path_buf(),
+            compose: compose.clone(),
+            committed: false,
+        })
+    }
+
+    /// Give up ownership: the project belongs to the session now and survives the drop.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ComposeGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // `down`, not `stop`: nothing recorded this project, so there is no session to attach
+        // to later and leaving stopped containers behind would only collide with the next
+        // attempt at the same slug. Named volumes still survive — see `down`.
+        if let Err(e) = down(&self.runtime_bin, &self.compose) {
+            // Reported rather than panicked: this runs while an error is already propagating,
+            // and a panic would replace the real failure with a less useful one.
+            eprintln!(
+                "{} could not roll back compose project {}: {e}\n\
+                 Take it down manually before retrying.",
+                color::warning_prefix(color::enabled(color::Stream::Stderr)),
+                self.compose.project
+            );
+        }
+    }
+}
+
 /// The argv that stops the project, for chaining after the agent in the pane.
 ///
 /// This is `shutdownAction: "stopCompose"`, the spec's default for a compose config: the
@@ -670,6 +727,82 @@ mod tests {
         let found = resolve_provider(&bin).expect("a provider");
         assert_eq!(found.argv, vec![bin.to_string_lossy().to_string(), "compose".to_string()]);
         assert!(found.env.is_empty());
+    }
+
+    /// A fake runtime that answers `compose version` as a real Compose v2 and appends every
+    /// other invocation to `log`, so a test can see what was asked of it.
+    #[cfg(unix)]
+    fn recording_runtime(dir: &Path, name: &str, log: &Path) -> PathBuf {
+        fake_runtime(
+            dir,
+            name,
+            &format!(
+                r#"if [ "$2" = version ]; then echo 'Docker Compose version v2.32.4'; exit 0; fi
+echo "$@" >> {}
+exit 0"#,
+                log.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn a_project() -> SessionCompose {
+        SessionCompose {
+            project: "am-guard-test".to_string(),
+            service: "app".to_string(),
+            files: vec![PathBuf::from("/repo/docker-compose.yml")],
+            override_path: PathBuf::from("/state/override.yml"),
+            run_services: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uncommitted_compose_guard_takes_the_project_down() {
+        // The leak this exists to prevent: `compose up` runs while `am start` is still
+        // assembling the plan, and the tmux window and the session record can both fail after
+        // it. Nothing recorded the project at that point, so `am destroy` cannot find it —
+        // which is exactly what the tmux error tells the user to run.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls");
+        let bin = recording_runtime(tmp.path(), "docker-rollback", &log);
+
+        let project = a_project();
+        {
+            let _guard = ComposeGuard::up(&bin, &project).expect("the project comes up");
+            let called = std::fs::read_to_string(&log).unwrap_or_default();
+            assert!(called.contains(" up "), "expected an up, got: {called}");
+        }
+
+        let called = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            called.lines().any(|l| l.ends_with(" down")),
+            "dropping without commit must take the project down, got: {called}"
+        );
+        assert!(
+            called.contains("am-guard-test"),
+            "the teardown must name the project: {called}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_compose_guard_leaves_the_project_running() {
+        // The other half: once the session record exists the project is the session's, and
+        // `am destroy` is what takes it down. A guard that tore it down here would destroy
+        // every compose session at the moment it started.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("calls");
+        let bin = recording_runtime(tmp.path(), "docker-commit", &log);
+
+        let project = a_project();
+        ComposeGuard::up(&bin, &project).expect("the project comes up").commit();
+
+        let called = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !called.lines().any(|l| l.ends_with(" down")),
+            "a committed guard must not take the project down, got: {called}"
+        );
     }
 
     #[cfg(unix)]
