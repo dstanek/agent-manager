@@ -79,6 +79,10 @@ jobs:
       # starts biting, authenticate to Hub with docker/login-action or mirror those three; the
       # ghcr.io and mcr.microsoft.com pulls this job also makes are not limited that way.
       - name: Start the local registries
+        env:
+          # Runners carry both podman and docker; naming the one this job uses keeps a CI
+          # failure reproducible instead of depending on which the script happens to find first.
+          AM_TEST_RUNTIME: docker
         # Publishes the purpose-built Features — one declaring dependsOn, one behind htpasswd —
         # that no public registry offers. Also does a real `docker login`, which is the point of
         # the private half: the test proves am finds the credential the runtime wrote.

@@ -39,6 +39,13 @@ FIXTURES="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tests/fixtures/regist
 STATE="${TMPDIR:-/tmp}/am-test-registry"
 
 runtime() {
+    # An explicit choice wins. Machines that have both podman and docker — GitHub's runners, for
+    # one — would otherwise pick by an order this script happens to list, which is a variable
+    # nobody chose and nobody sees until something fails.
+    if [ -n "${AM_TEST_RUNTIME:-}" ]; then
+        echo "$AM_TEST_RUNTIME"
+        return
+    fi
     for candidate in podman docker; do
         if command -v "$candidate" >/dev/null 2>&1; then
             echo "$candidate"
@@ -56,15 +63,47 @@ reachable() {
     [ "$code" = "200" ] || [ "$code" = "401" ]
 }
 
+# What the runtime thinks is going on. Printed on every failure path, because a registry that
+# will not answer has already cost someone a CI round trip by the time they read this, and
+# "exit 1" on its own buys a second one.
+diagnose() {
+    local rt
+    rt="$(runtime)"
+    echo "--- container state ---" >&2
+    "$rt" ps -a --filter "name=am-test-registry" >&2 || true
+    for name in "$REGISTRY_NAME" "$PRIVATE_NAME"; do
+        echo "--- ${name} logs (last 20) ---" >&2
+        "$rt" logs --tail 20 "$name" >&2 2>&1 || echo "(no such container)" >&2
+    done
+}
+
+# Wait for a registry to answer, because "not answering yet" and "not reachable from here" look
+# identical from the outside and mean opposite things. A freshly started registry — especially
+# one whose image was pulled a moment ago — takes a second or two to listen, and treating that
+# as "unreachable" sends the caller down the forwarder path on a host that needs no forwarder,
+# where it fails with a message about the wrong problem entirely.
+wait_reachable() {
+    local port="$1" attempts="${2:-30}"
+    for _ in $(seq "$attempts"); do
+        reachable "$port" && return 0
+        sleep 1
+    done
+    return 1
+}
+
 start_forwarder() {
     local port="$1"
-    # Only needed when the published port is not already this namespace's localhost.
-    if reachable "$port"; then
+    # Only needed when the published port is not already this namespace's localhost — decided
+    # after giving the registry a fair chance to start, not before.
+    if wait_reachable "$port"; then
         return
     fi
+    echo "==> localhost:${port} did not answer; assuming its port is published elsewhere"
     if ! command -v socat >/dev/null 2>&1; then
-        echo "error: the registry is not on localhost and socat is not installed." >&2
-        echo "       Install socat, or run this on the host where the port is published." >&2
+        echo "error: localhost:${port} never answered, and socat is not installed to forward" >&2
+        echo "       to a port published elsewhere. On a plain host the registry should be on" >&2
+        echo "       localhost already — so this usually means it failed to start." >&2
+        diagnose
         exit 1
     fi
     echo "==> forwarding localhost:${port} to the host's published port"
@@ -78,7 +117,8 @@ start_forwarder() {
         reachable "$port" && return
         sleep 0.25
     done
-    echo "error: registry still unreachable at localhost:${port}" >&2
+    echo "error: registry still unreachable at localhost:${port} after forwarding" >&2
+    diagnose
     exit 1
 }
 
@@ -108,13 +148,13 @@ start_private() {
         return
     fi
     echo "==> starting ${PRIVATE_NAME} on port ${PRIVATE_PORT} (basic auth)"
-    "$rt" run --rm --entrypoint htpasswd httpd:2 -Bbn "$PRIVATE_USER" "$PRIVATE_PASS" \
+    "$rt" run --rm --entrypoint htpasswd docker.io/library/httpd:2 -Bbn "$PRIVATE_USER" "$PRIVATE_PASS" \
         > "$STATE/htpasswd"
     "$rt" run -d --rm -p "${PRIVATE_PORT}:5000" --name "$PRIVATE_NAME" \
         -e REGISTRY_AUTH=htpasswd \
         -e REGISTRY_AUTH_HTPASSWD_REALM="am test registry" \
         -e REGISTRY_AUTH_HTPASSWD_PATH=/etc/htpasswd \
-        registry:2 >/dev/null
+        docker.io/library/registry:2 >/dev/null
     # Copied in rather than bind-mounted: under docker-outside-of-docker the daemon resolves a
     # `-v` source against the *host's* filesystem, where this path does not exist — so it would
     # helpfully create a directory there and the registry would answer every request with 400.
@@ -124,11 +164,12 @@ start_private() {
 up() {
     local rt
     rt="$(runtime)"
+    echo "==> using ${rt}"
     mkdir -p "$STATE"
 
     if ! running "$rt" "$REGISTRY_NAME"; then
         echo "==> starting ${REGISTRY_NAME} on port ${REGISTRY_PORT}"
-        "$rt" run -d --rm -p "${REGISTRY_PORT}:5000" --name "$REGISTRY_NAME" registry:2 >/dev/null
+        "$rt" run -d --rm -p "${REGISTRY_PORT}:5000" --name "$REGISTRY_NAME" docker.io/library/registry:2 >/dev/null
     fi
     start_private "$rt"
 
