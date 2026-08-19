@@ -91,3 +91,29 @@ Two workflows exercise the build:
   above (Linux via `ubuntu-latest`/`ubuntu-24.04-arm`, macOS via
   `macos-latest`, Windows via `windows-latest`), then packages the artifacts
   and publishes them to the GitHub release.
+
+### Prereleases
+
+A tag carrying a semver prerelease suffix — `v1.2.3-beta.1`, `v1.2.3-rc.2` — builds and
+publishes the same artifacts, with three differences that keep it away from people who did not
+ask for it:
+
+| | Stable tag | Prerelease tag |
+|---|---|---|
+| GitHub release | normal, shown as "Latest" | marked prerelease |
+| Homebrew tap | formula updated | **not touched** |
+| Container images | pushed, `latest` moved | pushed, `latest` left alone |
+| Documentation site | republished | **not republished** |
+
+The Homebrew and `latest` exclusions are the ones that matter: both are what a user gets when
+they ask for no version in particular, so a beta reaching either ships it to everyone.
+
+Release notes come from the first `## [` section of `CHANGELOG.md`, and a prerelease usually
+has none — the entry lands when the final version ships. When that section is empty the
+workflow falls back to notes generated from the commit range instead of publishing an empty
+release.
+
+The version in the artifacts comes from the *tag*, but the version compiled into the binary
+and into the `.deb`/`.rpm` metadata comes from `Cargo.toml`. Tagging a prerelease from a branch
+whose `Cargo.toml` has not been bumped is legitimate, so the workflow warns about the mismatch
+rather than failing — but `am --version` will report the crate's version, not the tag's.

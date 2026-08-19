@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+      # Prerelease tags: v1.2.3-beta.1, v1.2.3-rc.2. Everything downstream keys off the
+      # hyphen — the release is marked as a prerelease and the Homebrew tap is left alone,
+      # so `brew upgrade` users never see one.
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
 jobs:
   build:
@@ -123,12 +127,31 @@ jobs:
       contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Get version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          # A hyphen is what semver uses to mark a prerelease, and it is the only thing that
+          # distinguishes these tags from a normal one.
+          case "$version" in
+            *-*) echo "prerelease=true" >> $GITHUB_OUTPUT ;;
+            *)   echo "prerelease=false" >> $GITHUB_OUTPUT ;;
+          esac
+
+          # The packages take their version from Cargo.toml, not from the tag, so the two
+          # disagreeing produces artifacts whose name and contents differ. Warned rather than
+          # enforced: a prerelease cut from a branch before the version bump is a legitimate
+          # thing to do, and failing here would block exactly that.
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$crate" != "$version" ]; then
+            echo "::warning title=Version skew::tag says $version, Cargo.toml says $crate —" \
+                 "the binary will report $crate"
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -170,15 +193,35 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ steps.notes.outputs.NOTES }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "Release ${{ github.ref_name }}" \
-            --notes "${{ steps.notes.outputs.NOTES }}" \
-            release-files/*
+          args=(--title "Release ${{ github.ref_name }}")
+
+          # A prerelease usually has no CHANGELOG section yet — the entry lands when the final
+          # version ships. Rather than publish an empty release, or worse the *previous*
+          # version's notes, fall back to the commit list GitHub can generate.
+          if [ -n "${NOTES//[[:space:]]/}" ]; then
+            args+=(--notes "$NOTES")
+          else
+            echo "no CHANGELOG section for this version; generating notes from commits"
+            args+=(--generate-notes)
+          fi
+
+          # Marks it as a prerelease, which keeps it off the repository's front page as
+          # "Latest" and out of anything resolving the newest stable version.
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${{ github.ref_name }}" "${args[@]}" release-files/*
 
   homebrew:
     name: Update Homebrew Tap
     needs: release
+    # A prerelease must not reach the tap: the formula is what every `brew upgrade` follows,
+    # so publishing a beta there ships it to people who never asked for one.
+    if: needs.release.outputs.prerelease != 'true'
     runs-on: ubuntu-latest
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

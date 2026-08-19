@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+      # Prerelease tags publish images under their own version, but never move `latest`.
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   workflow_dispatch:
     inputs:
       tag:
@@ -42,10 +44,19 @@ jobs:
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
-            echo "version=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+            version="${{ inputs.tag }}"
           else
-            echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            version="${GITHUB_REF_NAME}"
           fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+          # `latest` is what anyone pulling without a tag gets, including am's own default
+          # image names — so a prerelease must not claim it. The hyphen is semver's prerelease
+          # marker and the only thing distinguishing these tags.
+          case "$version" in
+            *-*) echo "latest=false" >> $GITHUB_OUTPUT ;;
+            *)   echo "latest=true"  >> $GITHUB_OUTPUT ;;
+          esac
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -61,7 +72,7 @@ jobs:
           images: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
           tags: |
             type=raw,value=${{ steps.tag.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.tag.outputs.latest }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
