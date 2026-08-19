@@ -105,7 +105,25 @@ jobs:
         # ci.yml already covers — and cucumber shells out to a real jj, which this job has no
         # other reason to install. Narrowing keeps the two workflows from needing to be kept in
         # step over a dependency only one of them uses.
-        run: cargo test --bin am --features integration
+        run: |
+          set -o pipefail
+          if cargo test --bin am --features integration 2>&1 | tee /tmp/integration.log; then
+            exit 0
+          fi
+          # Republish the failure as a workflow annotation. The job log needs authentication to
+          # read, but annotations are part of the check run and visible to anyone who can see
+          # the pull request — so whoever (or whatever) is diagnosing this does not have to be
+          # the person holding the token. Newlines become %0A, which Actions renders as a
+          # multi-line annotation.
+          summary=$(
+            awk '/^failures:$/,0' /tmp/integration.log | head -40
+            echo '---'
+            grep -E "panicked at|assertion|^test .* FAILED" /tmp/integration.log | head -20
+          )
+          echo "::error title=Integration tests failed::$(
+            printf '%s' "$summary" | head -c 4000 | sed ':a;N;$!ba;s/\n/%0A/g'
+          )"
+          exit 1
 
       - name: Stop the local registries
         if: always()

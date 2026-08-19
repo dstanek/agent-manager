@@ -161,6 +161,80 @@ start_private() {
     "$rt" cp "$STATE/htpasswd" "${PRIVATE_NAME}:/etc/htpasswd"
 }
 
+# Check the things the tests assume, from the shell, before any test runs.
+#
+# Two of the tests depend on properties of this environment rather than of `am`: that the
+# private registry actually refuses anonymous callers, and that the credential `login` wrote is
+# somewhere `am` looks. When one of those is untrue the test failure names an assertion in Rust
+# and says nothing about the registry — so it gets checked here instead, where the message can
+# be about what is actually wrong.
+verify_contract() {
+    local rt="$1" code
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://localhost:${REGISTRY_PORT}/v2/amtest/base/manifests/1.0.0" \
+        -H 'Accept: application/vnd.oci.image.manifest.v1+json' || true)
+    if [ "$code" != "200" ]; then
+        echo "error: the published Feature is not readable anonymously (HTTP ${code})" >&2
+        diagnose
+        exit 1
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://localhost:${PRIVATE_PORT}/v2/" || true)
+    if [ "$code" != "401" ]; then
+        echo "error: the private registry answered ${code} anonymously, expected 401." >&2
+        echo "       Its htpasswd did not take effect, so the test that proves am sends" >&2
+        echo "       credentials would pass without am sending any." >&2
+        diagnose
+        exit 1
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        -u "${PRIVATE_USER}:${PRIVATE_PASS}" "http://localhost:${PRIVATE_PORT}/v2/" || true)
+    if [ "$code" != "200" ]; then
+        echo "error: the private registry rejected the credentials it was configured with" >&2
+        echo "       (HTTP ${code}) — so nothing could authenticate to it, am included." >&2
+        diagnose
+        exit 1
+    fi
+
+    # Where the credential landed, and in what form. `am` reads inline `auth` entries and
+    # credential helpers both, but only if it can find the file — and which file `login` writes
+    # depends on the runtime and the machine.
+    echo "==> credential written by ${rt} login:"
+    local found=no
+    for f in "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+             "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/containers/auth.json" \
+             "$HOME/.config/containers/auth.json"; do
+        [ -f "$f" ] || continue
+        python3 - "$f" "localhost:${PRIVATE_PORT}" <<'PYEOF' && found=yes
+import json, sys
+path, host = sys.argv[1], sys.argv[2]
+try:
+    doc = json.load(open(path))
+except Exception as e:
+    print(f"    {path}: unreadable ({e})")
+    raise SystemExit(1)
+entry = (doc.get("auths") or {}).get(host)
+store = doc.get("credsStore")
+helpers = (doc.get("credHelpers") or {}).get(host)
+if entry is None and not helpers:
+    raise SystemExit(1)
+how = "inline auth" if (entry or {}).get("auth") else "no inline auth"
+print(f"    {path}: entry for {host} present ({how})"
+      + (f", credsStore={store}" if store else "")
+      + (f", credHelper={helpers}" if helpers else ""))
+PYEOF
+    done
+    if [ "$found" != "yes" ]; then
+        echo "error: no auth entry for localhost:${PRIVATE_PORT} in any file am reads." >&2
+        echo "       ${rt} login reported success, so it stored the credential somewhere" >&2
+        echo "       else — that is the bug, not the test." >&2
+        exit 1
+    fi
+}
+
 up() {
     local rt
     rt="$(runtime)"
@@ -188,6 +262,8 @@ up() {
         exit 1
     fi
     publish "localhost:${PRIVATE_PORT}"
+
+    verify_contract "$rt"
 
     echo
     echo "Registries ready:"
