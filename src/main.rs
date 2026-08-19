@@ -723,7 +723,10 @@ fn cmd_start(
     let worktree_path = guard.path().to_path_buf();
 
     // ── Post-worktree preflight: the devcontainer config, if any ──────────────
-    let (container_cmd, mut session_container) = match runtime {
+    // `compose_guard` takes the compose project down if anything below fails before the
+    // session record exists — see `compose::ComposeGuard`. It is committed everywhere the
+    // worktree guard is, and always after `add_session_global`.
+    let (container_cmd, mut session_container, mut compose_guard) = match runtime {
         Some(ref runtime) => {
             let plan = plan_container(ContainerPlanInput {
                 slug,
@@ -740,9 +743,9 @@ fn cmd_start(
                 // A freshly started session never resumes anything.
                 resume: false,
             })?;
-            (Some(plan.cmd), Some(plan.session))
+            (Some(plan.cmd), Some(plan.session), plan.compose)
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     if let Some(container) = &mut session_container {
         container.container_name = Some(container_name.clone());
@@ -826,6 +829,10 @@ fn cmd_start(
         if !tmux::is_in_tmux() {
             session::add_session_global(new_session)?;
             guard.commit();
+            // Before the exec below, which never returns and so would never run the drop.
+            if let Some(project) = compose_guard.take() {
+                project.commit();
+            }
             println!("Started session '{slug}'");
             for line in start_detail_lines(
                 &worktree_path,
@@ -868,6 +875,9 @@ fn cmd_start(
         .map(|c| (c.mode, c.image.clone()));
     session::add_session_global(new_session)?;
     guard.commit();
+    if let Some(project) = compose_guard.take() {
+        project.commit();
+    }
 
     println!("Started session '{slug}'");
     for line in start_detail_lines(
@@ -950,6 +960,10 @@ struct ContainerPlanInput<'a> {
 struct ContainerPlan {
     cmd: Vec<String>,
     session: session::SessionContainer,
+    /// Present only for a compose session, and only until `cmd_start` records it. Held this
+    /// far up so that everything which can still fail — the tmux window, the session record —
+    /// happens while the project is still owned by a guard that will take it down.
+    compose: Option<compose::ComposeGuard>,
 }
 
 /// Container runtime detection, agent credential preflight, and leftover-container
@@ -1069,6 +1083,9 @@ fn plan_image(
             runtime.kind.to_string(),
             image.to_string(),
         ),
+        // Not a compose session: a plain container is `--rm`, so a later failure leaves
+        // nothing behind to roll back.
+        compose: None,
     })
 }
 
@@ -1231,6 +1248,7 @@ fn plan_devcontainer(
                 lifecycle_done: hooks_ran,
                 compose: Some(plan.1),
             },
+            compose: Some(plan.2),
         });
     }
 
@@ -1260,6 +1278,8 @@ fn plan_devcontainer(
             lifecycle_done: hooks_ran,
             compose: None,
         },
+        // The non-compose devcontainer path: a single `--rm` container, nothing to roll back.
+        compose: None,
     })
 }
 
@@ -1281,7 +1301,7 @@ fn plan_compose(
     trusted: &container::DevcontainerRuntime,
     agent_cmd: &[String],
     shutdown_action: Option<String>,
-) -> anyhow::Result<(Vec<String>, compose::SessionCompose)> {
+) -> anyhow::Result<(Vec<String>, compose::SessionCompose, compose::ComposeGuard)> {
     compose::check_network(&cfg.container.network)?;
     let service = json
         .service
@@ -1310,7 +1330,7 @@ fn plan_compose(
         override_path,
         run_services: json.run_services.clone(),
     };
-    compose::up(&runtime.bin, &project)?;
+    let guard = compose::ComposeGuard::up(&runtime.bin, &project)?;
     let mut cmd = compose::exec_command(&runtime.bin, &project, agent_cmd)?;
 
     // `shutdownAction` decides what happens when the *session* ends — the spec's "the tool
@@ -1328,7 +1348,7 @@ fn plan_compose(
         );
         cmd = vec!["sh".to_string(), "-c".to_string(), script];
     }
-    Ok((cmd, project))
+    Ok((cmd, project, guard))
 }
 
 /// The agent invocation appended as the container command, if there is one — or, for a
