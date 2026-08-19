@@ -637,8 +637,11 @@ pub(crate) fn get_host_uid_gid() -> Option<(u32, u32)> {
     Some(unsafe { (getuid(), getgid()) })
 }
 
+// Visibility must match the `cfg(unix)` arm above: `compose.rs` calls this, and a private
+// fallback compiles everywhere it is never selected — which is to say, everywhere the developer
+// who changed it was looking.
 #[cfg(not(unix))]
-fn get_host_uid_gid() -> Option<(u32, u32)> {
+pub(crate) fn get_host_uid_gid() -> Option<(u32, u32)> {
     None
 }
 
