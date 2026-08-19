@@ -934,9 +934,36 @@ mod tests {
 
     // ── Unknown keys ──────────────────────────────────────────────────────────
 
+    /// Every variable these tests set — see `container::tests::TOUCHED_ENV`.
+    const TOUCHED_ENV: [&str; 14] = [
+        "AM_AGENT",
+        "AM_CONTAINER_AGENT",
+        "AM_CONTAINER_IMAGE",
+        "AM_CONTAINER_MODE",
+        "AM_CONTAINER_USER",
+        "AM_DEVCONTAINER_AGENT_INSTALL",
+        "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
+        "AM_DEVCONTAINER_ALLOW_HOST_MOUNTS",
+        "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
+        "AM_DEVCONTAINER_PATH",
+        "AM_TMUX_SPLIT_PERCENT",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+    ];
+
+    /// Serialises the tests that mutate process-wide environment variables, and puts every one
+    /// of them back when the test ends — including when it ends by panicking. Clearing a
+    /// variable a test did not set is not the same as restoring it; see `EnvGuard`.
+    fn lock_env() -> (std::sync::MutexGuard<'static, ()>, crate::test_support::EnvGuard) {
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let env = crate::test_support::EnvGuard::saving(&TOUCHED_ENV);
+        (lock, env)
+    }
+
     #[test]
     fn unknown_keys_are_collected_not_rejected() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -991,7 +1018,7 @@ imag = "nope:latest"
 
     #[test]
     fn a_clean_config_reports_no_unknown_keys() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1009,7 +1036,7 @@ imag = "nope:latest"
 
     #[test]
     fn unknown_keys_name_the_file_they_came_from() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1044,7 +1071,7 @@ imag = "nope:latest"
 
     #[test]
     fn project_agent_beats_global_agent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1058,7 +1085,7 @@ imag = "nope:latest"
 
     #[test]
     fn env_agent_beats_both_config_files() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::set_var("AM_AGENT", "gemini");
         let tmp = TempDir::new().unwrap();
@@ -1072,7 +1099,7 @@ imag = "nope:latest"
 
     #[test]
     fn container_agent_is_no_longer_a_way_to_set_the_agent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_AGENT"]);
         std::env::remove_var("AM_AGENT");
         // Neither the retired file key nor its env var may resurrect the inversion.
@@ -1094,7 +1121,7 @@ imag = "nope:latest"
 
     #[test]
     fn defaults_when_no_config_files() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1125,7 +1152,7 @@ imag = "nope:latest"
 
     #[test]
     fn project_config_overrides_global() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1160,7 +1187,7 @@ image = "project-image"
 
     #[test]
     fn project_config_inherits_unset_global_fields() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1245,7 +1272,7 @@ image = "myimage"
 
     #[test]
     fn env_vars_override_project_config() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_IMAGE"]);
         let tmp = TempDir::new().unwrap();
 
@@ -1302,7 +1329,7 @@ image = "project-image"
 
     #[test]
     fn agent_image_overridden_in_project_config() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1334,7 +1361,7 @@ image = "myorg/am-claude:custom"
 
     #[test]
     fn agent_images_merged_across_global_and_project() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1414,7 +1441,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn unknown_attach_key_is_collected_not_rejected() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
         std::env::remove_var("AM_AGENT");
         let tmp = TempDir::new().unwrap();
@@ -1438,7 +1465,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn global_state_dir_uses_xdg_state_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         let xdg_dir = tmp.path().join("xdg_state");
@@ -1451,7 +1478,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn global_state_dir_falls_back_to_home_local_state() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::remove_var("XDG_STATE_HOME");
@@ -1466,7 +1493,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn global_state_dir_returns_none_without_home_or_xdg() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         std::env::remove_var("XDG_STATE_HOME");
         std::env::remove_var("HOME");
@@ -1477,7 +1504,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn global_config_path_uses_xdg_config_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_CONFIG_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         let xdg_dir = tmp.path().join("xdg");
@@ -1490,7 +1517,7 @@ image = "myorg/am-claude:project"
 
     #[test]
     fn global_config_path_falls_back_to_home_dot_config() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_CONFIG_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::remove_var("XDG_CONFIG_HOME");
@@ -1553,7 +1580,7 @@ env = ["--rm"]
 
     #[test]
     fn split_percent_out_of_range_in_toml_fails() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::remove_var("AM_TMUX_SPLIT_PERCENT");
         let tmp = TempDir::new().unwrap();
@@ -1574,7 +1601,7 @@ split_percent = 100
 
     #[test]
     fn split_percent_zero_in_toml_fails() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::remove_var("AM_TMUX_SPLIT_PERCENT");
         let tmp = TempDir::new().unwrap();
@@ -1591,7 +1618,7 @@ split_percent = 0
 
     #[test]
     fn split_percent_env_var_out_of_range_errors() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::set_var("AM_TMUX_SPLIT_PERCENT", "0");
 
@@ -1604,7 +1631,7 @@ split_percent = 0
 
     #[test]
     fn split_percent_env_var_over_max_errors() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::set_var("AM_TMUX_SPLIT_PERCENT", "100");
 
@@ -1614,7 +1641,7 @@ split_percent = 0
 
     #[test]
     fn split_percent_env_var_non_numeric_errors() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::set_var("AM_TMUX_SPLIT_PERCENT", "fifty");
 
@@ -1624,7 +1651,7 @@ split_percent = 0
 
     #[test]
     fn split_percent_env_var_valid_value_applied() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_TMUX_SPLIT_PERCENT"]);
         std::env::set_var("AM_TMUX_SPLIT_PERCENT", "30");
 
@@ -1664,7 +1691,7 @@ user = "../root"
 
     #[test]
     fn env_var_can_override_container_user() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_USER"]);
         std::env::set_var("AM_CONTAINER_USER", "dev-user1");
 
@@ -1675,7 +1702,7 @@ user = "../root"
 
     #[test]
     fn load_with_global_errors_on_invalid_container_user_in_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_USER"]);
         std::env::set_var("AM_CONTAINER_USER", "../root");
 
@@ -1691,7 +1718,7 @@ user = "../root"
         // A repo that describes its environment in .devcontainer/ means for that
         // description to be used; preferring an am-specific image over it is the
         // surprising behaviour. Repos without a config fall back to an image.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
         std::env::remove_var("AM_CONTAINER_MODE");
 
@@ -1703,7 +1730,7 @@ user = "../root"
     #[test]
     fn explicit_image_mode_still_overrides_the_default() {
         // The escape hatch for a repo whose devcontainer am cannot use.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
         std::env::remove_var("AM_CONTAINER_MODE");
         let tmp = TempDir::new().unwrap();
@@ -1716,7 +1743,7 @@ user = "../root"
 
     #[test]
     fn container_mode_reads_from_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
         std::env::remove_var("AM_CONTAINER_MODE");
         let tmp = TempDir::new().unwrap();
@@ -1733,7 +1760,7 @@ user = "../root"
 
     #[test]
     fn container_mode_env_overrides_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_CONTAINER_MODE"]);
         let tmp = TempDir::new().unwrap();
         let path = write_toml(tmp.path(), "project.toml", "[container]\nmode = \"image\"\n");
@@ -1746,7 +1773,7 @@ user = "../root"
 
     #[test]
     fn devcontainer_defaults_are_conservative() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&[
             "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
             "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
@@ -1767,7 +1794,7 @@ user = "../root"
 
     #[test]
     fn devcontainer_section_reads_from_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&[
             "AM_DEVCONTAINER_PATH",
             "AM_DEVCONTAINER_AGENT_INSTALL",
@@ -1809,7 +1836,7 @@ user = "../root"
         // Setting one must not silently grant the others — that is the entire point of the
         // split. See devcontainer.rs's own independence tests for the runtime behaviour this
         // config shape feeds into.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&[
             "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
             "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
@@ -1844,7 +1871,7 @@ user = "../root"
     /// is silent: the flag simply stays on.
     #[test]
     fn a_project_config_can_turn_off_what_the_global_config_turned_on() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&[
             "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
             "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
@@ -1884,7 +1911,7 @@ user = "../root"
     /// The environment is the highest layer, and must also be able to say `false`.
     #[test]
     fn the_environment_overrides_both_files_including_an_explicit_false() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&[
             "AM_DEVCONTAINER_ALLOW_HOST_COMMANDS",
             "AM_DEVCONTAINER_ALLOW_RUNTIME_ESCALATION",
@@ -1925,7 +1952,7 @@ user = "../root"
     /// and a global value survives where the project file is silent.
     #[test]
     fn the_project_layer_wins_per_key_rather_than_wholesale() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT", "AM_CONTAINER_MODE"]);
         std::env::remove_var("AM_AGENT");
         std::env::remove_var("AM_CONTAINER_MODE");
@@ -1950,7 +1977,7 @@ user = "../root"
     #[test]
     fn extra_features_merge_rather_than_replace() {
         // A project adding one Feature should not have to restate the global set.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let tmp = TempDir::new().unwrap();
         let global = write_toml(
             tmp.path(),
@@ -1970,7 +1997,7 @@ user = "../root"
 
     #[test]
     fn claude_maps_to_the_official_devcontainer_feature() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let config = load_with_global(None, None).unwrap();
 
         assert_eq!(
@@ -1981,7 +2008,7 @@ user = "../root"
 
     #[test]
     fn agents_without_a_published_feature_map_to_none() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let config = load_with_global(None, None).unwrap();
 
         assert_eq!(resolve_agent_feature(Some("copilot"), &config), None);
@@ -1991,7 +2018,7 @@ user = "../root"
 
     #[test]
     fn devcontainer_feature_can_be_overridden_per_agent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let tmp = TempDir::new().unwrap();
         let path = write_toml(
             tmp.path(),

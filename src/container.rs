@@ -1244,8 +1244,26 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Every variable these tests set. Listing them here rather than restoring each at its own
+    /// call site is what makes the restoration exhaustive by construction.
+    const TOUCHED_ENV: [&str; 8] = [
+        "AM_DOCKER_BIN",
+        "AM_GH_BIN",
+        "AM_PODMAN_BIN",
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        "MOCK_CONTAINER_LOG",
+        "OPENAI_API_KEY",
+        "SSH_AUTH_SOCK",
+    ];
+
+    /// Serialises the tests that mutate process-wide environment variables, and puts every one
+    /// of them back when the test ends — including when it ends by panicking. Clearing a
+    /// variable a test did not set is not the same as restoring it; see `EnvGuard`.
+    fn lock_env() -> (std::sync::MutexGuard<'static, ()>, crate::test_support::EnvGuard) {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let env = crate::test_support::EnvGuard::saving(&TOUCHED_ENV);
+        (lock, env)
     }
 
     #[test]

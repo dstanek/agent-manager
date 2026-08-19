@@ -129,12 +129,19 @@ fn auth_file_paths() -> Vec<PathBuf> {
     if let Ok(dir) = std::env::var("DOCKER_CONFIG") {
         paths.push(PathBuf::from(dir).join("config.json"));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(PathBuf::from(&home).join(".docker/config.json"));
-        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            paths.push(PathBuf::from(runtime).join("containers/auth.json"));
-        }
-        paths.push(PathBuf::from(&home).join(".config/containers/auth.json"));
+    let home = std::env::var("HOME").ok();
+    if let Some(home) = &home {
+        paths.push(PathBuf::from(home).join(".docker/config.json"));
+    }
+    // Not nested under `HOME`: `$XDG_RUNTIME_DIR` is where `podman login` writes by default and
+    // it names an absolute path of its own. Gating it on `HOME` meant that a process with a
+    // perfectly good runtime credential could not see it merely because `HOME` was unset — the
+    // two are independent, and the file the runtime actually wrote is the one that matters.
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        paths.push(PathBuf::from(runtime).join("containers/auth.json"));
+    }
+    if let Some(home) = &home {
+        paths.push(PathBuf::from(home).join(".config/containers/auth.json"));
     }
     paths
 }
@@ -227,31 +234,49 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Every variable `auth_file_paths` consults. A helper that scrubs only some of them leaves
+    /// the lookup free to fall through to the developer's real credentials, which is how a test
+    /// asserting "nothing was found" passes on CI and fails on the one machine that is logged in.
+    const AUTH_ENV: [&str; 4] =
+        ["REGISTRY_AUTH_FILE", "DOCKER_CONFIG", "HOME", "XDG_RUNTIME_DIR"];
+
+    /// Restores the environment on drop, so a panicking assertion inside the closure cannot
+    /// leak a temp path into every test that runs after it.
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        /// Clear `vars`, remembering what they were.
+        fn clearing(vars: &[&'static str]) -> Self {
+            let saved =
+                vars.iter().map(|k| (*k, std::env::var(k).ok())).collect::<Vec<_>>();
+            for (key, _) in &saved {
+                std::env::remove_var(key);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Point every auth-file path at `dir`, so the developer's real credentials are never read.
     fn with_auth_file(body: &str, f: impl FnOnce()) {
         let _g = lock_env();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("auth.json");
         std::fs::write(&path, body).unwrap();
-        let previous = std::env::var("REGISTRY_AUTH_FILE").ok();
-        let home = std::env::var("HOME").ok();
-        let docker = std::env::var("DOCKER_CONFIG").ok();
+        let _env = EnvGuard::clearing(&AUTH_ENV);
         std::env::set_var("REGISTRY_AUTH_FILE", &path);
-        std::env::remove_var("HOME");
-        std::env::remove_var("DOCKER_CONFIG");
 
         f();
-
-        match previous {
-            Some(v) => std::env::set_var("REGISTRY_AUTH_FILE", v),
-            None => std::env::remove_var("REGISTRY_AUTH_FILE"),
-        }
-        if let Some(v) = home {
-            std::env::set_var("HOME", v);
-        }
-        if let Some(v) = docker {
-            std::env::set_var("DOCKER_CONFIG", v);
-        }
     }
 
     #[test]
@@ -329,22 +354,12 @@ mod tests {
         std::fs::write(&file, auth_file).unwrap();
 
         let old_path = std::env::var("PATH").unwrap_or_default();
-        let old_auth = std::env::var("REGISTRY_AUTH_FILE").ok();
-        let old_home = std::env::var("HOME").ok();
+        let _env = EnvGuard::clearing(&AUTH_ENV);
+        let _path = EnvGuard::clearing(&["PATH"]);
         std::env::set_var("PATH", format!("{}:{old_path}", tmp.path().display()));
         std::env::set_var("REGISTRY_AUTH_FILE", &file);
-        std::env::remove_var("HOME");
 
         f();
-
-        std::env::set_var("PATH", old_path);
-        match old_auth {
-            Some(v) => std::env::set_var("REGISTRY_AUTH_FILE", v),
-            None => std::env::remove_var("REGISTRY_AUTH_FILE"),
-        }
-        if let Some(v) = old_home {
-            std::env::set_var("HOME", v);
-        }
     }
 
     #[cfg(unix)]

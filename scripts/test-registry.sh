@@ -139,6 +139,20 @@ publish() {
     fi
 }
 
+# A docker-format config.json holding the private registry's credential, for the reference CLI
+# alone. The CLI reads `$DOCKER_CONFIG/config.json` and nothing else — it has no idea podman
+# keeps its credentials in `$XDG_RUNTIME_DIR/containers/auth.json`, so under podman the publish
+# to the private registry fails with "No basic auth credentials to send" even though `login`
+# just succeeded. This is only about letting the *fixtures get published*; `am` is still left to
+# find the runtime's own auth file, which is the thing under test.
+cli_docker_config() {
+    mkdir -p "$STATE/docker-config"
+    printf '{"auths":{"localhost:%s":{"auth":"%s"}}}\n' \
+        "$PRIVATE_PORT" "$(printf '%s:%s' "$PRIVATE_USER" "$PRIVATE_PASS" | base64 -w0)" \
+        > "$STATE/docker-config/config.json"
+    echo "$STATE/docker-config"
+}
+
 # The private registry exists to exercise one thing the public ones cannot: am reading a
 # credential out of a runtime auth file and sending it. htpasswd comes from the httpd image
 # rather than a host package, because bcrypt is not something to hand-roll in a shell script.
@@ -254,14 +268,23 @@ up() {
 
     # Logging in writes the credential to the same auth file am reads, which is the point: the
     # test proves am finds it there, not that it can be handed one.
+    #
+    # `--tls-verify=false` is podman-only and not optional: docker treats localhost as an
+    # insecure registry implicitly, podman does not, so without it `podman login` speaks TLS to
+    # an HTTP port and fails with "server gave HTTP response to HTTPS client". Docker has no
+    # such flag, hence the branch rather than an unconditional argument.
     echo "==> logging in to localhost:${PRIVATE_PORT}"
-    if ! "$rt" login "localhost:${PRIVATE_PORT}" \
+    local login_args=()
+    case "$rt" in
+        *podman*) login_args+=(--tls-verify=false) ;;
+    esac
+    if ! "$rt" login "localhost:${PRIVATE_PORT}" "${login_args[@]}" \
         -u "$PRIVATE_USER" -p "$PRIVATE_PASS" >"$STATE/login.log" 2>&1; then
         cat "$STATE/login.log" >&2
         echo "error: could not log in to the private registry" >&2
         exit 1
     fi
-    publish "localhost:${PRIVATE_PORT}"
+    DOCKER_CONFIG="$(cli_docker_config)" publish "localhost:${PRIVATE_PORT}"
 
     verify_contract "$rt"
 
