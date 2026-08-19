@@ -240,32 +240,7 @@ mod tests {
     const AUTH_ENV: [&str; 4] =
         ["REGISTRY_AUTH_FILE", "DOCKER_CONFIG", "HOME", "XDG_RUNTIME_DIR"];
 
-    /// Restores the environment on drop, so a panicking assertion inside the closure cannot
-    /// leak a temp path into every test that runs after it.
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-    impl EnvGuard {
-        /// Clear `vars`, remembering what they were.
-        fn clearing(vars: &[&'static str]) -> Self {
-            let saved =
-                vars.iter().map(|k| (*k, std::env::var(k).ok())).collect::<Vec<_>>();
-            for (key, _) in &saved {
-                std::env::remove_var(key);
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+    use crate::test_support::EnvGuard;
 
     /// Point every auth-file path at `dir`, so the developer's real credentials are never read.
     fn with_auth_file(body: &str, f: impl FnOnce()) {
