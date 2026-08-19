@@ -50,15 +50,28 @@ jobs:
 
       - name: Install the reference Dev Containers CLI
         run: |
-          # Pinned, and kept in step with .devcontainer/Dockerfile: these tests assert that am
-          # agrees with a specific implementation, so an unpinned CLI turns an upstream release
-          # into a failure on a pull request that changed nothing related — and a local run that
-          # disagrees with this job is worse than either. Both carry a renovate comment, so they
-          # are bumped together.
-          # renovate: datasource=npm depName=@devcontainers/cli
-          DEVCONTAINER_VERSION=0.88.0
-          npm install -g "@devcontainers/cli@${DEVCONTAINER_VERSION}"
-          devcontainer --version
+          # The version is read out of .devcontainer/Dockerfile rather than restated here, so
+          # there is exactly one place to bump and no way for a local differential run and this
+          # job to compare against different reference implementations — which would quietly
+          # make both results meaningless. The Dockerfile carries the renovate comment.
+          #
+          # Two ARG lines declare this name; only the one with a default holds the version, and
+          # the `=` in the pattern is what selects it.
+          version="$(sed -n 's/^ARG DEVCONTAINER_CLI_VERSION=//p' .devcontainer/Dockerfile | head -1)"
+          if [ -z "$version" ]; then
+            echo "could not read DEVCONTAINER_CLI_VERSION from .devcontainer/Dockerfile" >&2
+            echo "(was the ARG renamed? this job must not silently install 'latest')" >&2
+            exit 1
+          fi
+          echo "pinned by the dev container image: $version"
+          npm install -g "@devcontainers/cli@${version}"
+          # Belt and braces: prove the CLI on PATH is the one just asked for, since a runner
+          # image shipping its own would otherwise be used without anyone noticing.
+          installed="$(devcontainer --version)"
+          if [ "$installed" != "$version" ]; then
+            echo "expected devcontainer $version on PATH, got $installed" >&2
+            exit 1
+          fi
 
       # Docker Hub's anonymous pull limit is per runner IP and shared with every other job on
       # that IP, so `registry:2`, `httpd:2` and `debian:bookworm-slim` are the likeliest source
