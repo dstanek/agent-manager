@@ -10,6 +10,10 @@ on:
       - '.github/workflows/docs.yml'
   push:
     tags:
+      # Stable tags only, deliberately. release.yml and images.yml also match prerelease tags
+      # (v1.2.3-beta.1); this one does not, because the published site has no notion of
+      # versions — deploying from a beta would replace the documentation for the release
+      # people are actually running.
       - 'v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
 
