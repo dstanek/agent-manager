@@ -113,7 +113,13 @@ has none — the entry lands when the final version ships. When that section is 
 workflow falls back to notes generated from the commit range instead of publishing an empty
 release.
 
-The version in the artifacts comes from the *tag*, but the version compiled into the binary
-and into the `.deb`/`.rpm` metadata comes from `Cargo.toml`. Tagging a prerelease from a branch
-whose `Cargo.toml` has not been bumped is legitimate, so the workflow warns about the mismatch
-rather than failing — but `am --version` will report the crate's version, not the tag's.
+The tag is the version. Before building, the release workflow rewrites `[package] version` in
+`Cargo.toml` from the tag, so the archive names, the `.deb`/`.rpm` metadata and `am --version`
+all agree with the tag that triggered the build — including for a prerelease cut from a branch
+whose `Cargo.toml` has not been bumped. Only the `[package]` entry is touched; if that line
+cannot be found the release fails rather than shipping artifacts labelled one version and
+containing another.
+
+The rewrite is confined to the build. `Cargo.toml` in the repository is not updated by it, so
+bump it separately when a release lands or local builds will keep reporting the older number —
+the workflow emits a notice when the two differ.

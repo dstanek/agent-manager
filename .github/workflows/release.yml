@@ -54,6 +54,39 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The tag is the version. Everything downstream — the binary's own --version, the .deb
+      # and .rpm metadata, the archive names — reads Cargo.toml, so setting it here is what
+      # makes them all agree with the tag that triggered the build. Without this a beta cut
+      # from a branch whose version was not bumped ships artifacts named for the tag
+      # containing a binary that reports something else.
+      #
+      # Only the [package] version: dependency entries match `^version = ` too, and the
+      # package block is the first in the file. awk exits non-zero if it substituted nothing,
+      # so a change to Cargo.toml's shape fails the release rather than silently shipping the
+      # wrong version.
+      - name: Set the crate version from the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^\[/ { in_pkg = ($0 == "[package]") }
+            in_pkg && /^version = / && !done { print "version = \"" v "\""; done = 1; next }
+            { print }
+            END { if (!done) exit 1 }
+          ' Cargo.toml > Cargo.toml.tagged || {
+            echo "::error title=Version not set::no [package] version line found in Cargo.toml"
+            exit 1
+          }
+          mv Cargo.toml.tagged Cargo.toml
+
+          set=$(awk '/^\[/ { in_pkg = ($0 == "[package]") }
+                     in_pkg && /^version = / { print; exit }' Cargo.toml)
+          echo "Cargo.toml now says: $set"
+          [ "$set" = "version = \"$version\"" ] || {
+            echo "::error title=Version not set::expected version = \"$version\", got $set"
+            exit 1
+          }
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -143,14 +176,14 @@ jobs:
             *)   echo "prerelease=false" >> $GITHUB_OUTPUT ;;
           esac
 
-          # The packages take their version from Cargo.toml, not from the tag, so the two
-          # disagreeing produces artifacts whose name and contents differ. Warned rather than
-          # enforced: a prerelease cut from a branch before the version bump is a legitimate
-          # thing to do, and failing here would block exactly that.
+          # The build job rewrites Cargo.toml from the tag, so the artifacts and the binary
+          # both report $version whatever this ref happens to say. A difference is worth
+          # noting — the repository should be bumped so local builds agree — but it is not a
+          # problem with the release, so it is a notice rather than a warning.
           crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$crate" != "$version" ]; then
-            echo "::warning title=Version skew::tag says $version, Cargo.toml says $crate —" \
-                 "the binary will report $crate"
+            echo "::notice title=Version::released as $version from the tag; Cargo.toml on" \
+                 "this ref says $crate — bump it so local builds match"
           fi
 
       - name: Download all artifacts
