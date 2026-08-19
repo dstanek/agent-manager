@@ -22,7 +22,22 @@ make build-copilot       # Build Copilot Docker image
 - Mock tmux via `AM_TMUX_BIN`; mock container runtimes via `AM_PODMAN_BIN`/`AM_DOCKER_BIN`; mock the Dev Containers CLI via `AM_DEVCONTAINER_BIN`; point the Feature cache at a scratch directory via `AM_FEATURE_CACHE`
 - Tests run single-threaded: `.cargo/config.toml` sets `RUST_TEST_THREADS = "1"`. A test that writes a mock script and then execs it fails with `ETXTBSY` if any other thread forks while the file is still open for writing, because the child inherits the write descriptor. Per-module mutexes cannot prevent this — the contended resource is the process-wide fd table — so the whole binary is serialized instead. Do not remove this without moving the exec-mock tests to their own test target.
 - Test git fixtures commit with `--no-verify`: a developer's global `init.templatedir` can install a `commit-msg` hook into every `git init`
-- Tests mutating env vars use a mutex to serialize execution
+- Tests mutating env vars use a mutex to serialize execution, and `lock_env()` in each module
+  returns an `EnvGuard` (`src/test_support.rs`) that *restores* them afterwards. Restoring, not
+  clearing: a test that ends with `remove_var("AM_DOCKER_BIN")` throws away whatever the
+  developer had set, and every later test in the binary — one process, one thread, fixed order —
+  sees it unset. This is invisible wherever the fallback happens to be right and fails
+  everywhere else: a `--features integration` run on a podman-only host had five differential
+  tests fail with `failed to run pull: No such file or directory`, each of which passed when run
+  alone, because the fallback is `/usr/bin/docker`. Add a variable to the module's `TOUCHED_ENV`
+  rather than restoring it at the call site.
+- The four infrastructure tiers each want something the bare host may not have. On a podman-only
+  machine: `AM_DOCKER_BIN=/usr/bin/podman` for `integration-cli`, `scripts/test-registry.sh up`
+  for `integration-registry`, and `integration-compose` needs a real Docker Compose v2 —
+  `podman compose` does not count when it is only a shim over `podman-compose` (`am` detects
+  that and refuses). Until a branch's tarball fixture lands on `main`, `integration-network`
+  needs `AM_TARBALL_FIXTURE_URL` pointed at the branch's raw URL; see
+  `tests/fixtures/tarball/README.md`.
 - The `cucumber` crate's `{string}` capture does not unescape *any* backslash sequence — not `\"`, not `\x1b`, not `\n` inside a `Then`/`And` assertion (as opposed to a `Given .. containing "..."` step, whose handler unescapes manually before writing a file — see e.g. `given_project_config`). A step written as `does not contain "agent = \"codex\""` or `does not contain "\x1b[2m"` compares against the literal backslash characters, which real output never contains, so it passes whether or not the thing it's meant to catch is present — a silently vacuous assertion (confirmed twice: once for `\"`, once for `\x1b` in `init.feature`, which stayed green through injected dimming it was written to catch). Fixes differ by what's being escaped: a double quote in the *expected* text — use single-quoted Gherkin strings (`does not contain 'agent = "codex"'`); an ANSI escape byte — compare the real `\u{1b}` byte in a dedicated Rust step function instead of through `{string}` (see `then_output_contains_dimmed_line`/`then_output_contains_plain_line`/`then_output_contains_note_line` in `tests/cucumber.rs`, and force color on for the scenario via `Given I have set env "NO_COLOR" to ""` + `And I have set env "CLICOLOR_FORCE" to "1"`, since the harness's default `NO_COLOR=1` never emits color to check in the first place).
 - The pty-based interactive test harness (`run_am_pty` in `tests/cucumber.rs`) gives `am` a real pty via `script`; a scripted input line missing its trailing `\n` leaves the child blocked forever in canonical-mode `read()` rather than failing fast.
 - Tests that need infrastructure are selected by cargo feature, not by `--ignored`: `integration-cli`

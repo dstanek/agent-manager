@@ -25,9 +25,12 @@ Docker always does, podman from **4.7** — and otherwise falls back to a standa
 `docker-compose` binary, pointing it at podman's socket when that is the runtime. This is what
 `podman compose` does internally, so `am` is doing what a newer podman would have done for it.
 
-`podman-compose` is not used: it is a different implementation with no `config` command, which is
-what `am` needs to read the compose file without carrying a YAML parser. `am doctor` reports
-whether a usable Compose was found.
+`podman-compose` is not used: it is a different implementation whose `config` does not take
+`--format json`, which is what `am` needs to read the compose file without carrying a YAML
+parser. `podman compose` can itself be a shim over `podman-compose` on a host where that is the
+only provider installed — `am` checks what answered rather than trusting the subcommand, and
+treats that case as no Compose being available. `am doctor` reports whether a usable Compose was
+found.
 
 Three things to know about compose sessions:
 

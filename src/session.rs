@@ -383,6 +383,18 @@ mod tests {
 
     // ── find_session ────────────────────────────────────────────────────────────
 
+    /// Every variable these tests set — see `container::tests::TOUCHED_ENV`.
+    const TOUCHED_ENV: [&str; 2] = ["HOME", "XDG_STATE_HOME"];
+
+    /// Serialises the tests that mutate process-wide environment variables, and puts every one
+    /// of them back when the test ends — including when it ends by panicking. Clearing a
+    /// variable a test did not set is not the same as restoring it; see `EnvGuard`.
+    fn lock_env() -> (std::sync::MutexGuard<'static, ()>, crate::test_support::EnvGuard) {
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let env = crate::test_support::EnvGuard::saving(&TOUCHED_ENV);
+        (lock, env)
+    }
+
     #[test]
     fn find_session_returns_none_for_missing_slug() {
         let sessions = vec![make_session("feat")];
@@ -401,7 +413,7 @@ mod tests {
 
     #[test]
     fn sessions_roundtrip_json() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -437,7 +449,7 @@ mod tests {
     /// perfectly valid JSON file that is simply missing sessions.
     #[test]
     fn concurrent_adds_all_survive() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -472,7 +484,7 @@ mod tests {
     /// not both win, or `am` ends up with two sessions it cannot tell apart.
     #[test]
     fn concurrent_adds_of_one_slug_leave_exactly_one() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -501,7 +513,7 @@ mod tests {
     /// Removals racing against unrelated updates must not take an innocent record with them.
     #[test]
     fn a_concurrent_remove_leaves_unrelated_sessions_alone() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -534,7 +546,7 @@ mod tests {
 
     #[test]
     fn agent_roundtrips_json() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -552,7 +564,7 @@ mod tests {
     fn legacy_record_without_agent_field_loads_as_none() {
         // Sessions written before Session.agent existed have no "agent" key at all.
         // #[serde(default)] must make that load as None rather than erroring.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -582,7 +594,7 @@ mod tests {
 
     #[test]
     fn devcontainer_session_roundtrips_json() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -615,7 +627,7 @@ mod tests {
     fn legacy_records_without_repo_root_migrate_correctly() {
         // Sessions on disk predate the repo_root field and devcontainer fields;
         // migration must handle missing fields gracefully.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -652,7 +664,7 @@ mod tests {
 
     #[test]
     fn global_sessions_path_uses_xdg_state_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -664,7 +676,7 @@ mod tests {
 
     #[test]
     fn global_sessions_path_falls_back_to_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::remove_var("XDG_STATE_HOME");
@@ -685,7 +697,7 @@ mod tests {
 
     #[test]
     fn global_sessions_path_returns_none_without_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         std::env::remove_var("XDG_STATE_HOME");
         std::env::remove_var("HOME");
@@ -697,7 +709,7 @@ mod tests {
 
     #[test]
     fn add_session_global_enforces_repo_slug_uniqueness() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -712,7 +724,7 @@ mod tests {
 
     #[test]
     fn add_session_global_allows_same_slug_in_different_repos() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -731,7 +743,7 @@ mod tests {
 
     #[test]
     fn load_sessions_for_repo_filters_by_repo_root() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -754,7 +766,7 @@ mod tests {
 
     #[test]
     fn load_sessions_for_repo_returns_empty_when_no_global_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -768,7 +780,7 @@ mod tests {
 
     #[test]
     fn remove_session_global_removes_correct_record() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -786,7 +798,7 @@ mod tests {
 
     #[test]
     fn remove_session_global_errors_when_not_found() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -806,7 +818,7 @@ mod tests {
 
     #[test]
     fn migrate_sessions_moves_records_and_deletes_old_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -840,7 +852,7 @@ mod tests {
 
     #[test]
     fn migrate_sessions_is_idempotent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -870,7 +882,7 @@ mod tests {
 
     #[test]
     fn migrate_sessions_skips_duplicates() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -907,7 +919,7 @@ mod tests {
 
     #[test]
     fn migrate_sessions_handles_malformed_old_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());
@@ -926,7 +938,7 @@ mod tests {
 
     #[test]
     fn migrate_sessions_handles_zero_records_deletes_file() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = lock_env();
         let _env = EnvGuard::save(&["XDG_STATE_HOME", "HOME"]);
         let tmp = TempDir::new().unwrap();
         std::env::set_var("XDG_STATE_HOME", tmp.path());

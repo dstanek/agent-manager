@@ -105,12 +105,18 @@ pub struct Provider {
 /// Find a usable Compose.
 ///
 /// Two are accepted, and they are the same implementation: Compose v2 as a runtime subcommand,
-/// or as a standalone `docker-compose` binary. This mirrors what `podman compose` does
-/// internally — it delegates to exactly this binary.
+/// or as a standalone `docker-compose` binary.
 ///
-/// `podman-compose` is deliberately **not** accepted. It is a separate implementation with no
-/// `config` subcommand at all, and `config --format json` is what lets `am` resolve a compose
-/// file without carrying a YAML parser. Selecting it would fail later and less clearly.
+/// `podman-compose` is deliberately **not** accepted. It is a separate implementation whose
+/// `config` does not take `--format json`, and that is what lets `am` resolve a compose file
+/// without carrying a YAML parser. Selecting it would fail later and less clearly.
+///
+/// Which is why `podman compose` is not taken at its word. It is a shim that hands off to
+/// whichever external provider it finds, preferring `docker-compose` but falling back to
+/// `podman-compose` — so on a host that has only the latter, `podman compose version` answers
+/// happily and selects the one implementation this module exists to rule out. The failure
+/// surfaced much later, as `unrecognized arguments: --format json` from a binary the caller
+/// never named.
 pub fn provider(runtime_bin: &Path) -> Result<Provider> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -152,12 +158,31 @@ fn resolve_provider(runtime_bin: &Path) -> Option<Provider> {
     None
 }
 
-/// Whether an argv prefix answers `version` — the cheapest question Compose can be asked.
+/// Whether an argv prefix answers `version` — the cheapest question Compose can be asked — and
+/// answers it as something other than `podman-compose`.
+///
+/// The output is read rather than discarded because a zero exit status only proves *a* Compose
+/// is there, not a usable one: `podman compose` delegates to `podman-compose` when that is all
+/// the host has, and `podman-compose version` succeeds. It names itself while doing so, in
+/// stdout and in the banner `podman compose` writes to stderr, so that is the thing to look at.
+///
+/// Identifying the incompatible implementation by name, rather than probing for `config
+/// --format json`, is deliberate: the probe would have to invent a compose file to run against,
+/// and a false negative there would reject a real Compose v2 and break the working path. No
+/// Compose v2 version banner mentions `podman-compose`.
 fn usable(argv: &[String]) -> bool {
     let mut cmd = command(argv);
     cmd.arg("version");
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    let Ok(out) = cmd.output() else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    !said.contains("podman-compose")
 }
 
 fn is_podman(runtime_bin: &Path) -> bool {
@@ -186,10 +211,11 @@ fn no_provider(runtime_bin: &Path) -> anyhow::Error {
     let runtime = runtime_bin.file_stem().unwrap_or_default().to_string_lossy();
     AmError::ContainerError(format!(
         "this devcontainer uses dockerComposeFile, but no Docker Compose was found\n\
-         `{runtime} compose` is unavailable — podman only grew it in 4.7 — and there is no \
-         `docker-compose` on PATH either\n\
-         Install Docker Compose v2. podman-compose will not do: it has no `config` command, \
-         which am needs to read the compose file"
+         `{runtime} compose` is unavailable — podman only grew it in 4.7, and where it exists \
+         it may be delegating to podman-compose — and there is no `docker-compose` on PATH \
+         either\n\
+         Install Docker Compose v2. podman-compose will not do: its `config` does not take \
+         `--format json`, which am needs to read the compose file"
     ))
     .into()
 }
@@ -648,6 +674,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_podman_compose_that_delegates_to_podman_compose_is_refused() {
+        // `podman compose` is a shim over whichever external provider the host has. Where that
+        // is podman-compose it still answers `version` with a zero status, so a probe that only
+        // checks the exit code selects the one implementation this module exists to rule out —
+        // and the mistake surfaces much later, as `unrecognized arguments: --format json`.
+        //
+        // The banner naming the provider goes to stderr and the version to stdout, which is why
+        // both are read.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_runtime(
+            tmp.path(),
+            "podman-delegating",
+            r#"[ "$1" = compose ] || exit 1
+echo '>>>> Executing external compose provider "/usr/bin/podman-compose". <<<<' >&2
+echo 'podman version 6.1.0'
+echo 'podman-compose version 1.6.0'
+exit 0"#,
+        );
+
+        // PATH is emptied so the standalone fallback cannot rescue it and hide the refusal.
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", tmp.path());
+        let resolved = resolve_provider(&bin);
+        std::env::set_var("PATH", old_path);
+
+        assert!(resolved.is_none(), "podman-compose must not be selected: {resolved:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_compose_v2_version_banner_is_accepted() {
+        // The other half of the check above: rejecting by name must not reject the thing it is
+        // meant to let through.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = fake_runtime(
+            tmp.path(),
+            "docker-v2",
+            r#"[ "$1" = compose ] || exit 1
+echo 'Docker Compose version v2.32.4'
+exit 0"#,
+        );
+        let found = resolve_provider(&bin).expect("a provider");
+        assert_eq!(found.argv, vec![bin.to_string_lossy().to_string(), "compose".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_podman_without_compose_reports_what_to_install() {
         // podman 4.3 — Debian 12, Ubuntu 22.04 — has no `compose` subcommand at all, and
         // answers am's invocation with `unknown shorthand flag: 'f'`. Without this the user
@@ -854,14 +927,26 @@ mod tests {
         );
         let override_path = write_override(tmp.path(), &doc).unwrap();
 
-        let out = std::process::Command::new("docker")
-            .args(["compose", "-f"])
+        // Resolved rather than hardcoded to `docker`, for two reasons. It honours AM_DOCKER_BIN,
+        // so the check is runnable on a podman host that has a supported Compose — hardcoding it
+        // made the test fail with a bare `No such file or directory` that named nothing. And it
+        // validates the override against the provider `am` would actually hand it to, which is
+        // the thing under test.
+        let runtime_bin = std::path::PathBuf::from(
+            std::env::var("AM_DOCKER_BIN").unwrap_or_else(|_| "docker".to_string()),
+        );
+        let compose = provider(&runtime_bin).expect(
+            "needs --features integration-compose — a working Compose provider on this host",
+        );
+        let mut cmd = provider_command(&compose, &compose.argv);
+        let out = cmd
+            .arg("-f")
             .arg(&base)
             .arg("-f")
             .arg(&override_path)
             .args(["config", "--format", "json"])
             .output()
-            .expect("running docker compose");
+            .expect("running Compose");
         assert!(
             out.status.success(),
             "compose rejected the override: {}",
