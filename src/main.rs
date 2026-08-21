@@ -1748,10 +1748,10 @@ fn attach_recreate_container_cmd(
 /// that were never created, `am attach`'s window-exists fast path would then find a *missing*
 /// pane, OQ-6 would (correctly) read that as `Ambiguous`, and the user would be stuck in a
 /// silent no-op loop with no way to make progress short of `am destroy`. Splitting first with
-/// no command, persisting those pane targets, and then `send_keys`-ing the launch command in
-/// (exactly like the already-open-window path in `relaunch_into_existing_window`) means a
-/// launch failure leaves a real, addressable window+split behind, and the record already
-/// matches it.
+/// no command, persisting those pane targets, and then delivering the launch command into the
+/// pane afterward (`launch_into_agent_pane`, exactly like the already-open-window path in
+/// `relaunch_into_existing_window`) means a launch failure leaves a real, addressable
+/// window+split behind, and the record already matches it.
 fn recreate_attach_window(
     repo_root: &Path,
     vcs: &config::Vcs,
@@ -1799,11 +1799,11 @@ fn recreate_attach_window(
 }
 
 /// UC-4: the window is still open, but `agent_pane_status` found the agent pane confidently
-/// idle. Relaunch by typing into the existing pane (`send_keys`) rather than recreating any
+/// idle. Relaunch into the existing pane (`launch_into_agent_pane`) rather than recreating any
 /// tmux structure. For a container session an idle pane means the container itself already
 /// exited (it is the container's PID 1), so this degenerates into the same OQ-2 recreate
-/// `recreate_attach_window`'s container branch performs — just delivered via `send_keys`
-/// into the pane that is already there instead of exec'd at split time.
+/// `recreate_attach_window`'s container branch performs — just delivered via `respawn_pane`
+/// into the pane that is already there instead of a fresh split's own command.
 fn relaunch_into_existing_window(
     repo_root: &Path,
     vcs: &config::Vcs,
@@ -1827,7 +1827,11 @@ fn relaunch_into_existing_window(
 
 /// Build the launch command for this session's agent pane — a container recreate
 /// (`attach_recreate_container_cmd`) or a host agent relaunch (`agent_command`), whichever
-/// this session calls for — and `send_keys` it into `s.tmux.agent_pane`.
+/// this session calls for — and deliver it into `s.tmux.agent_pane`: `respawn_pane` for a
+/// container (its command can be a multi-line script), `send_keys` for a host agent
+/// (`agent_command`'s tokens are always single-line flags, and typing into the pane's live
+/// shell — rather than exec'ing — deliberately leaves that shell behind once the agent exits,
+/// mirroring `cmd_start`'s host-agent branch).
 ///
 /// Shared by both `am attach` launch sites: a freshly split pane in `recreate_attach_window`
 /// (which persists the pane targets before calling this, so a failure here still leaves a
@@ -1845,8 +1849,14 @@ fn launch_into_agent_pane(
 ) -> anyhow::Result<AttachLaunch> {
     if s.container.is_some() {
         let cmd = attach_recreate_container_cmd(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
-        let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
-        tmux::send_keys(&s.tmux.agent_pane, &keys)?;
+        // The container run command can be a multi-line `sh -c '<script>'` (the devcontainer
+        // userEnvProbe script — see `container::user_env_probe_script`) with literal embedded
+        // newlines, so it must reach the pane as one argv element via `respawn_pane`'s
+        // `$SHELL -c`, not be typed in with `send_keys` — typing multi-line content into the
+        // pane's live shell is fragile and not verified safe (see `tmux::send_keys`'s doc
+        // comment), and `respawn_pane` sidesteps the question entirely.
+        let shell_cmd = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
+        tmux::respawn_pane(&s.tmux.agent_pane, &shell_cmd)?;
         return Ok(AttachLaunch::Container);
     }
     match s.agent.clone() {

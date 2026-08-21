@@ -18,14 +18,15 @@ recreated an empty window (or, for a container session, printed a `Note:` tellin
 what to relaunch. `am attach` checks the pane's actual state (`tmux::pane_current_command`,
 biased hard toward "still running" on any ambiguity — a missed relaunch costs an `am run`, an
 unwanted one can interrupt live work) and does the least work needed to fix it: an already-live
-session is an unchanged, instant no-op; a live window with an idle agent pane gets a
-`send-keys` relaunch in place; a fully gone window gets recreated (window, split, and — for a
-containerized session — the container itself, via a container-planning helper shared with `am
-start` so the two can't drift apart) before the agent is relaunched into it. Resume is on by
-default (`--continue` for Claude/Copilot, `--resume latest` for Gemini, `resume --last` for
-Codex, each verified against the CLI's own `--help`), with `am attach --fresh` and
-`[attach].resume = false` as opt-outs. A legacy record with no agent falls back to `cfg.agent`
-and persists the resolved value; if neither is available, `am` says so and points at `am run`.
+session is an unchanged, instant no-op; a live window with an idle agent pane gets relaunched in
+place — `send-keys` for a host agent, `tmux respawn-pane` for a container (see the fix below);
+a fully gone window gets recreated (window, split, and — for a containerized session — the
+container itself, via a container-planning helper shared with `am start` so the two can't drift
+apart) before the agent is relaunched into it. Resume is on by default (`--continue` for
+Claude/Copilot, `--resume latest` for Gemini, `resume --last` for Codex, each verified against
+the CLI's own `--help`), with `am attach --fresh` and `[attach].resume = false` as opt-outs. A
+legacy record with no agent falls back to `cfg.agent` and persists the resolved value; if
+neither is available, `am` says so and points at `am run`.
 
 Two accepted trade-offs: recreating a container re-runs `am start`'s own preflight (credential
 validation, an image rebuild if pruned), so attach can now be as slow as, and fail the same ways
@@ -35,6 +36,32 @@ pane; the window and split are created first, so a retry has something real to a
 
 `cargo test` (528 unit tests + 120 cucumber scenarios) and
 `cargo clippy --all-targets -- -D warnings` both clean.
+
+**Fixed 2026-08-21: the container relaunch pane never actually launched anything.** Both the
+idle-pane relaunch and the fully-gone-window recreate delivered the container's `podman`/`docker
+run ...` command via `send-keys` — which types text into the pane's already-running interactive
+shell, byte by byte, exactly as a user typing would. That's fine for a single line, but the
+devcontainer relaunch script (`container::user_env_probe_script`) legitimately contains embedded
+newlines, and in the field nothing executed: the user was left looking at the `podman run`
+command itself sitting unexecuted in the pane.
+
+The exact trigger was never pinned down, and is recorded here rather than glossed over. A shell
+sitting inside an unterminated single quote cannot submit or run a fragment mid-quote — it
+buffers the newline and reprints its continuation prompt — so the initial "submits a fragment
+mid-quote" theory was disproven: hand-reproducing the pre-fix send-keys ordering against real
+tmux + zsh (`scripts/test-live-attach.sh`, added for this) ran the multi-line command to
+completion every time. A structurally plausible but unconfirmed alternative: there is a real
+~440ms window in which `send-keys` can fire at a freshly split pane whose shell is still sourcing
+rc files, and what that shell does with input arriving mid-startup was never verified either way.
+
+Fixed regardless of mechanism, since typing multi-line content into a live shell is fragile on
+its face: the container path now uses a new `tmux::respawn_pane`, which hands the whole command
+to the pane's shell as one argv element via `$SHELL -c` — the same delivery `split_window`'s own
+`shell_cmd` parameter already used, which is why `am start` was never affected by this bug.
+`tmux::send_keys` now refuses any string containing an embedded newline outright, so a future
+caller can't reintroduce the same class of bug silently. The host-agent relaunch path is
+unaffected — its commands (`--continue`, `resume --last`, …) are always single-line — and still
+uses `send-keys` deliberately, so the pane's shell survives the agent process exiting.
 
 Deferred code-review suggestions, not dropped:
 
@@ -80,7 +107,7 @@ Observed: `select_window` fails, so `recreate_attach_window` creates the window 
 persists the pane targets, and calls `attach_recreate_container_cmd` →
 `plan_container_runtime` → `validate_agent_credentials(Claude)` →
 `ensure_required_paths(&[~/.claude])`. The path exists, so the check passes. The run command is
-built and `send_keys`'d into the pane, and `am` prints
+built and delivered into the pane via `tmux respawn-pane`, and `am` prints
 
 ```
 Opened new window for session 'feat' and restarted the container.
@@ -658,7 +685,9 @@ Follow-ups the native builder left behind:
       compose project" and dropped the runtime's own message. Two things it still does not
       cover: a real agent (there is none in a debian-slim service, so the session sets
       `shutdownAction: "none"` and lets it exit), and the live-attach path, which needs an agent
-      process to still be running.
+      process to still be running. The live-attach half is now covered by
+      `scripts/test-live-attach.sh`, added 2026-08-21 alongside the `respawn-pane`/`send-keys`
+      container relaunch fix above.
 - [x] **podman compose.** Done 2026-08-16, and it was broken rather than merely untested:
       podman only grew the `compose` subcommand in 4.7, so on the podman Debian 12 and Ubuntu
       22.04 ship, every compose session failed with `unknown shorthand flag: 'f'`. `am` now

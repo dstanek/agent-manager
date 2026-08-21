@@ -130,9 +130,51 @@ pub fn select_window(window_name: &str) -> Result<()> {
 }
 
 /// `tmux send-keys -t <pane_target> "<keys>" Enter`
+///
+/// This *types* `keys` into whatever shell is already running interactively in the pane —
+/// each byte arrives at the pty as if a user typed it, and `Enter` is sent as a final,
+/// separate keystroke. Typing multi-line content this way is fragile and not verified safe:
+/// delivery depends on the pane's pty mode and on the pane shell's startup timing, neither of
+/// which this function controls. One specific, plausible-but-unconfirmed hazard is that a
+/// freshly split pane's shell can still be sourcing rc files when the keys arrive — there is
+/// a real multi-hundred-millisecond window between the pane appearing and its first
+/// interactive prompt — and what a shell does with input arriving during that window is not
+/// something this code has verified either way. Use `respawn_pane` instead for any command
+/// that can contain a newline — it delivers the whole string as one argv element via
+/// `$SHELL -c`, the same way `split_window`'s `shell_cmd` does, so embedded newlines survive
+/// intact regardless of pty mode or shell startup timing.
+///
+/// Rejecting embedded newlines here (rather than trusting callers to remember) is deliberate:
+/// the bug this guards against was a caller reusing `send_keys` for a multi-line script; the
+/// exact mechanism by which that failed was never pinned down, but routing multi-line content
+/// through `send_keys` is unsound regardless, so it is rejected outright rather than merely
+/// discouraged.
 pub fn send_keys(pane_target: &str, keys: &str) -> Result<()> {
+    if keys.contains('\n') {
+        return Err(AmError::TmuxError(format!(
+            "send_keys keys must not contain embedded newlines (typing multi-line content \
+             into the pane's live shell is fragile and not verified safe) — use \
+             respawn_pane instead: {keys:?}"
+        ))
+        .into());
+    }
     let bin = tmux_bin()?;
     run_tmux(&bin, &["send-keys", "-t", pane_target, keys, "Enter"])
+}
+
+/// `tmux respawn-pane -k -t <pane_target> <shell_cmd>`
+///
+/// Kills whatever is currently running in the pane and starts `shell_cmd` there via
+/// `$SHELL -c` — the same delivery mechanism `split_window`'s `shell_cmd` parameter uses,
+/// and the pane-reuse counterpart to it: `split_window` execs a command into a *freshly
+/// created* pane, `respawn_pane` execs one into a pane that already exists. `shell_cmd`
+/// arrives at tmux as a single argv element, so embedded newlines (e.g. a multi-line
+/// `sh -c` probe script) survive intact regardless of pty mode or the pane shell's startup
+/// timing — unlike `send_keys`, which types the string in keystroke by keystroke and is not
+/// verified safe for multi-line content (see its doc comment).
+pub fn respawn_pane(pane_target: &str, shell_cmd: &str) -> Result<()> {
+    let bin = tmux_bin()?;
+    run_tmux(&bin, &["respawn-pane", "-k", "-t", pane_target, shell_cmd])
 }
 
 /// `tmux kill-window -t <window_name>`
@@ -439,6 +481,53 @@ mod tests {
         assert!(out.contains("am-feat.0"));
         assert!(out.contains("claude"));
         assert!(out.contains("Enter"));
+    }
+
+    /// Regression guard for the `am attach` bug where a multi-line container launch script
+    /// was typed into a live shell via `send_keys` instead of delivered with `respawn_pane`.
+    /// The exact mechanism by which that produced the observed failure was never pinned down
+    /// (see `send_keys`'s doc comment), but typing multi-line content into a pane's live
+    /// shell is unsound regardless of mechanism, so `send_keys` must refuse it outright
+    /// rather than risk silently corrupting the command.
+    #[test]
+    fn send_keys_rejects_embedded_newlines() {
+        let _mock = MockTmux::new();
+        let err = send_keys("am-feat.1", "sh -c 'first line\nsecond line'").unwrap_err();
+        assert!(
+            err.to_string().contains("newline"),
+            "expected a newline-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn respawn_pane_sends_correct_command() {
+        let mock = MockTmux::new();
+        respawn_pane("am-feat.1", "podman run --rm -it myimage").unwrap();
+        let out = mock.captured();
+        assert!(out.contains("respawn-pane"));
+        assert!(out.contains("-k"));
+        assert!(out.contains("-t"));
+        assert!(out.contains("am-feat.1"));
+        assert!(out.contains("podman run --rm -it myimage"));
+    }
+
+    /// The regression itself: a multi-line `sh -c '<script>'` command must reach tmux as one
+    /// intact argv element, newlines preserved, rather than going through `send_keys`'s
+    /// keystroke-by-keystroke delivery into a pane's live shell (which `send_keys` now
+    /// refuses for exactly this reason — see its doc comment). `respawn_pane` hands it to
+    /// `Command::args`, which never splits a `&str` on internal bytes regardless of content —
+    /// this test pins that the whole script, newlines included, shows up verbatim in what
+    /// tmux received.
+    #[test]
+    fn respawn_pane_preserves_embedded_newlines_as_one_argument() {
+        let mock = MockTmux::new();
+        let script = "sh -c 'export FOO=bar\nexec claude --resume'";
+        respawn_pane("am-feat.1", script).unwrap();
+        let out = mock.captured();
+        assert!(
+            out.contains(script),
+            "expected the multi-line script intact in tmux's args, got: {out}"
+        );
     }
 
     #[test]

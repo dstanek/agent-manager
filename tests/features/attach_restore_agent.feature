@@ -54,17 +54,21 @@ Feature: Restore the agent on `am attach`
     And the output contains "Opened new window for session 'my-feature' and restarted the container."
     # The window is split first, with no command (so the record's pane targets are valid
     # even if what follows fails — see recreate_attach_window's doc comment), and the
-    # rebuilt "podman run ..." command line is then typed into the fresh agent pane via
-    # send-keys rather than exec'd as the split's own shell_cmd — so the proof lives in the
-    # tmux log's send-keys line, not the podman log. Mirrors "start with container records
-    # container metadata" in container.feature, which pins the analogous shape for `am
-    # start`, which — unlike attach — can exec the command at split time because its
-    # preflight always runs before it ever touches tmux.
+    # rebuilt "podman run ..." command line is then respawned into the fresh agent pane via
+    # `tmux respawn-pane` (exec'd through $SHELL -c, same delivery split-window's own
+    # shell_cmd uses) rather than typed with send-keys — the container command can be a
+    # multi-line script, and send-keys types a string keystroke by keystroke into the pane's
+    # live shell, which is fragile and not verified safe for embedded newlines (see
+    # tmux::send_keys's doc comment) — so the proof lives in the tmux log's respawn-pane
+    # line, not the podman log. Mirrors "start with
+    # container records container metadata" in container.feature, which pins the analogous
+    # shape for `am start`, which — unlike attach — can exec the command at split time
+    # because its preflight always runs before it ever touches tmux.
     And the mock tmux log contains "run"
     And the mock tmux log contains "--name am-my-feature"
     And the mock tmux log contains "test-image:latest"
     And the mock tmux log contains "split-window"
-    And the mock tmux log contains "send-keys"
+    And the mock tmux log contains "respawn-pane"
 
   # A3: the window *and split* must already exist by the time a container preflight failure
   # can occur ("the user is left with an opened window and a clear error"). recreate_attach_
@@ -160,7 +164,7 @@ Feature: Restore the agent on `am attach`
     When I run "am attach my-feature"
     Then the command succeeds
     And the output contains "Attached to session 'my-feature'; container had exited — restarted it."
-    And the mock tmux log contains "send-keys"
+    And the mock tmux log contains "respawn-pane"
     And the mock tmux log contains "run"
     And the mock tmux log does not contain "new-window"
 
