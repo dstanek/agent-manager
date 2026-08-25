@@ -11,739 +11,665 @@ image (highest priority)":
 > any name outside `claude|copilot|gemini|codex` — even with `--no-container` — so there is no
 > path to "run this image, mount these creds, exec this command."
 
-Concretely: `cmd_start` (`src/main.rs:646`) computes one string, `effective_agent`
-(`src/main.rs:674`), and immediately parses it into one `KnownAgent`, `effective_known_agent`
-(`src/main.rs:689-692`), via `.transpose()?` — a hard error for any name outside the four
-built-ins, unconditionally, even with `--no-container`. That single `KnownAgent` value then
-drives three unrelated things: the literal command exec'd in the container/pane
-(`agent_command`, `src/main.rs:1366`, which just echoes back the same string), the auth preset
-(`container::resolve_agent_auth`, `src/container.rs:490`, keyed on the `KnownAgent` value), and
-the image (`config::resolve_image`, `src/config.rs:293`, keyed on the same string via
-`[agents.<name>]`). Naming your command is naming your credentials is naming your image, and
-none of the three can vary independently.
+This revision replaces two earlier drafts of this spec with a different model, proposed by the
+user: instead of adding parallel CLI flags for command/integration/image alongside `--agent`,
+**complete the table `[agents.<name>]` already is.** `--agent <name>` stops being a
+`KnownAgent::parse` gate and becomes a lookup into `cfg.agents`, which gains two new fields
+(`command`, `integration`) alongside its existing two (`image`, `devcontainer_feature`). One
+flag, one lookup, no new CLI surface at all.
 
-**Correction already recorded in the backlog, not re-derived here:** this was originally
-logged as blocking Dev Container Support and turned out not to be. Devcontainer mode never
-calls `config::resolve_image` — that function has exactly one caller, `plan_image`
-(`src/main.rs:1039`), which devcontainer sessions never reach (`plan_container`,
-`src/main.rs:991`, routes to `plan_devcontainer` instead whenever a config is discovered). So
-`--agent claude` already stops implying an image on that path today; this spec does not touch
-that fact.
+**Note on scope, not re-derived here:** `am run` was removed prior to this spec, and that
+removal is now committed history (`7334eaeb`; see `src/main.rs`'s `cmd_run_removed`,
+`AmError::RunRemoved`) — a prior, independent change, not part of this spec. This document
+accounts for its absence but does not own or re-argue that decision.
 
-This unblocks the adjacent backlog item, **"Custom-harness fast path"**:
-`am start idea --image my-image --cmd my-agent`, no built-in integration required. This spec
-treats that as the acceptance target and ships it in the same change — see
-[Resolved Decisions](#resolved-decisions) #1.
+**Correction already recorded in the backlog, not re-derived here:** this was originally logged
+as blocking Dev Container Support and turned out not to be. Devcontainer mode never resolves an
+`am` image outside `plan_image` (`src/main.rs:1039`), which devcontainer sessions never reach —
+so `--agent claude` already stops implying an image on that path today, unaffected by this spec.
+
+The backlog's adjacent item, **"Custom-harness fast path"**, and the decoupling item above
+collapse into the same mechanism under this model: there is no separate CLI work to "unlock" a
+custom harness once `[agents.<name>]` can name its own command and (optionally) an integration
+— defining the section *is* the fast path. The acceptance target is now: add
+`[agents.my-harness]` with `command`/`image` to `.am/config.toml`, then `am start idea --agent
+my-harness`. The user has explicitly accepted that a one-off custom harness requires editing
+config first — there is no `am start --cmd ...`-shaped escape hatch in this design.
 
 ## Assumptions
 
-- **A1.** "Integration" means exactly what `container.rs` already calls the six behaviors
-  keyed on `KnownAgent` today: credential mounts, extra env, credential presence-validation,
-  the credentials hint, auto-mode flags, and resume flags. Nothing new is being invented here
-  — see [Design](#design-the-coupling-is-narrower-than-it-looks).
-- **A2.** "Image" in this spec means only the `container.image` / `[agents.<name>].image`
-  axis (`plan_image`'s world). Devcontainer mode's environment still comes entirely from the
-  repo's own config, per the correction above; this spec does not add an `--image` escape
-  hatch that fights with `plan_devcontainer` — `--image` is documented as inert whenever
-  `container.mode` resolves to `devcontainer`, the same way `container.image` already is today
-  (see [Open Questions](#open-questions), OQ-4).
-- **A3.** `am run <slug> <agent>`'s existing `agent: String` CLI argument (`src/cli.rs:94`,
-  no `value_parser`) already *is* an unvalidated command string, persisted onto
-  `Session.agent` verbatim — `attach-restore-agent.md`'s own data model section
-  (`src/session.rs:315-329`) says so explicitly. `am run` therefore already models "Command"
-  correctly today; the only gap this spec closes for it is giving it a way to say *which*
-  integration (if any) that command belongs to, instead of inferring it by re-parsing the
-  string — see [`am run` impact](#am-run-impact).
-- **A4.** No change to the tmux/container mount, network, or SELinux-labeling machinery in
+- **A1.** "Integration" means exactly what `container.rs` already calls the six behaviors keyed
+  on `KnownAgent` today: credential mounts, extra env, credential presence-validation, the
+  credentials hint, auto-mode flags, and resume flags. Nothing new is being invented here.
+- **A2.** "Image" means only the `container.image` / `[agents.<name>].image` axis
+  (`plan_image`'s world). Devcontainer mode's environment still comes entirely from the repo's
+  own `.devcontainer/devcontainer.json`; nothing here changes that.
+- **A3.** No change to the tmux/container mount, network, or SELinux-labeling machinery in
   `container.rs`. Every one of its public functions already takes `Option<KnownAgent>` and
   nothing else agent-related; this spec adds no new parameter to any of them.
 
-## Design: the coupling is narrower than it looks
+## The new model, in a few sentences
 
-Read literally, "introduce independent concepts: command, integration, image" sounds like it
-touches everywhere `KnownAgent` appears — the raw grep counts the team-lead supplied
-(`container.rs` 94, `onboarding.rs` 86, `main.rs` 34, `doctor.rs` 2, `cli.rs` 1) make it look
-like a 200+ site rewrite. It is not, and the reason is worth stating plainly because it is the
-whole design:
+`AgentSettings` (`src/config.rs:88-93`) gains `command: Option<String>` and `integration:
+Option<String>`. `--agent <name>` / `defaults.agent = "name"` resolve to a lookup,
+`cfg.agents.get(name)`, not a `KnownAgent::parse`. Two defaulting rules make every config in
+the wild today keep working unchanged: **command defaults to the section name**, and
+**integration defaults to the section name when it parses as a `KnownAgent`, otherwise
+`None`**. `KnownAgent` survives exactly as it is today — it is the *value* `integration`
+resolves to, still driving the same six behaviors in `container.rs`, unchanged. Incoherent
+states that needed a whole paragraph to argue against in the previous draft (`--agent claude
+--integration gemini` — mount gemini's credentials, exec `claude`) are simply unrepresentable
+now: there is one flag, and it names one section, which has one `integration` value.
 
-**`KnownAgent` already means "integration," everywhere it is used, except at the one place
-it gets constructed.** Look at what it actually parameterizes: `resolve_agent_auth_mounts`,
-`agent_extra_env` (the `env` half of `resolve_agent_auth`, `src/container.rs:490`),
-`validate_agent_credentials`, `credentials_hint`, `agent_auto_flags`, `agent_resume_flags` —
-every one of the six behaviors named in the task — plus `agent_command`'s own `known` parameter
-(`src/main.rs:1366`) and `resume_will_apply`'s `known_agent` parameter
-(`src/main.rs:1647`, used only to decide whether the "(resuming)" wording applies). None of
-these ever look at the *literal command string* — `agent_command` takes it as a wholly separate
-`agent_name: Option<&str>` parameter already, and just echoes it into `cmd[0]`. The type was
-never wrong for what it does; `onboarding.rs`'s 86 references are the `am setup` menu picking
-one of four known integrations and writing `defaults.agent` — also already correct, because
-`am setup` only ever offers presets (see [`am setup` impact](#am-setup-impact)).
+## Why this beats the previous two drafts
 
-The actual bug is narrower: **there is exactly one way to produce a `KnownAgent` value today
-— parse the command string — and exactly one way to produce a command string that `am`
-actually launches — pass it as `--agent`, which requires it to parse as a `KnownAgent`.**
-`effective_known_agent = effective_agent.map(KnownAgent::parse).transpose()?`
-(`src/main.rs:689-692`) is the coupling, and it is three lines. Fix those three lines' worth of
-*resolution logic* — give command and integration each a second, independent way to be
-supplied — and the six behaviors, `agent_command`, `resume_will_apply`, `plan_container`, and
-essentially all of `container.rs` and `onboarding.rs` need no interface change at all. They
-already do the right thing once fed the right values.
-
-What *does* need real, non-mechanical work, concentrated almost entirely in `main.rs` and
-`config.rs`:
-
-| File | Raw `KnownAgent` refs | What actually changes |
-|---|---|---|
-| `src/container.rs` | 94 | **None.** Every function already takes `Option<KnownAgent>` meaning "integration." Doc-comment wording only (a handful of `agent` → `integration` in prose, not code). |
-| `src/onboarding.rs` | 86 | **None.** `am setup` stays preset-only — see [`am setup` impact](#am-setup-impact). Same reasoning: it already only ever selects an integration and writes `defaults.agent`. |
-| `src/main.rs` | 34 | **Real.** This is where command/integration/image get resolved and dispatched: `cmd_start`, `cmd_attach`, `cmd_run`, `plan_container_runtime`/`plan_image`/`plan_devcontainer`'s parameter docs, `agent_command`'s doc comment, `injected_features` (one real bug fix — see below), `print_next_steps`. |
-| `src/config.rs` | 0 direct (via `resolve_image`/`resolve_agent_feature`) | **Real.** New `Config.command`/`Config.integration` fields, a new `resolve_launch` helper, `resolve_agent_feature`'s key changes from command to integration (bug fix). |
-| `src/doctor.rs` | 2 | **Real but small.** `check_agent`/`check_image_mode` take the resolved integration/image instead of re-deriving them. |
-| `src/cli.rs` | 1 | **Real but small.** Three new flags on `Start`, one new flag on `Run`. |
-| `src/session.rs` | 0 | **Real but small.** One new `Option<String>` field, `#[serde(default)]`. |
-| `src/error.rs` | 0 | **Real but small.** Two error variants renamed for accuracy, no behavior change. |
-
-This is the load-bearing claim of the whole spec, so it is worth being explicit about what
-would falsify it: if `container.rs` or `onboarding.rs` turn out to need a real interface
-change during implementation (not just a doc-comment reword), that is a sign this design
-document was wrong about the boundary and needs revisiting before continuing, not a sign to
-push through it.
-
-## The three concepts
-
-- **Command** — the literal argv[0] exec'd in the agent pane or as the container CMD.
-  Free-form string, never validated against anything. Already modeled correctly today as
-  `Session.agent: Option<String>` and `agent_name: Option<&str>` throughout `main.rs`; this
-  spec gives it a second source (`--cmd`) beyond the `--agent` shorthand.
-- **Integration** — which auth preset (if any) applies: credential mounts, extra env,
-  credential-presence validation, the doctor hint, auto-mode flags, resume flags, and (new —
-  see below) which devcontainer Feature installs the agent. Already modeled correctly today as
-  `container::KnownAgent`; this spec gives it a second source (`--integration`) beyond parsing
-  the command string.
-- **Image/profile** — the container image to run, in image mode only (A2). Already modeled as
-  `config::resolve_image`, keyed on a name; this spec (a) gives it a third source, `--image`,
-  above `container.image` and `[agents.<name>].image`, and (b) fixes what that key means — see
-  [Devcontainer agent-Feature injection](#devcontainer-agent-feature-injection-keyed-by-integration-not-command).
-
-## Resolution model
-
-Three independent axes, each resolved by "most specific CLI flag beats less specific CLI flag
-beats most specific config key beats less specific config key beats nothing." `--agent` and
-`defaults.agent` are the *shorthand* tier on two axes at once (command and integration); `--cmd`
-/ `defaults.command` and `--integration` / `defaults.integration` are the *explicit* tier, new
-in this spec, and always win when present.
-
-**Command:**
-
-1. `--cmd <string>` (new, CLI) — never validated.
-2. `--agent <name>` (existing, CLI) — validated via `KnownAgent::parse`; used as the literal
-   command string too, exactly as today.
-3. `defaults.command` (new, config) — never validated.
-4. `defaults.agent` (existing, config) — validated, same as `--agent`.
-5. `None` — legal. A container starts with the image's own `ENTRYPOINT`/`CMD`; a host session
-   opens the window with nothing launched, exactly like today's "no agent configured" state.
-
-**Integration:**
-
-1. `--integration <name>` (new, CLI) — validated via `KnownAgent::parse`; an unrecognized name
-   is a hard error (typo protection — this is the one place in the whole design that still
-   errors on an unknown name, and deliberately so, since the user asked for a specific preset
-   by name).
-2. `--agent <name>` (existing, CLI), if it parses as a `KnownAgent` — it always does, since
-   `--agent` is still fully validated (see [Resolved Decisions](#resolved-decisions) #2).
-3. `defaults.integration` (new, config) — validated the same way as `--integration`.
-4. `defaults.agent` (existing, config), if it parses.
-5. `None` — legal, and the entire point of the custom-harness fast path. No mounts, no extra
-   env beyond `container.env`, no credential validation, no auto flags, no resume flags, no
-   devcontainer Feature injected for it.
-
-**Image** (image mode only — A2):
-
-1. `--image <string>` (new, CLI).
-2. `container.image` (existing, config) — unchanged behavior and precedence.
-3. `[agents.<integration>].image` (existing, config) — **now keyed by the resolved
-   *integration*, not by the resolved command** (see the Feature-injection bug fix below for
-   why this distinction matters and was already latent).
-4. `None` — legal only when no image is required (devcontainer mode, or `--no-container`).
-   Otherwise `AmError::ContainerImageNotConfigured`, message updated to mention `--image`.
-
-Worked example, the wrapper case this design exists to support: `--agent claude --cmd
-my-claude-wrapper`. Command = `my-claude-wrapper` (tier 1). Integration = `claude` (tier 2, `
---agent` parses). Image = `[agents.claude].image` (tier 3) — claude's credentials get mounted,
-claude's compiled-in image is used, and the container's CMD is the wrapper script, not
-`claude` itself.
-
-Worked example, the acceptance target: `am start idea --image my-image --cmd my-agent`.
-Command = `my-agent`. Integration = `None` (nothing at any tier parses or is given). Image =
-`my-image` (tier 1). No credential preflight, no mounts beyond `container.env`, no auto/resume
-flags ever appended regardless of `--auto`/`--fresh`.
+`[agents.<name>]` was already "everything `am` knows about an agent"; it stopped short only of
+the command and the auth preset, which is exactly why those two leaked onto `--agent` as hidden
+extra meanings in the first place. Completing the table dissolves the coupling instead of
+building a second, parallel CLI surface beside it (`--cmd`/`--integration`/`--image`, as the
+previous draft did). It also makes custom agents *committable and shareable*: a repo can define
+as many named harnesses as it wants in `.am/config.toml`, where `defaults.command` (the
+previous draft's design) gave it exactly one. And the "217 references" framing the earlier
+drafts leaned on — the argument that `container.rs`/`onboarding.rs` don't need interface
+changes because `KnownAgent` already means "integration" everywhere — still holds, and holds
+*more cleanly*: nothing about command or image is threaded through `KnownAgent` under this
+model at all, in any file, ever. See [Honest cost report](#honest-cost-report) below for where
+that claim still needed real, if smaller, revision.
 
 ## Data model
 
-### `Config` (`src/config.rs:219-233`)
-
-Two new fields, both additive, both following the existing `agent`/`FileDefaults` pattern
-(`src/config.rs:307-312`) exactly:
+### `AgentSettings` (`src/config.rs:88-93`)
 
 ```rust
-pub struct Config {
-    pub agent: Option<String>,          // unchanged — the shorthand
-    pub command: Option<String>,        // NEW — explicit command override
-    pub integration: Option<String>,    // NEW — explicit integration override
-    pub agents: HashMap<String, AgentSettings>,  // unchanged in shape
-    // ...
+pub struct AgentSettings {
+    pub command: Option<String>,       // NEW — what to exec; defaults to the section name
+    pub integration: Option<String>,   // NEW — which built-in auth preset; see defaulting rule 2
+    pub image: Option<String>,         // existing, unchanged in shape
+    pub devcontainer_feature: Option<String>,  // existing, unchanged in shape
 }
 ```
 
-`[defaults]` in the TOML file gains two optional keys alongside the existing `agent`:
+`[agents.<name>]` in the TOML file gains two optional keys:
 
 ```toml
-[defaults]
-agent = "claude"        # shorthand: sets command + integration + image-lookup-key together
-# command = ""           # explicit override: what to exec (independent of `agent`)
-# integration = ""       # explicit override: which auth preset to use (independent of `agent`)
+[agents.my-harness]
+command = "./scripts/agent.sh"
+integration = "claude"     # optional — omit for no built-in auth preset at all
+# image = "..."             # optional — see Inheritance below for what happens when omitted
+# devcontainer_feature = "..."
 ```
 
-No key is renamed, no key is removed, no existing key's meaning changes for a config that only
-ever sets `agent` — which is every config in the wild today. `[agents.<name>]` and
-`container.image` are untouched in shape; only what `<name>` is *resolved from* changes (see
-Resolution model above).
+No key is renamed, no key is removed. Every config that only ever sets `[agents.claude]`/
+`[agents.copilot]`'s existing keys, or `defaults.agent`, is untouched — see
+[Defaulting rules](#defaulting-rules) for why.
 
-### `resolve_launch` (new, `src/config.rs`, beside `resolve_image`)
+### `resolve_agent` (new, `src/config.rs`, beside the existing `resolve_image`)
 
-The one place all three call sites — `cmd_start`, `cmd_attach`'s OQ-1-style legacy fallback,
-and `doctor::run` — get command/integration/image, so they cannot drift apart from each other
-the same way `am setup`'s verification step already shares logic with `am doctor`
-(`specs/guided-setup.md`, "Relationship to `am doctor`").
+The one place that resolves a section name into everything downstream needs, shared by
+`cmd_start` and `doctor::run` so they cannot drift — the same "shared, not duplicated"
+principle `specs/guided-setup.md` already applies between `am setup`'s verification and
+`am doctor`. Absorbs what `resolve_image` and `resolve_agent_feature` did separately today,
+because both need the inheritance rule below and neither can apply it alone.
 
 ```rust
-pub struct LaunchFlags<'a> {
-    pub agent: Option<&'a str>,
-    pub cmd: Option<&'a str>,
-    pub integration: Option<&'a str>,
-    pub image: Option<&'a str>,
+pub struct ResolvedAgent {
+    pub name: String,                              // the section name, for display
+    pub command: String,                            // never empty — rule 1 guarantees this
+    pub integration: Option<container::KnownAgent>, // rule 2
+    pub image: Option<String>,                      // see Inheritance
+    pub devcontainer_feature: Option<String>,        // see Inheritance
 }
 
-pub struct ResolvedLaunch {
-    pub command: Option<String>,
-    pub integration: Option<container::KnownAgent>,
-    pub image: Option<String>,  // image mode only; None in devcontainer mode regardless of input
-}
-
-/// Resolve the three independent axes per the precedence in this spec. Errors only when
-/// `flags.integration` (or `cfg.integration`) names something `KnownAgent::parse` rejects —
-/// every other axis degrades to `None` rather than erroring, which is what makes an unknown
-/// `--cmd` value a first-class supported case instead of a typo to catch.
-pub fn resolve_launch(flags: LaunchFlags, cfg: &Config) -> Result<ResolvedLaunch>;
+/// Resolve `name` against `cfg.agents`. Errors only when no section named `name` exists —
+/// `AmError::AgentNotConfigured(name, available)`, `available` being every configured section
+/// name, sorted, so the message can list them. A section that exists but leaves every field
+/// unset still resolves successfully (rules 1 and 2 fill `command`/`integration`); it is
+/// finding no section at all that fails, not an incomplete one.
+pub fn resolve_agent(name: &str, cfg: &Config) -> Result<ResolvedAgent>;
 ```
+
+`cmd_start`'s existing three-line coupling bug —
+`effective_known_agent = effective_agent.map(KnownAgent::parse).transpose()?`
+(`src/main.rs:689-692`) — becomes, at the same call site, roughly the same number of lines:
+`effective_agent.as_deref().map(|name| config::resolve_agent(name, &cfg)).transpose()?`. The
+fix does not need to be bigger than the bug was; it needs to call a real resolver instead of an
+enum parse.
+
+### Defaulting rules
+
+Verified against the actual compiled-in skeleton (`src/config.rs:239-263`,
+`global_config_template`'s `[agents.*]` block at `src/config.rs:640-660`), per the instruction
+not to assert this without checking.
+
+1. **`command` defaults to the section name.** `[agents.gemini]` with only `image` set still
+   runs `gemini`.
+2. **`integration` defaults to the section name when it parses as a `KnownAgent`, otherwise
+   `None`.** `[agents.claude]` still gets Claude's credential mounts with no new keys written
+   anywhere.
+
+Together these mean every config in the wild — which only ever sets `image`/
+`devcontainer_feature` on `[agents.claude]`/`[agents.copilot]`, or `defaults.agent` naming one
+of the four built-ins — resolves identically to today, field for field.
+
+**One real, required change the rules alone don't cover, found by checking rather than
+assuming:** `default_agent_images()` (`src/config.rs:239-263`) only populates `claude` and
+`copilot` in the compiled-in `cfg.agents` map — `gemini` and `codex` have **no entry at all**
+today, compiled-in or otherwise. `resolve_image`'s existing `cfg.agents.get(name)` already
+tolerates that (falls through to "no image," fine in `--no-container` mode or host sessions).
+But `resolve_agent`'s contract is "error if the section doesn't exist," and a bare `--agent
+gemini --no-container` — which works today with zero configuration — would regress into
+`AgentNotConfigured` if `gemini` genuinely has no section to find. **`default_agent_images()`
+must be extended to include all four `KnownAgent` presets as entries**, with `image: None`/
+`devcontainer_feature: None` for the two that have no compiled default, so a section always
+exists to find for any of the four built-ins, exactly matching `onboarding.rs`'s `MENU` (which
+already lists all four). This is a small change — two more tuples in an existing array literal
+— but a real, necessary one; not covered by "the two rules alone."
+
+### Inheritance: does `integration` pull in the preset's `image`/`devcontainer_feature`?
+
+The question the team-lead posed directly: `[agents.team-harness]` sets `integration =
+"claude"` and nothing else. Does it get Claude's compiled-in image and devcontainer Feature, or
+none?
+
+**Decision: inherit.** When a section's own `image`/`devcontainer_feature` is unset, and its
+resolved `integration` is `Some(k)`, `resolve_agent` falls back to `cfg.agents.get(&k.to_string())`'s
+`image`/`devcontainer_feature` — the *built-in preset's own section* — before giving up. Each
+field is independent: a section can inherit the image and set its own `devcontainer_feature`,
+or vice versa, or override both, or neither.
+
+**Rejected alternative: section-is-self-contained** (no inheritance; a custom section gets
+exactly what it states, nothing more). Rejected because it forces every team-wrapper config to
+duplicate the preset's image string (`ghcr.io/dstanek/am-claude-minimal:latest`) verbatim into
+their own section — the exact class of duplication `[agents.<name>]` exists to avoid, and one
+that drifts silently the day `[agents.claude]`'s compiled default changes and nobody remembers
+to update the copy. The trade-off accepted in exchange: a section that sets `integration =
+"claude"` and nothing else picks up an image the author never typed, which could read as
+surprising in isolation — mitigated by `am doctor`/`am start`'s existing detail lines already
+naming the resolved image explicitly, so "which image did this actually use" is never a mystery
+at the point it matters.
 
 ### `Session` (`src/session.rs:110-131`)
 
-One new field, mirroring exactly how `attach-restore-agent.md` added `agent` itself:
+One new field:
 
 ```rust
 pub struct Session {
     // ...existing fields...
-    pub agent: Option<String>,  // unchanged in name and meaning: the command last launched
-    /// The integration (if any) resolved when `agent` was last launched — used by `am attach`
-    /// to look up resume/auto flags without re-parsing `agent` as a `KnownAgent`, which would
-    /// silently misfire for a custom command wrapping a known integration (`agent =
-    /// "my-claude-wrapper"`, `integration = "claude"`). `None` for records written before this
-    /// field existed, or for a launch that genuinely had no integration.
+    pub agent: Option<String>,  // unchanged in name; now documented as the *resolved command*,
+                                 // not the section name — see reasoning below
     #[serde(default)]
-    pub integration: Option<String>,
+    pub integration: Option<String>,  // NEW — the resolved integration, if any
 }
 ```
 
-**Backward compatibility for reads.** A record with no `integration` key deserializes as
-`None`. `am attach`'s existing legacy-fallback shape (`src/main.rs:1960-1979`, OQ-1 in
-`attach-restore-agent.md`) already re-derives `known_agent` by parsing `s.agent` when nothing
-better is available — extend that fallback one step: when `s.integration` is `None`, fall back
-to `KnownAgent::parse(s.agent).ok()`, exactly what the code does today, and persist the result
-onto `s.integration` the same way OQ-1 already persists a recovered `s.agent` — so the
-inference runs at most once per legacy record, same idiom, same file.
+**What gets persisted, and why it is the resolved values and not the section name.** A section
+can be edited or deleted between `am start` and a later `am attach` — `.am/config.toml` is a
+file, not a database, and nothing stops a teammate from renaming `[agents.my-harness]` or
+deleting it entirely while a session built from it is still running. If `Session` recorded only
+the *section name*, `am attach` would have to re-resolve `cfg.agents` at attach time to know
+what to relaunch — and a section edited in the meantime would silently relaunch something
+different from what is actually running, or a deleted section would break the relaunch outright
+with no fallback. Persisting the already-resolved `command`/`integration` instead means `am
+attach` never needs `cfg.agents` at all: it relaunches exactly what was launched before,
+independent of whatever the config says *now*. This is the same principle
+`SessionContainer.image`/`config_hash` already follow — an opaque, already-resolved string, not
+a pointer back into a config that may have moved.
 
-`SessionContainer` (`src/session.rs:33-61`) needs no changes — nothing about which image was
-used, or the devcontainer identity, depends on command vs. integration; it already records
-`image`/`config_hash`/`remote_user` as opaque strings.
+**Not persisted: the section name itself.** A `Session.agent_section` field recording which
+`[agents.<name>]` produced a given session would be genuinely useful for `am list` observability
+("this session was started via `my-harness`") — but that's the existing, separately-tracked
+`BACKLOG.md` item "Session observability in `am list`," not something this spec's correctness
+goal (`am attach` relaunches the right thing) requires. Left out deliberately rather than
+smuggled in; a future observability pass can add it without touching anything this spec
+defines.
 
-## CLI contract
+**Backward compatibility.** A record with no `integration` key deserializes as `None`. `am
+attach`'s existing legacy-fallback shape (`src/main.rs:1970-1979`) already re-derives
+`known_agent` by parsing `s.agent` when nothing better is available — extend that one step:
+when `s.integration` is `None`, fall back to `KnownAgent::parse(s.agent).ok()`, persisting the
+result the same way OQ-1 in `attach-restore-agent.md` already persists a recovered `s.agent`.
 
-### `am start <slug>` (`src/cli.rs:53-69`)
+## `AmError::AgentNotConfigured` and `KnownAgent::parse`'s role, unchanged
 
-Three new flags, all optional, all combinable with the existing `--agent`:
+Two distinct validation failures now, where there was one before:
 
-```rust
-Start {
-    slug: String,
-    #[arg(short, long)]
-    agent: Option<String>,        // unchanged
-    #[arg(long)]
-    cmd: Option<String>,          // NEW — explicit command, never validated
-    #[arg(long)]
-    integration: Option<String>,  // NEW — explicit integration, validated (typo → error)
-    #[arg(long)]
-    image: Option<String>,        // NEW — explicit image override, image mode only
-    #[arg(long)]
-    no_container: bool,           // unchanged
-    #[arg(long)]
-    auto: bool,                   // unchanged
-    #[arg(long)]
-    rebuild: bool,                // unchanged
-}
-```
-
-Validation: `--integration <name>` where `KnownAgent::parse(name)` fails is a hard error
-naming the four valid integrations, same wording `--agent`'s error already uses
-(`src/container.rs:49-60`). `--cmd` and `--image` accept anything; nothing about the custom
-command or the custom image is ever validated by `am` — that is the entire point of the
-harness-agnostic path, and it mirrors `container.image`'s existing no-validation contract.
-
-### `am run <slug> <command> [--integration <name>]`
-
-```rust
-Run {
-    slug: String,
-    agent: String,                 // unchanged in name and behavior — still unvalidated
-    #[arg(long)]
-    integration: Option<String>,   // NEW, optional
-}
-```
-
-Behavior: `s.agent = Some(command)` (unchanged). `s.integration` is set to
-`integration.map(|i| KnownAgent::parse(&i)).transpose()?.map(|k| k.to_string())` when the flag
-is given (validated — same typo-protection reasoning as `am start --integration`); when the
-flag is *not* given, `s.integration = KnownAgent::parse(command).ok().map(|k| k.to_string())`
-— i.e., exactly today's implicit "does the command name happen to match a known integration"
-inference, preserved as the default so `am run feat codex` keeps working with zero flags, same
-as before this spec. The flag exists only for the case that inference gets wrong: a wrapper
-script whose name doesn't match any `KnownAgent` variant.
-
-### `am attach <slug> [--fresh]` — no new flags
-
-Unchanged surface. `am attach` never lets you pick a different command/integration for a
-session — `am run` is still the dedicated tool for that (A3's reasoning, and
-`attach-restore-agent.md`'s own A5, both carry over unchanged).
-
-### `am doctor` — no new flags
-
-Deliberately. See [`am doctor` impact](#am-doctor-impact) for why the existing zero-argument
-surface is enough.
+- **`--agent`/`defaults.agent` names a section that doesn't exist at all** — new
+  `AmError::AgentNotConfigured(name, available)`, message: `"no agent 'cladue' configured —
+  configured agents: claude, codex, copilot, gemini, my-harness"` (sorted, and — this is the
+  point — includes any user-defined sections, which a fixed four-name enum list never could).
+  This replaces `KnownAgent::parse`'s error on the `--agent`/`defaults.agent` path entirely.
+- **`AgentSettings.integration` is explicitly set to something that doesn't parse** —
+  unchanged: `KnownAgent::parse`'s existing error (`src/container.rs:49-60`), still exactly the
+  four-name list, because `integration` genuinely can only ever be one of the four built-ins —
+  there is nothing else it could coherently name. `KnownAgent::parse` itself needs **no code
+  change**; it is simply called from a narrower place (validating one field) than it used to be
+  (validating the whole `--agent` flag).
 
 ## Per-behavior dispatch
 
-The six behaviors the task names, and what each is keyed on after this change — column three
-is the point: every single one is unchanged, because every single one was already keyed on
-`KnownAgent`/integration, never on the command string.
+Unchanged from the previous draft's finding, and — under this model — even more clearly true,
+since nothing about command or image is threaded through `KnownAgent` in any file, ever:
 
 | Behavior | Location | Keyed on | Changed? |
 |---|---|---|---|
-| Credential mounts | `resolve_agent_auth_mounts`, `src/container.rs:326` | `KnownAgent` (integration) | No |
-| Extra env | `resolve_agent_auth`'s `env` field, `src/container.rs:490` | `KnownAgent` (integration) | No |
-| Credential validation | `validate_agent_credentials`, `src/container.rs:565` | `KnownAgent` (integration) | No |
-| Credentials hint | `credentials_hint`, `src/container.rs:607` | `KnownAgent` (integration) | No |
-| Auto-mode flags | `agent_auto_flags`, `src/container.rs:406` | `KnownAgent` (integration) | No |
-| Resume flags | `agent_resume_flags`, `src/container.rs:430` | `KnownAgent` (integration) | No |
-| Devcontainer Feature injection | `resolve_agent_feature`, `src/config.rs:280` via `injected_features`, `src/main.rs:1397` | **command today, integration after this change** | **Yes — see below** |
+| Credential mounts | `resolve_agent_auth_mounts`, `src/container.rs:326` | `KnownAgent` | No |
+| Extra env | `resolve_agent_auth`'s `env` field, `src/container.rs:490` | `KnownAgent` | No |
+| Credential validation | `validate_agent_credentials`, `src/container.rs:565` | `KnownAgent` | No |
+| Credentials hint | `credentials_hint`, `src/container.rs:607` | `KnownAgent` | No |
+| Auto-mode flags | `agent_auto_flags`, `src/container.rs:406` | `KnownAgent` | No |
+| Resume flags | `agent_resume_flags`, `src/container.rs:430` | `KnownAgent` | No |
+| Devcontainer Feature injection | `resolve_agent_feature` → folded into `resolve_agent` | `KnownAgent`, via inheritance | No — see below |
 
-## Devcontainer agent-Feature injection: keyed by integration, not command
+### The devcontainer Feature-injection "bug" from the previous draft evaporates
 
-`injected_features` (`src/main.rs:1397-1420`) calls
-`config::resolve_agent_feature(agent_name, cfg)` — today `agent_name` is the same string as
-the integration, so this has never visibly misbehaved. Once command and integration can differ
-(`--agent claude --cmd my-claude-wrapper`), keying on command would look up
-`cfg.agents.get("my-claude-wrapper")`, find nothing, and inject no Feature — even though the
-session is unambiguously "claude, launched via a wrapper" and should get
-`ghcr.io/anthropics/devcontainer-features/claude-code:1` baked in exactly as a bare `--agent
-claude` would. `injected_features` and `resolve_agent_feature`'s call sites in `doctor.rs`
-(`src/doctor.rs:725-744`, mirrored to keep image-currency checks from drifting from
-`am start`) switch to the resolved *integration name* — `resolved.integration.map(|k|
-k.to_string())` — not the resolved command. This is a real (if currently unobservable) latent
-bug, fixed as a required part of this change, not an optional drive-by.
+The previous draft found a real latent bug: `injected_features` keyed the Feature lookup on the
+*command* string, which only ever matched the integration by coincidence (command and
+integration were forced equal). Under this model there is no command string to key on at all —
+`resolve_agent` resolves `devcontainer_feature` from the section's own value, or, via the
+inheritance rule above, from the *integration's own section* — which is exactly "keyed on
+integration," by construction, not by a fix layered on top. **Saying so plainly, as instructed
+rather than defended: this is not a bug carried forward from the previous draft. It does not
+exist under this model, and there is nothing to fix.**
 
-## The `agent_auto_flags`-before-`agent_resume_flags` ordering bug
+## Honest cost report
 
-`agent_command` (`src/main.rs:1366-1394`) already carries an in-code comment on this: auto
-flags are appended before resume flags, which is harmless today only because no agent combines
-a non-empty `agent_auto_flags` with a subcommand-shaped resume form (Codex's `resume --last`
-must be the first token). `agent_command`'s signature is already being touched by this change
-(its doc comment needs updating for the command/integration split regardless), so fixing the
-ordering — append resume flags first when the resume form is subcommand-shaped, or more simply,
-special-case "resume flags whose first element is not a `-`-prefixed flag go first" — costs
-nothing extra on top of work already required and removes a landmine for the next agent
-integration. **Recommendation: fix it as part of this change**, since the alternative is
-touching the same function's signature twice (once here, once whenever the ordering bug is
-finally addressed) for no reason.
+The previous draft's headline claim — "`container.rs` and `onboarding.rs` need no interface
+changes" — was checked against this model rather than repeated on faith, per the instruction.
+
+**`container.rs`: still zero.** Confirmed above — no function in `container.rs` gains, loses,
+or changes a parameter. `KnownAgent::parse`, `Display`, and all six behavior functions are
+untouched.
+
+**`onboarding.rs`: revised upward — the user overrode this spec's OQ-1 recommendation, and the
+menu itself now changes.** The previous pass of this spec recommended keeping `am setup`'s
+4-item preset menu (`MENU`, `src/onboarding.rs:29-33`) untouched, on the reasoning that listing
+custom sections was a config-editor-shaped feature `am setup` shouldn't grow. The user rejected
+that recommendation directly: a menu that silently omits an agent the user themselves
+configured reads as a bug, not a boundary. See
+[The agent menu becomes dynamic](#the-agent-menu-becomes-dynamic) under `am setup` impact for
+the resulting design (ordering, credential annotation, column width, `--agent` validation, and
+the boundary that *is* still preserved — listing, never creating).
+
+With that reversal, the things the previous estimate said were untouched no longer are: `MENU`
+itself is deleted (replaced by a list computed per invocation from `cfg.agents`),
+`agent_credentials`/`has_credentials` become section-derived rather than `KnownAgent`-indexed,
+`parse_agent_answer` needs the resolved entry list to accept a typed section name (not just a
+`KnownAgent::parse`), and the render loop's credential annotation grows a third state. Layered
+on top of the previously-identified `resolve_effective`/`effective_agent` fix (unchanged — still
+needed, still the same reasoning), the total footprint in the "which agent" question's code path
+is roughly 150–250 lines across ~8–9 items (`MENU`'s replacement, `DetectedState::gather`,
+`agent_credentials`/`has_credentials`, `default_agent()`, `agent_write`, `ask_agent`'s render
+loop and "currently" line, `parse_agent_answer`, `resolve_effective`'s agent branch,
+`MENU_NOTE_GAP`'s doc comment) — larger than the 60–100 lines previously quoted, and reported as
+such rather than smoothed over. Still confined to the single "which agent" question: the
+container/layout questions, the toml-writing helpers (`update_project_agent`, etc.), and the
+shared `write_target_line`/`dim_line` machinery are untouched.
+
+**The one genuinely structural finding, not just "more lines in the same shape":**
+`DetectedState::gather`'s own module doc comment states a deliberate principle — "Deliberately
+not `config::load_with_global`: that merges the layers into a single answer, and knowing *which*
+layer an answer came from is the whole point here" (`src/onboarding.rs`, module doc). That
+principle was true for the four scalar keys `gather` tracks (`defaults.agent`,
+`container.enabled`, the three `tmux.*` keys), each read per-layer via `TrackedKeys`/
+`read_tracked`. Computing a *menu row* for a custom section is a different kind of question:
+its resolved `integration` (and, transitively, any inherited `image`/`devcontainer_feature`)
+can genuinely depend on values from a *different* layer than the one that defines the section
+(a project-level `[agents.my-harness]` naming `integration = "claude"`, whose image comes from
+a global or compiled-in `[agents.claude]`) — exactly what `config::resolve_agent` is built to
+resolve, and `resolve_agent` operates on an already-merged `&Config`, not a per-layer
+`TrackedKeys`. This is the first time `am setup`'s detection phase needs a genuinely merged
+config, not just per-layer tracked scalars, and it is worth being explicit that this changes
+what the module's own stated principle covers — it is no longer true of the module as a whole,
+only of the four scalar keys it always meant. The cleaner shape, to keep this an intentional
+addition rather than a contradiction buried inside `gather`: `cmd_setup` loads a `Config` once
+(the same `load_config` helper `cmd_start` already uses) and passes it into
+`DetectedState::gather` as a new parameter, which `gather` uses only to build the menu-entry
+list via `config::resolve_agent`, leaving the four tracked scalars' per-layer reads exactly as
+they are today. Two resolution strategies coexisting on purpose, each documented for what it is
+for, rather than one silently absorbing the other's job.
+
+**`doctor.rs`: bigger than the previous draft assumed, still bounded to two functions.**
+`check_agent`/`check_image_mode` (`src/doctor.rs:576-589`, `746-782`) previously just needed to
+*receive* an already-resolved value. Now they need `resolve_agent` to actually run the
+resolution — section lookup, both defaulting rules, the inheritance lookup — because there is
+no other call site computing it for them. Both are updated to call `config::resolve_agent`
+once (shared between them via `doctor::run`, so they cannot report two different answers for
+the same config) and gain a genuinely new failure mode that didn't exist before:
+`Status::Fail` when `--agent`/`defaults.agent` names a section that doesn't exist at all
+(`AgentNotConfigured`), with the hint listing configured names.
 
 ## Use-Cases
 
-### UC-1: `--agent claude` — the shorthand, unchanged
+### UC-1: `--agent claude` — the built-in shorthand, unchanged
 
-**Actor:** any existing user. **Preconditions:** none beyond today's. **Main flow:** `am start
-feat --agent claude` behaves byte-for-byte as it does before this change — command =
-integration = image-lookup-key = `"claude"`, all three resolved from tier 2 of their
-respective axes. **Postconditions:** identical to today. **Business rule:** this is the
-regression the entire task is scoped around not breaking; it must be pinned by tests, not just
-argued.
+**Actor:** any existing user. **Main flow:** `am start feat --agent claude` resolves
+`cfg.agents.get("claude")`, finds the compiled-in section, and gets `command = "claude"` (rule
+1, section name), `integration = Some(Claude)` (rule 2, "claude" parses), `image =
+"ghcr.io/dstanek/am-claude-minimal:latest"` (the section's own value). Byte-for-byte identical
+container run to today. **Business rule:** this is the regression the entire task is scoped
+around not breaking; pinned by tests, not just argued.
 
 ### UC-2: Custom harness, the acceptance target
 
 **Actor:** a user with their own agent CLI and their own image, no built-in integration.
-**Preconditions:** an image exists (built elsewhere, or via `--rebuild`-independent means) that
-contains the `my-agent` binary. **Main flow:**
+**Preconditions:** `.am/config.toml` has been edited to add:
 
-1. `am start idea --image my-image --cmd my-agent`.
-2. Command resolves to `my-agent` (tier 1), integration resolves to `None` (nothing supplies
-   it), image resolves to `my-image` (tier 1).
-3. No credential preflight runs (`plan_image`'s `agent_auth = match agent { Some(_) => ...,
-   None => AgentAuth::default() }`, `src/main.rs:1054-1057`, already handles `None` correctly —
-   no code change needed here, just correct input).
-4. Container starts with `my-image`, mounts the worktree/VCS/gitconfig/ssh exactly as any
-   session does, sets `container.env`, and execs `my-agent` as CMD.
+```toml
+[agents.my-harness]
+command = "my-agent"
+image = "my-image"
+```
 
-**Postconditions:** a running session with no `am`-managed credentials and no devcontainer
-Feature injection — the user's image is fully responsible for having `my-agent` and whatever
-it needs already baked in. **Business rules:** `--image` and `--cmd` never validate their
-argument's existence — the runtime's own "image not found" / "exec format error" is the
-failure mode, exactly as it already is for `container.image` today.
+**Main flow:** `am start idea --agent my-harness`. `resolve_agent("my-harness", &cfg)` finds
+the section, `command = "my-agent"` (explicit), `integration = None` ("my-harness" doesn't
+parse as a `KnownAgent`, and no explicit `integration` key was set), `image = "my-image"`
+(explicit). No credential preflight, no mounts beyond `container.env`, no devcontainer Feature
+injected. **Postconditions:** a running session with no `am`-managed credentials — the user's
+image is fully responsible for having `my-agent` and whatever it needs already baked in.
 
-### UC-3: Wrapper around a known integration
+### UC-3: Wrapper around a known integration, with inheritance
 
-**Actor:** a user who wants Claude's credentials and default image, but launches through their
-own wrapper script instead of the bare `claude` binary. **Main flow:** `am start feat --agent
-claude --cmd ./scripts/claude-with-logging.sh`. Command = the wrapper (tier 1, `--cmd` beats
-`--agent`'s shorthand-as-command). Integration = `claude` (tier 2, `--agent` still supplies
-it). Image = `[agents.claude].image` (tier 3, from the integration). **Postconditions:**
-Claude's credentials are mounted, Claude's devcontainer Feature is injected if devcontainer
-mode applies, and the container's CMD is the wrapper script, which presumably `exec`s `claude`
-itself eventually.
+**Actor:** a user who wants Claude's credentials and default image, but launches through a
+wrapper script instead of the bare `claude` binary. **Preconditions:**
 
-### UC-4: `am run` with a command that isn't a recognized integration
+```toml
+[agents.claude-logging]
+command = "./scripts/claude-with-logging.sh"
+integration = "claude"
+```
 
-**Actor:** a user with an already-running session who wants to launch a one-off custom command
-into the agent pane. **Main flow:** `am run feat ./scripts/my-tool.sh`. `s.agent =
-Some("./scripts/my-tool.sh")`; since `--integration` wasn't given and the string doesn't parse
-as a `KnownAgent`, `s.integration = None`. **Postconditions:** a subsequent `am attach feat`
-relaunches `./scripts/my-tool.sh` with no resume/auto flags — see UC-5.
+No `image`/`devcontainer_feature` in this section. **Main flow:** `am start feat --agent
+claude-logging`. `resolve_agent` finds `command` explicit, `integration = Some(Claude)`
+explicit, then — since `image`/`devcontainer_feature` are unset here — inherits both from
+`cfg.agents.get("claude")` (the built-in section) via the inheritance rule.
+**Postconditions:** Claude's credentials are mounted, Claude's devcontainer Feature is injected
+if devcontainer mode applies, and the container's CMD is the wrapper script. A variant worth
+noting: the same section could additionally set its own `image = "my-team-claude-image"` to
+keep Claude's credentials while overriding only the image — each field inherits independently.
 
-### UC-5: `am attach` relaunching a custom command with no integration
+### UC-4: `am attach` relaunching a session with no integration
 
-**Actor:** a user whose machine rebooted, mid-session on UC-2's or UC-4's setup.
-**Preconditions:** `Session.agent = Some("my-agent")`, `Session.integration = None`, tmux
-window gone. **Main flow:** identical to `attach-restore-agent.md`'s UC-1/UC-2, except every
-integration-gated step is a no-op: `known_agent` resolves to `None` (from `s.integration`, not
-by re-parsing `s.agent`), so `agent_command`'s `auto`/`resume` branches never execute
-(`src/main.rs:1384-1391`, both gated on `if let Some(agent) = known`), `preflight_agent_auth`
-is never called for the container-recreate path, and `resume_will_apply(None, resume)` returns
-`false`. **Postconditions:** `Opened new window for session 'idea' and relaunched 'my-agent'.`
-— no `(resuming)` suffix, because there is nothing to resume and `am` never claims otherwise.
-**Business rule, directly answering the team-lead's question:** auto mode and resume both do
-*nothing* for a custom command with no integration, and say so by simply omitting the
-resuming/auto language from the success line rather than printing an error — this already
-falls out of the existing gating with zero new code, once `known_agent` is sourced correctly.
+**Actor:** a user whose machine rebooted, mid-session on UC-2's setup. **Preconditions:**
+`Session.agent = Some("my-agent")`, `Session.integration = None`, tmux window gone. **Main
+flow:** identical to `attach-restore-agent.md`'s UC-1/UC-2, except every integration-gated step
+is a no-op: `known_agent` resolves to `None` (from `s.integration`, never by re-resolving
+`cfg.agents`), so `agent_command`'s `auto`/`resume` branches never execute, and
+`preflight_agent_auth` is never called for a container recreate. **Postconditions:** `Opened
+new window for session 'idea' and relaunched 'my-agent'.` — no `(resuming)` suffix, because
+there is nothing to resume and `am` never claims otherwise. This already falls out of the
+existing gating with zero new code once `known_agent` is sourced from `Session.integration`.
 
-### UC-6: `am doctor` / `am setup --agent` on a custom-command config
+### UC-5: `am doctor` on a custom-command config, and on a dangling one
 
-**Actor:** a user running `am doctor` (or `am setup`'s verification step) against a config that
-sets `defaults.command`/`defaults.integration` by hand, or a fresh repo with no config at all
-using `--cmd`/`--image` at the `am start` call site (doctor cannot see per-invocation flags —
-see [`am doctor` impact](#am-doctor-impact)). **Main flow:** `check_agent` reports "command:
-my-agent" and "integration: none — no credential checks apply" as an **ok**, not a warning —
-this is a fully supported, intentional configuration, and warning on it would contradict the
-entire point of the feature. `check_image_mode` reports whatever `container.image`/the
-integration-keyed lookup resolves to, unchanged in shape.
+**Actor:** a user running `am doctor` against a config using UC-2's or UC-3's setup, or a typo.
+**Main flow (UC-2's config):** `check_agent` reports `command: my-agent` and
+`integration: none — no credential checks apply` as **ok**, not a warning — a fully supported,
+intentional configuration. `check_image_mode` reports `image: my-image`. **Main flow (a typo,
+`defaults.agent = "cladue"`):** `check_agent` reports `Status::Fail`, `"no agent 'cladue'
+configured"`, hint listing every configured section name (built-ins plus any user-defined
+ones) — a strictly better hint than the previous model's fixed four-name list could give,
+since it can point at a genuine near-miss like `"claude-logging"` if that's what the user
+actually meant.
 
-### UC-7: Devcontainer mode with an integration but a custom command
+### UC-6: Devcontainer mode with an inherited integration and a custom command
 
-**Actor:** UC-3's user, in devcontainer mode. **Main flow:** `injected_features` resolves the
-Feature by integration (`claude`), so `ghcr.io/anthropics/devcontainer-features/claude-code:1`
-is injected regardless of what `--cmd` was; the built image's CMD is still the wrapper script.
-**Postconditions:** the image contains both `claude` (from the Feature) and whatever the
-wrapper needs (from the base image or other Features) — `am` never inspects whether the wrapper
-actually calls `claude`.
+**Actor:** UC-3's user, in devcontainer mode. **Main flow:** the resolved
+`devcontainer_feature` (inherited from `[agents.claude]`) is injected regardless of the
+section's own `command`; the built image's CMD is still the wrapper script.
+**Postconditions:** the image contains both `claude` (from the inherited Feature) and whatever
+the wrapper needs — `am` never inspects whether the wrapper actually calls `claude`.
 
-### UC-8: A typo in `--integration` errors; a typo in `--cmd` does not
+### UC-7: A typo, at each of the two places a typo can now occur
 
-**Actor:** a user who mistypes. **Main flow A:** `am start feat --integration cladue` — hard
-error, "unknown agent 'cladue' — valid agents are: claude, copilot, gemini, codex" (reusing
-`KnownAgent::parse`'s existing message verbatim). **Main flow B:** `am start feat --cmd
-my-agnet` — no error; a container starts and execs a binary named `my-agnet`, which the runtime
-then reports missing. **Business rule:** this asymmetry is intentional, not an oversight — see
-[Resolved Decisions](#resolved-decisions) #2.
+**Actor:** a user who mistypes. **Main flow A — `--agent` names a nonexistent section:**
+`am start feat --agent cladue` — `AmError::AgentNotConfigured`, `"no agent 'cladue' configured
+— configured agents: claude, codex, copilot, gemini"` (or more, with user-defined sections).
+**Main flow B — `integration` inside a real section is misspelled:**
 
-## `am doctor` impact
+```toml
+[agents.my-harness]
+integration = "cladue"
+```
 
-**No CLI surface change.** `am doctor` continues to report the *configured* (file-based) state
-— `resolve_launch(LaunchFlags { agent: agent_flag, cmd: None, integration: None, image: None
-}, &cfg)`, where `agent_flag` is the existing `Option<&str>` parameter `doctor::run` already
-takes (`src/doctor.rs:196`), used only by `am setup`'s verification call to preview an
-in-progress choice (`specs/guided-setup.md`, "Verification step"). A per-invocation `--cmd`/
-`--integration`/`--image` triple passed to `am start` is invisible to `am doctor` by design,
-the same way a bare `am start --agent codex` today is invisible to a doctor run that doesn't
-pass `--agent` — `am doctor` has always answered "is the *persisted config* ready," not "would
-this specific command line work." Extending `am doctor` with its own `--cmd`/`--integration`/
-`--image` flags for symmetry is real, small, and deliberately left as a follow-on — see
-[Open Questions](#open-questions), OQ-1.
-
-`check_agent` (`src/doctor.rs:746-782`) and `check_image_mode` (`src/doctor.rs:576-589`) both
-take `resolved.command`/`resolved.integration` instead of re-deriving them from a single
-`agent_name: Option<&str>` — small signature change, no behavior change for any config that
-only ever sets `defaults.agent` (every config today). New behavior only for a config that sets
-`defaults.command`/`defaults.integration` explicitly: `check_agent` reports command and
-integration as two separate lines instead of one, and treats `integration: none` as **ok**,
-never **fail** or **warn** (see UC-6). `check_image_mode`'s fail hint gains a mention of
-`--image`: `"...or set defaults.agent = \"...\" in .am/config.toml, or set container.image /
-defaults.command + defaults.integration + container.image for a custom harness"`.
+`am start feat --agent my-harness` — `KnownAgent::parse`'s existing error, unchanged wording,
+fired from `resolve_agent`'s field-level validation. **Business rule:** both are now real,
+CLI-surfaced typo errors — unlike the previous two drafts, there is no third case ("a typo in
+`--cmd`") that silently succeeds, because there is no `--cmd` flag left to typo.
 
 ## `am setup` impact
 
-**Deliberately preset-only — no change to the guided flow.** `am setup`'s agent menu
-(`onboarding.rs:29-33`'s `MENU` constant, `ask_agent`, `src/onboarding.rs:593`) continues to
-offer exactly the four known integrations and write `defaults.agent`, unchanged. This is not a
-gap being left unaddressed; it is the same boundary `guided-setup.md` already drew and
-justified for its own scope ("`am setup` doesn't replace those workflows or grow into a general
-config editor" — Assumptions, and Resolved Decisions #4 there): a wizard that walks a
-first-time user through *four Enter-key defaults* is the wrong tool for "type your own image
-name and your own command," which is an advanced, scripting-flavored flow by construction —
-the same "fast supported-integration path vs. advanced/custom-harness path" split
-`BACKLOG.md`'s own "Docs" follow-up item already calls for. A user who wants the custom-harness
-path already knows enough to type `--image`/`--cmd` on a command line; asking `am setup` to
-prompt for an arbitrary image string with no validation, no autocomplete, and no way to check
-it works before `am start` actually runs it would be worse UX than just running `am start`
-directly. **This is why `onboarding.rs`'s 86 references need no interface change** — the table
-in [Design](#design-the-coupling-is-narrower-than-it-looks) already accounts for this.
+**The menu now lists configured sections — the user overrode this spec's earlier
+recommendation, and the reasoning was direct:** *"if we don't list custom agents it will be
+filed as a bug by users. it's not what i would expect either."* A menu that silently omits an
+agent the user themselves configured is a bug report waiting to happen, not a scoping boundary
+worth defending. See the design below.
 
-## `am run` impact
+### The agent menu becomes dynamic
 
-Covered in [CLI contract](#am-run-slug-command---integration-name) and A3/UC-4 above. Net
-effect: `am run` gains one optional flag and otherwise behaves identically, including for every
-existing test that doesn't pass it.
+**Source of truth.** `const MENU: [container::KnownAgent; 4]`'s own doc comment
+(`src/onboarding.rs:27-28`) says `KnownAgent` is "the source of truth for which agents exist."
+That was always slightly wrong even under the old model (the source of truth was really "the
+four names `KnownAgent::parse` accepts," which happened to be enumerable as a `KnownAgent`
+array) and is now actually wrong: `cfg.agents` is the source of truth for which agents exist —
+the four built-ins appear in it automatically, as compiled-in sections (see the defaulting-rules
+fix to `default_agent_images()` above), and any custom section a user adds appears the same way.
+`MENU` as a fixed `[KnownAgent; 4]` is deleted; the doc comment claiming it as the source of
+truth goes with it.
+
+**1. Ordering.** The four built-ins appear first, in their current fixed order (`claude`,
+`copilot`, `gemini`, `codex`), followed by every other name in `cfg.agents` sorted alphabetically
+(ASCII byte order — no locale-aware collation, kept simple and deterministic). Justification:
+`cfg.agents` is a `HashMap`, whose iteration order is not guaranteed and must never leak into an
+interactive menu — that's the non-determinism bug named directly. Putting the built-ins first
+in their existing order, rather than merging everything into one alphabetical list, preserves
+today's exact menu positions (`[1] claude`, `[2] copilot`, ...) for the overwhelmingly common
+case of a config with no custom sections — a fully alphabetical merge would silently reorder
+built-ins the moment a custom section's name sorts earlier (e.g. `"aardvark-harness"` bumping
+`claude` to `[2]`), which is disruptive to existing muscle memory for a feature most users will
+never touch. Custom sections carry no prior positional expectation among themselves, so
+alphabetical is a reasonable, simple, and — the point — deterministic tiebreak.
+
+**2. Credential note per row — three states, not two.** Today's row is either `"credentials
+found"` (checked) or nothing (not checked, read as "not yet"). That silence works when there
+are only two possible states; it stops working the moment a third state — "there is nothing to
+check" — exists, because unlabeled silence would then read as "credentials missing" for a
+config that has no credentials to be missing, which is exactly the confusion the team-lead
+flagged. Three states, three presentations:
+
+- `integration: Some(k)`, credentials found → `"credentials found"` (unchanged).
+- `integration: Some(k)`, credentials not found → nothing extra (unchanged) — still legitimately
+  "not yet," and adding a label here isn't needed to resolve the ambiguity above.
+- `integration: None` → `"no integration"` — an explicit, honest annotation, chosen to be the
+  same length-class as `"credentials found"` so the column still reads cleanly, and to say
+  plainly "there is nothing here to check" rather than leave a blank a user could misread as a
+  problem.
+
+**3. Column alignment generalizes, but the doc comment doesn't yet — fix the comment, not the
+mechanism.** `MENU_NOTE_GAP`'s doc comment (`src/onboarding.rs:36-40`) already computes `width`
+freshly at the call site from whatever's being displayed (`MENU.iter().map(|a|
+a.to_string().len()).max()`), which is exactly the pattern that generalizes: swap `MENU` for the
+dynamic entry list and the same `.map(|e| e.name.len()).max()` computation produces correct
+alignment for any set of names, built-in or custom, of any length. Verified there is no other
+fixed-width assumption anywhere else in the render path. What needs to change is only the
+comment's specific claim that width is "computed from `MENU`... so a longer agent name added
+later doesn't silently misalign the menu" — true in spirit, wrong in specifics once `MENU` no
+longer exists; reword to name the dynamic entry list instead.
+
+**4. `am setup --agent <name>`.** Currently validated via `KnownAgent::parse`
+(`src/onboarding.rs:593-601`, the `agent_flag: Option<container::KnownAgent>` parameter to
+`ask_agent`). Becomes a section lookup, sharing the exact `AgentNotConfigured` error `am start`
+raises for the same condition — one error type, one message shape, reached from two call sites,
+not two independently-worded "unknown agent" messages that could drift apart.
+
+**5. The boundary that survives, stated explicitly so it doesn't quietly disappear along with
+the one that didn't.** Listing configured sections is not the same as becoming a config editor,
+and this design does not blur that line: the menu enumerates what already exists in
+`cfg.agents` — there is no `[N] add a new custom agent...` option, no free-text prompt that
+creates a section on the fly. Typing an existing custom section's name at the prompt (instead of
+its menu number) is accepted, the same way typing `"claude"` instead of `"1"` already is today —
+selecting, not creating. Typing a name that matches nothing in `cfg.agents` re-prompts with the
+same "not one of 1-N or a configured agent name" handling the menu already has for an
+out-of-range number, exactly mirroring `am start`'s `AgentNotConfigured` for the same input.
+Defining a *new* section is still, and remains, purely a config-editing action outside `am
+setup`'s scope — this is the boundary the previous draft was protecting, just drawn one line
+over from where it was.
+
+## `am doctor` impact
+
+`check_agent`/`check_image_mode` now share one `resolve_agent` call per `doctor::run` invocation
+(see [Honest cost report](#honest-cost-report)) and report a section-not-found failure that
+didn't exist before. No CLI surface change — `am doctor` still takes no flags related to this
+spec.
 
 ## `am attach` impact
 
-Covered in UC-5. The only functional change to `cmd_attach` (`src/main.rs:1943-2006`) is
-sourcing `known_agent` from `s.integration` (falling back to parsing `s.agent`, per the Session
-data-model section) instead of always parsing `s.agent`. Everything downstream —
-`recreate_attach_window`, `relaunch_into_existing_window`, `agent_pane_status`,
-`run_post_attach` — is unaffected, because all of them already take `known_agent:
+Unchanged in shape from the previous draft's finding: the only functional change to
+`cmd_attach` (`src/main.rs:1943-2006`) is sourcing `known_agent` from `s.integration` (falling
+back to parsing `s.agent`, per the Session data-model section) instead of always parsing
+`s.agent`. Everything downstream is unaffected, because it already takes `known_agent:
 Option<KnownAgent>` as an opaque input.
-
-## Resolved Decisions
-
-1. **The custom-harness fast path ships in the same change as the decoupling, not as a
-   follow-on.** Once command/integration/image are resolved independently inside `main.rs`,
-   exposing that as `--cmd`/`--integration`/`--image` is three `clap` fields and wiring them
-   into `resolve_launch` — a few hours of the same PR, not a separately schedulable project.
-   Shipping the decoupling without any CLI surface to exercise it would leave the refactor
-   internally correct but externally unverifiable end-to-end (no cucumber scenario could
-   reach the "integration is `None`" branch), which is precisely the branch this whole change
-   exists to make safe. The alternative — landing `resolve_launch`/`Session.integration`/the
-   Feature-injection fix now and the three flags later — saves nothing and defers the only
-   test coverage that proves the design works.
-
-2. **`--agent`/`defaults.agent` keep today's strict `KnownAgent::parse` validation; they are
-   not relaxed to accept arbitrary names.** Considered and rejected: making `--agent
-   my-custom-thing` succeed (as command-only, integration `None`) would let the new
-   harness-agnostic path piggyback on the existing flag instead of adding `--cmd`. Rejected
-   because `--agent`'s current hard error is real, valuable typo protection for the
-   overwhelmingly common case (a user meant one of the four built-ins and fat-fingered it), and
-   there is no way to keep that protection while also accepting arbitrary strings on the same
-   flag — the two goals are in direct conflict on one axis. `--cmd` is new, unvalidated, and
-   named differently on purpose, so a user who wants "no validation" has to opt into it
-   explicitly rather than lose a safety net they didn't ask to give up. This also happens to
-   match the acceptance target's own spelling (`--image ... --cmd ...`, not `--agent
-   my-agent`).
-
-3. **`KnownAgent` is not renamed in this change.** Considered `KnownAgent` → `KnownIntegration`
-   for clarity, since after this change the type unambiguously means "integration" and never
-   "command." Rejected for *this* change: it is a mechanical, behavior-preserving rename
-   touching the 94 + 86 + 34 + 2 + 1 = 217 references the team-lead counted, and bundling it
-   with the actual logic change (a few hundred lines in `main.rs`/`config.rs`) makes the real
-   diff harder to review for no functional benefit — a renamed-but-unchanged 94-site file
-   reviews identically to an unchanged one, badly. Left as an optional, purely mechanical
-   follow-up (a single `cargo`-verified rename), not blocking, not part of this spec's task
-   list. See [Open Questions](#open-questions), OQ-2, for whether to schedule it at all.
-
-4. **`resolve_launch` lives in `config.rs`, not `container.rs` or a new module.** `config.rs`
-   already owns `resolve_image` and `resolve_agent_feature`, both of which `resolve_launch`
-   subsumes the precedence logic for; keeping resolution logic in one file next to the config
-   structs it reads is the existing pattern (`config::resolve_image`'s own doc comment already
-   states its precedence order the same way this spec states `resolve_launch`'s).
-
-5. **Devcontainer Feature injection is fixed to key on integration, not command, as a required
-   part of this change, not an optional drive-by.** See the dedicated section above. Left
-   unfixed, it would be a regression introduced by this spec (today it's merely
-   coincidentally-correct, not tested-and-correct) rather than a pre-existing gap this spec
-   declines to close.
-
-6. **The `agent_auto_flags`/`agent_resume_flags` ordering bug is fixed as part of this change.**
-   See the dedicated section above — `agent_command`'s signature is already being touched, so
-   the marginal cost is near zero and the alternative touches the same function twice for no
-   reason.
 
 ## Task breakdown
 
 ### backend-engineer
 
-- [ ] `src/config.rs`: `Config.command`/`Config.integration` fields (`#[serde(default)]` via
-      the existing `FileDefaults` pattern), `LaunchFlags`/`ResolvedLaunch`/`resolve_launch` per
-      [Data model](#resolve_launch-new-srcconfigrs-beside-resolve_image); `resolve_agent_feature`
-      keyed on integration.
-- [ ] `src/session.rs`: `Session.integration: Option<String>`, `#[serde(default)]`; update
-      `make_session`/test helpers; roundtrip test with the field set and a legacy-record test
-      confirming a missing key loads as `None` (mirror the existing `agent` field's tests).
-- [ ] `src/cli.rs`: `--cmd`/`--integration`/`--image` on `Start`; `--integration` on `Run`.
-- [ ] `src/main.rs`: thread `resolve_launch`'s output through `cmd_start` (replacing
-      `effective_agent`/`effective_known_agent`'s direct derivation), `cmd_run` (per
-      [CLI contract](#am-run-slug-command---integration-name)), and `cmd_attach`'s legacy
-      fallback (per [Data model](#session-srcsessionrs110-131)); update `plan_image`'s image
-      resolution to take the CLI `--image` value; update `injected_features` to key on
-      integration; fix the auto/resume flag ordering in `agent_command`; update doc comments
-      on `agent_command`, `ContainerPlanInput`, `plan_container`/`plan_image`/`plan_devcontainer`
-      to say "command"/"integration" instead of "agent" where that's what they now mean.
-- [ ] `src/error.rs`: rename `AutoRequiresAgent` → `AutoRequiresCommand` (message: "--auto
-      requires a command; set one with --agent, --cmd, or configure defaults.agent /
-      defaults.command"), update `ContainerImageNotConfigured`'s message to mention `--image`.
-- [ ] `src/doctor.rs`: `check_agent`/`check_image_mode` take resolved command/integration/image
-      instead of a single `agent_name`; `check_agent`'s `integration: none` case is `ok`, not
-      `warn`/`fail`.
+- [ ] `src/config.rs`: `AgentSettings.command`/`AgentSettings.integration` fields
+      (`#[serde(default)]`); `default_agent_images()` extended to include `gemini`/`codex` as
+      entries with `image: None`/`devcontainer_feature: None`; `resolve_agent`/`ResolvedAgent`
+      (folding in `resolve_image`/`resolve_agent_feature`'s existing logic plus the two
+      defaulting rules and the inheritance rule).
+- [ ] `src/session.rs`: `Session.integration: Option<String>`, `#[serde(default)]`; roundtrip
+      test with the field set and a legacy-record test confirming a missing key loads as
+      `None`.
+- [ ] `src/main.rs`: `cmd_start` calls `resolve_agent` instead of `KnownAgent::parse`;
+      `cmd_attach`'s legacy fallback per the Session data-model section; `agent_command`'s doc
+      comment updated (signature likely takes `Option<&ResolvedAgent>` or its unpacked
+      `command`/`integration` fields — implementer's choice, no behavior change either way);
+      fix the `agent_auto_flags`-before-`agent_resume_flags` ordering while `agent_command` is
+      already being touched (unchanged rationale from the previous draft — zero marginal cost,
+      no agent combines the two today).
+- [ ] `src/error.rs`: new `AmError::AgentNotConfigured(String, String)` (name, sorted
+      comma-joined configured list); update `ContainerImageNotConfigured`'s message to mention
+      adding `image` to `[agents.<name>]`.
+- [ ] `src/doctor.rs`: `check_agent`/`check_image_mode` call the shared `resolve_agent` result;
+      new `Status::Fail` case for a not-configured section; `integration: none` stays `ok`.
+- [ ] `src/onboarding.rs`: per [Honest cost report](#honest-cost-report) and
+      [The agent menu becomes dynamic](#the-agent-menu-becomes-dynamic) — `cmd_setup` loads a
+      `Config` once and passes it into `DetectedState::gather`; `MENU` deleted, replaced by a
+      menu-entry list built from `cfg.agents` (four built-ins first in current order, then
+      other sections alphabetically); `agent_credentials`/`has_credentials` become
+      section-derived; `ask_agent`'s render loop gains the three-state credential annotation
+      (`"credentials found"` / blank / `"no integration"`); `parse_agent_answer` accepts a
+      typed section name, not just a `KnownAgent::parse`; `MENU_NOTE_GAP`'s doc comment
+      reworded for the dynamic list; `effective_agent`'s type changes to
+      `Effective<Option<String>>`; `agent_write`/`default_agent()`/`ask_agent`'s "currently"
+      line updated to compare section names as strings; `cmd_setup`'s `--agent` validation
+      switches from `KnownAgent::parse` to the shared `AgentNotConfigured` path.
 - [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.
 
 ### integration-tester
 
 - [ ] New `tests/features/harness_decoupling.feature`, with `AM_PODMAN_BIN`/`AM_DOCKER_BIN`
       mocks:
-  - UC-1: `--agent claude` unchanged — pin the exact `run` invocation (image, mounts, CMD)
-        against the pre-change baseline.
-  - UC-2: `--image my-image --cmd my-agent` — assert the mocked runtime records a `run` with
-        `my-image` and CMD `my-agent`, and asserts **no** credential mount/env for any of the
-        four known agents appears.
-  - UC-3: `--agent claude --cmd ./wrapper.sh` — assert Claude's credential mount is present
-        *and* CMD is the wrapper, not `claude`.
-  - UC-4/UC-5: `am run <slug> ./tool.sh` then simulate window loss and `am attach <slug>` —
-        assert relaunch with no `(resuming)` wording and no auto/resume flags in the replayed
-        command.
-  - UC-8: `--integration cladue` fails before any container/worktree side effect; `--cmd
-        my-agnet` succeeds at the `am` level (the mocked runtime doesn't know or care that the
-        binary is missing, which is the correct thing to assert — `am` did its job).
+  - UC-1: `--agent claude` unchanged — pin the exact `run` invocation against the pre-change
+        baseline.
+  - UC-2: a config defining `[agents.my-harness]` with `command`/`image`, no `integration` —
+        assert the mocked runtime records `my-image` and CMD `my-agent`, and asserts no
+        credential mount/env for any of the four built-ins appears.
+  - UC-3: `[agents.claude-logging]` with `integration = "claude"`, no `image` — assert Claude's
+        credential mount is present, the inherited image is used, and CMD is the wrapper.
+        Include the variant where the section also sets its own `image`, overriding only that
+        one inherited field.
+  - UC-4: simulate window loss on UC-2's session, `am attach` — assert relaunch with no
+        `(resuming)` wording and no auto/resume flags.
+  - UC-5/UC-7: a config with `defaults.agent = "cladue"` — `am doctor`/`am start` both fail
+        with `AmError::AgentNotConfigured`, hint lists configured names; a config with
+        `[agents.my-harness]` `integration = "cladue"` — fails with `KnownAgent::parse`'s
+        unchanged error.
+  - UC-6: a devcontainer config with `agent_install = "feature"` and UC-3's section — assert
+        the built image's label carries the claude-code Feature (this is now a
+        correct-by-construction assertion, not a regression test for a fix — see
+        [the evaporated bug](#the-devcontainer-feature-injection-bug-from-the-previous-draft-evaporates)).
   - Regression: every existing scenario in `start.feature`/`container.feature`/
-        `full_flow.feature`/`attach_restore_agent.feature` still passes unmodified — this is
-        the test that the "no interface change" cells in the [Design](#design-the-coupling-is-narrower-than-it-looks)
-        table are actually true.
-  - Devcontainer: a config with `agent_install = "feature"` and `--agent claude --cmd
-        ./wrapper.sh` — assert the built image's label still carries the claude-code Feature
-        (this is the regression test for the Feature-injection bug fix; it cannot be written
-        against the *unfixed* code without a mock devcontainer CLI, so write it to fail loudly
-        against `main` before the fix lands, not just pass after).
-- [ ] Unit tests for `resolve_launch` covering every cell of the three precedence tables
-      independently (tier-1-beats-tier-2 for each axis, all four tiers empty → `None`,
-      integration typo → error, command typo → no error).
+        `full_flow.feature`/`attach_restore_agent.feature` still passes unmodified.
+- [ ] Unit tests for `resolve_agent`: both defaulting rules independently; the inheritance rule
+      for `image` and `devcontainer_feature` independently, including the "section sets its
+      own, no inheritance" case; `AgentNotConfigured` lists every configured name, sorted,
+      including user-defined ones; a compiled-in `gemini`/`codex` lookup succeeds with `image:
+      None` (the regression this spec's defaulting-rules section flags explicitly).
+- [ ] Unit tests for `onboarding.rs`'s updated `resolve_effective`/`effective_agent`: a
+      `defaults.agent` naming a valid, configured custom section reports it as the effective
+      value (not "none configured"); a `defaults.agent` naming nothing configured still reads
+      as unfilled, preserving UC3's repair-prompt behavior in `guided-setup.md`.
+- [ ] Unit tests for the dynamic agent menu: built-ins always appear first in their current
+      order regardless of `cfg.agents`' `HashMap` iteration order; custom sections appear
+      after them, alphabetically, and a second run with the same config produces the identical
+      order (determinism, not just "looks sorted once"); a section with `integration: None`
+      shows `"no integration"`, not a blank; a section with `integration: Some(k)` and no
+      credentials on this host shows a blank, not `"no integration"` — the two must not be
+      confusable; `am setup --agent <bogus>` and typing a bogus name at the interactive prompt
+      both produce the same `AgentNotConfigured`-shaped message `am start` would.
 
 ### code-reviewer
 
-- [ ] Confirm zero interface changes landed in `container.rs`/`onboarding.rs` beyond doc
-      comments — this is the design's central claim and the easiest place for scope to creep
-      back in during implementation.
-- [ ] Confirm `check_agent`'s `integration: none` path is `ok`, never `warn`/`fail`.
-- [ ] Confirm `--cmd`/`--image` never call `KnownAgent::parse` or any validation function
-      anywhere in the new code paths.
-- [ ] Confirm the Feature-injection fix and the auto/resume ordering fix both shipped with
-      their own dedicated tests, not folded silently into an unrelated assertion.
-- [ ] Confirm `Session.integration` round-trips through a legacy record (missing key → `None`,
-      no crash) and that the attach-time inference-and-persist happens at most once per record.
+- [ ] Confirm zero interface changes landed in `container.rs` — the design's central claim,
+      and still the easiest place for scope to creep back in.
+- [ ] Confirm the agent menu's ordering is deterministic across repeated runs regardless of
+      `cfg.agents`' `HashMap` iteration order — this is the exact bug class flagged during
+      design; a flaky-looking cucumber scenario here is a real bug, not a harness issue.
+- [ ] Confirm the three credential-note states (`"credentials found"` / blank / `"no
+      integration"`) are each reachable and distinguishable, and that `am setup`'s scope
+      boundary holds: no menu option creates a section, and no free-text entry silently
+      defines one.
+- [ ] Confirm `resolve_agent`'s inheritance rule is applied per-field independently (a section
+      can inherit `image` while setting its own `devcontainer_feature`, or vice versa).
+- [ ] Confirm `check_agent`/`check_image_mode` call `resolve_agent` exactly once per
+      `doctor::run` invocation, not once each (drift risk if they diverge).
+- [ ] Confirm `Session.integration` round-trips through a legacy record and that the
+      attach-time inference-and-persist happens at most once per record.
 
 ### documentation-writer
 
-- [ ] `docs/reference/configuration.md`: document `defaults.command`/`defaults.integration`
-      alongside the existing `defaults.agent`, and `--cmd`/`--integration`/`--image` alongside
-      `--agent` in the `am start`/`am run` sections.
-- [ ] `docs/reference/commands.md`: `am start`/`am run` sections gain the three/one new flags;
-      a new short "Custom harnesses" callout showing the acceptance-target example verbatim.
-- [ ] Per `BACKLOG.md`'s existing "Docs: separate the fast path from the custom path" item —
-      this spec's shipped feature is what makes that split concrete; note in `BACKLOG.md`
-      (owner: documentation-writer, not this spec, since the instruction is spec-only and does
-      not modify `BACKLOG.md`) that the docs item is now unblocked and should point at the new
-      flags as "the custom/advanced path."
-- [ ] `BACKLOG.md`: leave to the orchestrator to mark both backlog items — "Decouple command,
-      integration, and image" and "Custom-harness fast path" — resolved once implementation and
-      review land; this spec does not modify `BACKLOG.md` itself per instruction.
-
-## Test plan
-
-Summarized from the task breakdown above; the two properties that matter most and are each
-worth their own explicit assertion rather than incidental coverage:
-
-1. **No observable behavior change for any config that only sets `defaults.agent`/`--agent`.**
-   Every existing cucumber scenario passes unmodified — a diff in `.feature` files anywhere
-   outside the new `harness_decoupling.feature` is a signal something leaked.
-2. **Integration `None` is a fully working, first-class state, not a degraded one.** No error,
-   no warning from `am doctor`, no crash from `agent_command`/`resume_will_apply`/
-   `plan_image`/`plan_devcontainer` — all four already handle `Option<KnownAgent> = None`
-   today (verified by reading them during this spec's research; `agent_command`'s early guard,
-   `plan_image`/`plan_devcontainer`'s `match agent { Some(_) => ..., None =>
-   AgentAuth::default() }`), so the test plan's job is proving that continues to hold once
-   `None` becomes reachable through a path other than "no `--agent` given at all."
+- [ ] `docs/reference/configuration.md`: document `AgentSettings.command`/`.integration`
+      alongside the existing `image`/`devcontainer_feature`, with the inheritance rule spelled
+      out and a worked custom-harness example matching UC-2/UC-3.
+- [ ] `docs/reference/commands.md`: `am start`'s `--agent` description updated from "select a
+      known agent" to "select a configured `[agents.<name>]` section"; new short "Custom
+      harnesses" callout.
+- [ ] `BACKLOG.md`: left to the orchestrator to mark the two backlog items resolved once
+      implementation and review land; this spec does not modify `BACKLOG.md` itself.
 
 ## Edge Cases & Considerations
 
-- **Security:** a custom-harness session (integration `None`) mounts *strictly less* than a
-  preset session — no credential mounts, no credential env — so this change narrows attack
-  surface for that path rather than widening it. `--image`/`--cmd` accepting unvalidated
-  strings is not a new risk: `container.image` already accepts an arbitrary string today with
-  identical trust properties (the image is trusted exactly as much as any other `container.image`
-  value already is).
-- **Performance:** `resolve_launch` is pure string/enum resolution, no I/O; negligible next to
-  the container preflight it feeds into.
-- **UX:** the doctor/start error messages for `ContainerImageNotConfigured`/
-  `AutoRequiresCommand` need updating in the same PR that changes the conditions under which
-  they fire, or a user hits a stale message that doesn't mention the flag that would have
-  fixed it — flagged explicitly in the task breakdown, not left implicit.
-- **Race conditions:** none introduced; no new shared state, no new concurrency.
+- **Security:** a custom-harness session (`integration: None`) mounts *strictly less* than a
+  preset session — no credential mounts, no credential env. Unchanged reasoning from the
+  previous draft.
+- **Performance:** `resolve_agent` is a hashmap lookup plus at most one more (the inheritance
+  fallback); negligible.
+- **UX:** `AgentNotConfigured`'s message needs to land in the same PR that introduces the
+  failure mode it names, or a user hits a stale error — flagged in the task breakdown.
 - **Config drift across a shared `.am/config.toml`:** unaffected by the additive-only key
-  policy — a teammate on an older `am` binary sees `command`/`integration` as unknown keys and
-  gets the existing warn-don't-fail behavior (`BACKLOG.md`, "Decided against" —
-  `deny_unknown_fields`), exactly the property that policy exists to preserve.
+  policy (`command`/`integration` are new, optional `AgentSettings` fields) — a teammate on an
+  older `am` binary sees them as unknown keys and gets the existing warn-don't-fail behavior.
+- **A section can name itself as its own integration's inheritance source pathologically**
+  (e.g. `[agents.claude]` with `integration = "claude"` — the default anyway, so this is
+  self-referential but not infinite: the inheritance lookup only ever recurses one level, into
+  the *named* integration's section, never further, so there's no cycle to guard against.
 
-## Open Questions
+## Decided by the user
 
-Each has a recommended default; ship the default unless the user overrides it.
+All three Open Questions from the previous draft have been resolved; recorded here rather than
+left as open items.
 
-### OQ-1: Should `am doctor` (and `am setup --agent`) grow its own `--cmd`/`--integration`/
-`--image` flags for full symmetry with `am start`?
+- **Custom sections appear in `am setup`'s agent menu** — this spec's earlier recommendation
+  (stay preset-only) was overridden directly: *"if we don't list custom agents it will be filed
+  as a bug by users. it's not what i would expect either."* See
+  [The agent menu becomes dynamic](#the-agent-menu-becomes-dynamic) for the resulting design.
+- **`KnownAgent` → `KnownIntegration` is scheduled, not merely recommended** — its own PR, once
+  this spec's implementation lands, never sharing a PR with the decoupling itself. Filed in
+  `BACKLOG.md` by the orchestrator; not tracked further in this document.
+- **No `am agents list` command in this change** — confirmed as recommended, folded into the
+  existing `BACKLOG.md` item "Session observability in `am list`" by the orchestrator; not
+  tracked further in this document.
 
-**Recommendation: not in this change.** `am doctor` has always reported the *persisted config's*
-readiness, not a hypothetical command line's — it takes no `--no-container`/`--auto`/`--rebuild`
-either, for the same reason. Adding three flags here is a small, real, independently-shippable
-follow-on with no dependency on anything in this spec beyond `resolve_launch` already existing.
-Low urgency: the only user this helps is someone iterating on a `--cmd`/`--image` combination
-before committing it to config, who can just run `am start` itself to find out.
-
-### OQ-2: Should `KnownAgent` be renamed to `KnownIntegration` at all, and if so, when?
-
-**Recommendation: yes, eventually, as its own PR, not scheduled as part of this feature.**
-The type's *meaning* is settled by this spec (it is "integration," full stop); the name is now
-mildly misleading but not incorrect (an integration is still tied to a specific agent CLI). A
-pure `cargo`-mechanical rename is low-risk and easy to review in isolation — exactly the kind
-of change that should not share a PR with a logic change, per [Resolved Decisions](#resolved-decisions)
-#3. Needs a decision on timing (next release cycle? opportunistic, next time someone touches
-`container.rs` for an unrelated reason?), not a decision on whether it's correct.
-
-### OQ-3: Is a `--integration none` (or empty-string) escape hatch needed, to force integration
-off even when `--agent`/`defaults.agent` would otherwise supply one?
-
-**Recommendation: not in this change, revisit if requested.** No use-case in this spec's
-research needs it — `--cmd` alone, with no `--agent`, already gets you integration `None`; the
-only gap is "I want to type `--agent claude` for its image-lookup convenience but explicitly
-suppress its credential mounting," which is a narrow, easily-worked-around case (just use
-`--image`/`defaults.agent`'s `[agents.claude].image` value directly instead of `--agent`).
-Adding a sentinel value now, before anyone has asked for it, risks guessing wrong about its
-spelling or semantics.
-
-### OQ-4: Should `am start --image` with a devcontainer-mode session (where `--image` is
-inert) print a note, or stay silent the way `container.image` already does today?
-
-**Recommendation: stay silent, matching existing behavior for `container.image`.** No prior
-complaint or test exists about `container.image` going unused in devcontainer mode despite
-being set; adding a note only for the new `--image` flag while leaving the old one silent
-would be an inconsistency, not an improvement. If this is judged worth fixing, it should be
-fixed for both flags together, as its own small change, not smuggled into this one.
+No open questions remain.

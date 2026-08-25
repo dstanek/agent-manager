@@ -561,6 +561,31 @@ turned out not to be. Devcontainer mode simply never resolves an `am` image —
 still worth doing for the custom-harness fast path below; it is not a prerequisite
 for anything shipped.
 
+### Rename `KnownAgent` to `KnownIntegration`
+
+**Scheduled** (decided 2026-08-25): do it as soon as
+[`specs/harness-decoupling.md`](specs/harness-decoupling.md) is implemented, as its own PR.
+
+After the decoupling, the type unambiguously means "which built-in auth preset" and never
+"which command to launch" — it becomes the *value* of an `integration` key rather than the
+thing `--agent` parses into. The name then actively misleads, and the longer it survives past
+the decoupling the more new code gets written against the wrong mental model.
+
+Two constraints on how, both deliberate:
+
+- **Not in the decoupling PR.** It is a mechanical, behaviour-preserving rename across ~217
+  references (`container.rs` 94, `onboarding.rs` 86, `main.rs` 34, `doctor.rs` 2, `cli.rs` 1).
+  Bundled with a few hundred lines of real logic change it would make the logic diff
+  unreviewable — a renamed-but-unchanged 94-site file reviews exactly like an unchanged one,
+  badly.
+- **Compiler-verified and nothing else.** No behaviour change, no signature change beyond the
+  type's name, no reordering. If the rename PR wants to fix anything, that is a different PR.
+
+- [ ] Rename the type, its `parse`/`Display` impls, and every reference
+- [ ] Update doc comments that describe it as "the agent" rather than "the integration"
+- [ ] Confirm `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings` are
+      clean, and that the diff contains no change other than the rename
+
 ### Custom-harness fast path
 
 Deliver the mission promise ("quickly manage isolated AI harnesses") for
@@ -596,6 +621,13 @@ Partly landed: `am list --all` reports a `stale` marker when a session's reposit
 longer exists, and `am session rm` cleans those records up. Still storage-derived,
 though — the marker is a `Path::exists` check on the record, not a liveness probe. The
 container and tmux window are still never queried.
+
+Also folded in here (decided 2026-08-25, rather than built as its own `am agents list`
+command): once [`specs/harness-decoupling.md`](specs/harness-decoupling.md) lands,
+`[agents.<name>]` stops being four presets plus an override and becomes a real multi-entry
+registry a user adds to. There is then no way to ask `am` what agents are configured. The
+answer belongs with this entry — an operator asking "what can I start?" and "what is running?"
+is asking one question — not in a separate command invented for it.
 
 ### Docs: separate the fast path from the custom path; tone down future features
 
