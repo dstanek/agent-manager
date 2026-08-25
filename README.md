@@ -16,7 +16,7 @@ The install script downloads the right binary for your platform into `~/.local/b
 curl -fsSL https://raw.githubusercontent.com/dstanek/agent-manager/main/install.sh | sh
 ```
 
-Or build from source (requires [Rust](https://rustup.rs) 1.70+):
+Or build from source (requires [Rust](https://rustup.rs) 1.88+):
 
 ```sh
 git clone https://github.com/dstanek/agent-manager.git

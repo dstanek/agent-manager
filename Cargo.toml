@@ -2,6 +2,13 @@
 name = "am"
 version = "0.5.0"
 edition = "2021"
+# The real floor, measured from the resolve graph, not a number picked once and left. Both the
+# binary and the test suite need it: `ureq -> url -> idna -> idna_adapter -> icu_*` pins the
+# build, `cucumber -> globwalk -> ignore/globset` pins the tests. Every constraint so far has
+# been transitive, so this moves on dependency bumps nobody asked for it to move on -- the
+# `msrv` leg of ci.yml's test matrix reads this value back, so a move shows up as a failing
+# job on the bumping PR instead of as a user's compile error. See docs/reference/building.md.
+rust-version = "1.88"
 description = "Creates isolated environments for coding agents"
 authors = ["David Stanek"]
 license = "MIT"

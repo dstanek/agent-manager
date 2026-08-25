@@ -37,7 +37,7 @@ Renovate proposes that bump as a pull request — see
 
 Building outside a dev container needs:
 
-- [Rust](https://rustup.rs) 1.70 or later (edition 2021)
+- [Rust](https://rustup.rs) 1.88 or later (edition 2021)
 - A C linker, which every supported platform already provides:
   - **Linux** — the system linker from `gcc`/`binutils` (installed on virtually
     all distributions; `build-essential` on Debian/Ubuntu if missing)
@@ -47,6 +47,39 @@ Building outside a dev container needs:
 
 No system libraries, `pkg-config` entries, or headers are required — the crate
 graph is pure Rust.
+
+### The minimum supported Rust version
+
+1.88 is the floor for *both* building the binary and running the test suite. The
+two can differ — they have before — so when they do, this section says so and the
+higher one is what `rust-version` in `Cargo.toml` declares. Today they coincide.
+
+`am` **tracks** that floor rather than holding it. Every constraint that has set
+it so far arrived transitively, through a routine dependency bump: the build
+floor comes from `ureq → url → idna → idna_adapter → icu_*`, the test floor from
+`cucumber → globwalk → ignore`/`globset`. Holding a lower number would mean
+version-pinning crates `am` does not depend on directly and does not use, purely
+to constrain them — a standing cost with no user asking for it. So the number
+moves when the ecosystem moves it, in both directions: it was 1.85 for the binary
+for part of a week, lowered by a `which` v6 → v8 bump that dropped `home` from the
+graph entirely, then back to 1.88 when `icu_*` 2.3.0 landed.
+
+What makes that safe rather than sloppy is that the floor is measured and
+enforced, not asserted:
+
+- `rust-version` in `Cargo.toml` is the single declaration. On an older toolchain
+  `cargo` refuses with a message naming `am` and the required version, instead of
+  failing deep inside a transitive crate with nothing pointing at the cause.
+- The `msrv` leg of CI's test matrix reads that same value back out of
+  `Cargo.toml` and builds and tests on it. A dependency bump that raises the real
+  floor fails on the pull request that raises it, so the bump and the new floor
+  land together — the drift this replaced was invisible precisely because every
+  job used `stable`.
+
+To re-measure the floor from the resolve graph rather than trusting the number,
+`cargo metadata` reports each package's own `rust_version`; the maximum over the
+normal and build dependencies is the build floor, and including dev-dependencies
+gives the test floor.
 
 ## Build
 

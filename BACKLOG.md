@@ -339,36 +339,52 @@ platform.
 
 ### Documented MSRV is stale and unenforced
 
-[`docs/reference/building.md:39`](docs/reference/building.md) states "Rust 1.70 or later", but
-the crate graph has drifted well past that:
+**Done 2026-08-25.** `Cargo.toml` now declares `rust-version = "1.88"`, the docs state that
+number in all three places that quoted 1.70 ([`README.md`](README.md),
+[`docs/getting-started/installation.md`](docs/getting-started/installation.md),
+[`docs/reference/building.md`](docs/reference/building.md)), and CI's `test` job grew a second
+matrix leg, `msrv`, that reads `rust-version` back out of `Cargo.toml` and runs the same build
+and the same suite on it. Reading the value back rather than repeating it is the point: the
+declared floor and the tested floor are one number, and a renamed or removed key fails the job
+instead of silently falling back to `stable` and testing nothing while looking green.
 
-- **Building the binary requires 1.85** — `toml_parser` 1.1.3, `indexmap` 2.14.0,
-  `clap_lex` 1.1.0, `cpufeatures` 0.3.0, and `hybrid-array` 0.4.14 all declare it.
-- **Running the test suite requires 1.88** — `cucumber` 0.23, `gherkin` 0.16, and their
-  `globset`/`ignore` dependencies.
+The floor was re-measured from the resolve graph rather than taken from this entry, and it had
+already drifted again in the interval — proving the entry's own thesis a second time. Both
+floors are now **1.88**:
 
-So the real floor is 1.85 to build and 1.88 to contribute — both well above the documented
-1.70.
+| | This entry said | Measured 2026-08-25 |
+|---|---|---|
+| Build the binary | 1.85 | **1.88** |
+| Run the test suite | 1.88 | **1.88** |
 
-The drift moves in *both* directions, which is what makes it worth enforcing rather than
-just correcting once. Measured a day earlier, the binary floor was 1.88, pinned there by
-`home` 0.5.12 arriving transitively through `which` 6.0.3. The routine `which` v8 bump
-dropped `home` from the graph entirely (v8 depends only on `libc`), lowering the floor to
-1.85 — a change no one asked for, reviewed, or recorded.
+The binary's floor climbed back because `icu_*` 2.3.0 declares 1.88 and reaches the graph via
+`ureq → url → idna → idna_adapter → icu_normalizer`/`icu_properties`; the test floor is still
+`cucumber → globwalk → ignore`/`globset`. Every binding constraint remains transitive — no
+direct dependency choice would have surfaced any of them.
 
-Nothing catches any of this because nothing enforces it: `Cargo.toml` has no `rust-version`
-field, and every job in `ci.yml` uses `dtolnay/rust-toolchain@stable`, so CI has never once
-compiled against the floor the docs promise. A user on 1.70 following those docs gets a
-compile failure deep in a transitive dependency, with nothing pointing at the real cause.
+**Policy decided: track stable and document it honestly**, not hold a floor and pin what pushes
+past it. Holding one would mean adding version constraints on crates `am` neither depends on
+directly nor uses (`icu_provider`, `globset`, …) purely to pin them, plus Renovate rules to keep
+them pinned — a standing cost against no user asking for an older toolchain. The floor is
+allowed to move; what changed is that it can no longer move *unobserved*. The rationale and the
+re-measurement recipe are written down under "The minimum supported Rust version" in
+`docs/reference/building.md` so the next person to see the number move knows whether to follow
+it or fight it.
 
-- [ ] Set `rust-version` in `Cargo.toml` to the real floor so `cargo` reports a clear error
+Setting `rust-version` did not move `Cargo.lock`: MSRV-aware resolution is opt-in on
+`resolver = "2"` (edition 2021), so the key adds the check without changing what resolves.
+
+- [x] Set `rust-version` in `Cargo.toml` to the real floor so `cargo` reports a clear error
       instead of a dependency-resolution failure
-- [ ] Correct `docs/reference/building.md` to match, and say whether the documented floor is
+- [x] Correct `docs/reference/building.md` to match, and say whether the documented floor is
       the build floor or the contribute floor — they differ
-- [ ] Add a CI job pinned to the declared MSRV, so the two cannot drift again
-- [ ] Decide the policy: track stable and document it honestly, or hold a floor and pin the
-      dependencies that push past it. Note the binding constraints have all been *transitive*
-      so far — no direct dependency choice would have surfaced them
+- [x] Add a CI job pinned to the declared MSRV, so the two cannot drift again
+- [x] Decide the policy: track stable and document it honestly
+
+Not done, deliberately: [`specs/guided-setup.md`](specs/guided-setup.md) lines 600 and 1041–1042
+still say the docs claim 1.70 and point here. That is a historical record of what was true when
+that feature was designed, and specs are read for design intent, not current behaviour — the
+pointer is stale only in the sense that this entry is now closed.
 
 Found while pricing prompt-crate options for [`specs/guided-setup.md`](specs/guided-setup.md);
 independent of that feature.

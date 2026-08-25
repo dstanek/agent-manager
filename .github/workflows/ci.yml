@@ -31,8 +31,17 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test
+    name: Test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    # Two toolchains, one job definition, so the msrv leg cannot drift from what `stable`
+    # actually runs -- it is the same build and the same suite, only the compiler differs.
+    # `msrv` resolves to `rust-version` in Cargo.toml (see the step below); a dependency bump
+    # that raises the real floor fails here, on the PR that raises it, instead of reaching a
+    # user as a compile error deep in a transitive crate.
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, msrv]
     # A real run finishes in a couple of minutes; this cap exists only so a hung test (e.g. a
     # pty-driven cucumber scenario whose child never gets EOF) fails fast with a clear GitHub
     # Actions timeout instead of silently eating the 360-minute default. The test harness has
@@ -42,9 +51,33 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The floor lives in exactly one place, Cargo.toml's `rust-version`. Reading it back
+      # rather than repeating it here is what keeps the declared floor and the tested floor
+      # the same number; a rename or removal fails the job instead of quietly falling back
+      # to stable, which would test nothing and still look green.
+      - name: Resolve toolchain
+        id: toolchain
+        run: |
+          if [ "${{ matrix.toolchain }}" != "msrv" ]; then
+            echo "version=${{ matrix.toolchain }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "could not read rust-version from Cargo.toml" >&2
+            echo "(was the key renamed or removed? this job must not silently test stable)" >&2
+            exit 1
+          fi
+          echo "declared floor: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.toolchain }}
 
       - name: Install jj
         run: |
@@ -62,7 +95,10 @@ jobs:
       - name: Test
         run: cargo test
 
+      # Only from the stable leg: both legs produce the same binary, and two uploads under one
+      # artifact name is an error.
       - name: Upload binary artifact
+        if: matrix.toolchain == 'stable'
         uses: actions/upload-artifact@v7
         with:
           name: am-x86_64-unknown-linux-gnu

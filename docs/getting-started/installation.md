@@ -98,7 +98,9 @@ Container isolation is enabled by default but can be disabled per-session with `
 
 === "Build from source"
 
-    Building from source requires [Rust](https://rustup.rs) 1.70 or later.
+    Building from source requires [Rust](https://rustup.rs) 1.88 or later.
+    See [the minimum supported Rust version](../reference/building.md#the-minimum-supported-rust-version)
+    for why that number moves.
 
     ```sh
     git clone https://github.com/dstanek/agent-manager.git
