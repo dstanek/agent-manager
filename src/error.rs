@@ -55,6 +55,13 @@ pub enum AmError {
     #[error("cannot determine state directory: neither XDG_STATE_HOME nor HOME is set")]
     GlobalStateDirNotFound,
 
+    #[error(
+        "`am run` has been removed — for a containerized session it typed into the running \
+         container's stdin instead of launching anything. Set `defaults.agent` in \
+         .am/config.toml (or run `am setup --agent <name>`), then run `am attach {0}`"
+    )]
+    RunRemoved(String),
+
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
@@ -139,6 +146,16 @@ mod tests {
     fn config_error_includes_message() {
         let e = AmError::ConfigError("invalid toml".to_string());
         assert!(e.to_string().contains("invalid toml"));
+    }
+
+    #[test]
+    fn run_removed_names_the_replacement_path() {
+        let e = AmError::RunRemoved("my-feature".to_string());
+        let msg = e.to_string();
+        assert!(msg.contains("am run"));
+        assert!(msg.contains("defaults.agent"));
+        assert!(msg.contains("am setup --agent"));
+        assert!(msg.contains("am attach my-feature"));
     }
 
     #[test]

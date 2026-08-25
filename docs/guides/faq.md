@@ -31,10 +31,10 @@ Think of it as **tmux + git worktrees + containers** all orchestrated for AI age
 Partially. `am` **requires** tmux for its split-pane interface (agent on one side, shell on the other). However:
 
 - **If inside tmux:** Everything works normally
-- **If outside tmux:** Running `am start` without tmux will execute `am` but replace your shell process with the container. No split pane, no second shell.
-- **Alternative:** Use `am run <slug> -- <cmd>` to execute commands without tmux at all
+- **If outside tmux, containerized session:** `am start` records the session, then `exec`s the container in place of the `am` process itself — no split pane, no second shell, but it runs to completion and exits with the container's real exit code.
+- **If outside tmux, `--no-container` session:** `am start` records the session and prints a note; no agent is launched. Run `am attach <slug>` from inside tmux to open a window and launch it.
 
-For non-interactive use (scripts, CI/CD), you don't need tmux.
+For non-interactive use (scripts, CI/CD), a containerized session started outside tmux is the path that actually runs something.
 
 ### Do I need Docker or Podman?
 
@@ -183,13 +183,11 @@ Likely causes:
 
 ### How do I run a command inside a session without attaching?
 
-Use `am run`:
-
-```bash
-am run feat -- your-command-here
-```
-
-This executes the command in the session's container and prints output. Useful for CI/CD and scripts.
+There's no dedicated command for this — `am` doesn't have an "exec into a running session" primitive.
+For a non-interactive run of an agent from the start, start a containerized session outside tmux
+(see [Can I use `am` without tmux?](#can-i-use-am-without-tmux)); `am start` records the session
+and then `exec`s the container in place of itself, so it runs to completion and exits with the
+container's real exit code.
 
 ### Can I keep a session running while I close my terminal?
 
@@ -256,12 +254,11 @@ This is a feature request, not currently implemented.
 
 ### Can I run `am` in a CI/CD pipeline?
 
-Yes! See [CI/CD Integration Guide](../guides/ci-cd-integration.md) for examples:
-- GitHub Actions
-- GitLab CI
-- Jenkins
-
-Key insight: Use `am run` instead of `am attach` in non-interactive environments.
+A containerized session started outside tmux is the non-interactive path: `am start` records the
+session, then `exec`s the container in place of the `am` process, so it runs to completion with a
+real exit code a pipeline can check. There isn't yet a verified, runner-tested CI/CD guide for
+this — one is planned, but publishing untested worked examples has caused real problems here
+before, so none are included yet.
 
 ### Does `am` store any telemetry or usage data?
 

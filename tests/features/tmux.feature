@@ -28,13 +28,13 @@ Feature: am start and am attach with tmux
     And the mock tmux log contains "new-window"
     And the mock tmux log contains "split-window"
 
-  Scenario: run sends an agent command to the session's agent pane
+  Scenario: run has been removed and never touches tmux
     Given a session "my-feature" has been started
+    And I clear the mock tmux log
     When I run "am run my-feature claude"
-    Then the command succeeds
-    And the output contains "Launched 'claude'"
-    And the mock tmux log contains "send-keys"
-    And the mock tmux log contains "claude"
+    Then the command fails
+    And the output contains "am attach my-feature"
+    And the mock tmux log does not contain "send-keys"
 
   Scenario: destroy kills the tmux window
     Given a session "my-feature" has been started
@@ -72,4 +72,4 @@ Feature: am start and am attach with tmux
     When I run "am attach my-feature"
     Then the command succeeds
     And the output contains the plain line "Opened new window for session 'my-feature' and restarted the container."
-    And the output contains the note line "am attach does not know which agent to launch — run 'am run my-feature <agent>'"
+    And the output contains the note line "am attach does not know which agent to launch — set 'defaults.agent' in .am/config.toml (or run 'am setup --agent <name>'), then run 'am attach my-feature' again"

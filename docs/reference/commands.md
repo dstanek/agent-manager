@@ -429,18 +429,17 @@ command instead of leaving you with an empty window.
 Deciding a pane is idle is deliberately conservative: if the foreground process can't be
 confidently matched to either the recorded agent/container or a bare shell — an unrecognized
 process name, a failed tmux query, a pane target that's gone — `am attach` treats it as still
-running and does nothing. A missed relaunch just costs you an `am run`; relaunching on top of a
-live agent could interrupt real work.
+running and does nothing. A missed relaunch just costs you a repeat `am attach`; relaunching on
+top of a live agent could interrupt real work.
 
-**Which agent gets relaunched.** Whatever `am start --agent <agent>` or the most recently run
-`am run <slug> <agent>` launched into the session — `am run` updates the recorded agent on
-success, so attach always relaunches what actually ran last. Session records written before
-this feature existed have no agent on file; `am attach` falls back to the current `agent` from
-config and remembers that choice for next time. If there's no configured agent either, it opens
-the window/pane with nothing launched and adds:
+**Which agent gets relaunched.** Whatever `am start --agent <agent>` recorded on the session.
+Session records written before that field existed have no agent on file; `am attach` falls back
+to the current `agent` from config and remembers that choice for next time. If there's no
+configured agent either, it opens the window/pane with nothing launched and adds:
 
 ```
-Note: am attach does not know which agent to launch — run 'am run <slug> <agent>'
+Note: am attach does not know which agent to launch — set 'defaults.agent' in
+.am/config.toml (or run 'am setup --agent <name>'), then run 'am attach <slug>' again
 ```
 
 **Resuming the previous conversation.** By default, a relaunch asks the agent to resume its
@@ -489,31 +488,6 @@ Opened new window for session 'demo' and restarted the container.
 
 !!! warning "Requires tmux"
     `am attach` must be run from inside a tmux session. If `$TMUX` is not set, the command exits with an error. To get a terminal inside an existing session without tmux, navigate directly to `.am/worktrees/<slug>`.
-
----
-
-## `am run <slug> <agent>`
-
-Send an agent command to a session's agent pane.
-
-**Usage**
-
-```sh
-am run <slug> <agent>
-```
-
-Uses `tmux send-keys` to send the specified agent command to the agent pane of the `am-<slug>` window, followed by Enter. This is useful for (re)starting an agent in a session that was started without one, or after the agent process has exited.
-
-On success, `am run` also records `<agent>` as the session's agent, so a later [`am attach`](#am-attach-slug) relaunches whatever was actually run last rather than whatever `am start` originally recorded.
-
-**Example**
-
-```sh
-am run feat claude
-```
-
-!!! warning "Requires tmux"
-    `am run` must be run from inside a tmux session. If `$TMUX` is not set, the command exits with an error.
 
 ---
 

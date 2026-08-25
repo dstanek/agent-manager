@@ -31,16 +31,18 @@ Feature: error handling — clear, early errors for invalid usage
     Then the command fails
     And the output contains "tmux"
 
-  Scenario: run when not inside tmux fails
+  Scenario: run has been removed and points at the replacement path
     Given a git repository
     And a session "my-feature" has been started
     When I run "am run my-feature claude"
     Then the command fails
-    And the output contains "tmux"
+    And the output contains "am run"
+    And the output contains "am attach my-feature"
 
-  Scenario: run with an unknown session fails while inside tmux
+  Scenario: run has been removed even for an unknown session
     Given a git repository
     And I am inside a tmux session
     When I run "am run no-such-session claude"
     Then the command fails
-    And the output contains "not found"
+    And the output contains "am run"
+    And the output contains "am attach no-such-session"

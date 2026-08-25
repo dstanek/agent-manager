@@ -441,6 +441,54 @@ reintroduced from memory:
 - **`--auto` is `am start`-only.** Not on `am run`, not on `am attach`; attach re-applies the
   recorded value rather than accepting a new one.
 
+### Rewrite the CI/CD guide against something that actually runs
+
+`docs/guides/ci-cd-integration.md` was **deleted** 2026-08-25 rather than updated. It documented
+a workflow that had never worked, in a form that had never parsed.
+
+The guide was built end to end on `am run <slug> -- <command>` — roughly 25 examples across
+GitHub Actions, GitLab CI, Jenkins, and CircleCI, including `OUTPUT=$(am run task --
+your-command)` and `am run task -- your-command || EXIT_CODE=$?`. Three independent reasons none
+of it could work:
+
+1. **It never parsed.** `Run` was `{ slug: String, agent: String }` with no `trailing_var_arg`,
+   so `am run docs -- claude "Generate API documentation for src/"` (the guide's own line 434)
+   returned `error: unexpected argument 'Generate API documentation for src/' found`.
+2. **It required tmux.** `cmd_run` opened with a hard `NotInTmux` guard. No CI runner has a tmux
+   session.
+3. **It could not have reported anything.** The valid two-arg form did `tmux send-keys` — typed
+   into a pane and returned immediately. No waiting, no output capture, no exit code. The guide
+   captured all three.
+
+`docs/guides/faq.md` carried the same fiction in prose ("execute commands without tmux at all",
+"use `am run` instead of `am attach` in non-interactive environments"), corrected in the same
+change.
+
+**The honest root cause is that nobody ever executed the examples.** That is the thing to fix,
+not the syntax — which is why this is a backlog entry rather than a rewrite bundled into the
+removal commit. Writing a fresh set of plausible-looking CI snippets without running them
+reproduces the identical failure in a new spelling.
+
+**There is a real non-interactive path to build on.** `am start` outside tmux
+([`src/main.rs:825-845`](src/main.rs)) records the session and then `exec`s the container,
+replacing the `am` process — so it runs to completion and propagates a genuine exit code. That
+is what the deleted guide claimed `am run` did. It is documented in prose as existing; it has
+**not** been run under a real CI runner by anyone.
+
+- [ ] Verify `am start` outside tmux under an actual runner — exit-code propagation on both
+      success and failure, what happens to the worktree and container when the job is
+      cancelled, and whether `am destroy` is reachable from a later step or a trap.
+- [ ] Only then write the guide, and only with examples that were executed. Consider whether a
+      CI job in this repository should run one of them, so the guide cannot rot back into
+      fiction the way this one did.
+- [ ] Decide whether `am` should support headless use as a first-class mode at all, or whether
+      the honest answer is that it is a tmux-oriented tool and CI users should call the
+      container runtime directly. The deleted guide assumed the former without the code ever
+      supporting it.
+
+Found while removing `am run`; the guide's breakage is entirely pre-existing and independent of
+that removal.
+
 ### Context-aware user messages
 > Spec: [`specs/context-aware-messages.md`](specs/context-aware-messages.md)
 

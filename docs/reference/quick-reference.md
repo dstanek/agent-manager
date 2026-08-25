@@ -14,7 +14,6 @@ One-page guide to common `am` commands, workflows, and configurations.
 | `am list` | Show active sessions in the current repo |
 | `am list --all` | Show active sessions across every repo |
 | `am attach <slug>` | Switch to existing session |
-| `am run <slug> <agent>` | Launch agent in session's agent pane |
 | `am destroy <slug>` | Stop and remove session |
 | `am session rm <slug>` | Remove a session record, leaving worktree and branch alone |
 | `am generate-config` | Show resolved configuration |
@@ -51,13 +50,13 @@ am list
 # Both agents work independently on separate branches
 ```
 
-### Run a Single Command (Non-Interactive)
+### Run a Session Non-Interactively
 
 ```bash
-# Useful for scripts or CI/CD
+# Useful for scripts. Outside tmux, a containerized `am start` records the
+# session, then execs the container in place of the `am` process itself —
+# runs to completion, exits with the container's real exit code.
 am start task --agent claude
-am run task claude
-am destroy task --force
 ```
 
 ### Destroy All Sessions (Cleanup)
@@ -294,18 +293,12 @@ network = "full"
 env = []
 ```
 
-### CI/CD Integration (GitHub Actions)
+### CI/CD Integration
 
-```yaml
-- name: Initialize and run am
-  env:
-    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  run: |
-    am init
-    am start agent --agent claude
-    am run agent claude
-    am destroy agent --force
-```
+Outside tmux, a containerized `am start` records the session, then `exec`s the container in
+place of the `am` process itself, so it runs to completion with a real exit code a pipeline can
+check. There's no verified, runner-tested worked example yet — see
+[FAQ: Can I run `am` in a CI/CD pipeline?](../guides/faq.md#can-i-run-am-in-a-cicd-pipeline).
 
 ---
 

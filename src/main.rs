@@ -59,7 +59,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => cmd_start(&slug, agent.as_deref(), no_container, auto, rebuild),
         Commands::List { all } => cmd_list(all),
         Commands::Attach { slug, fresh } => cmd_attach(&slug, fresh),
-        Commands::Run { slug, agent } => cmd_run(&slug, &agent),
+        Commands::Run { slug, agent: _ } => cmd_run_removed(&slug),
         Commands::Destroy { slug, force } => cmd_destroy(&slug, force, &msgs),
         Commands::Doctor => cmd_doctor(None),
         Commands::GenerateConfig => cmd_generate_config(),
@@ -1352,17 +1352,17 @@ fn plan_compose(
 }
 
 /// The agent invocation appended as the container command, if there is one — or, for a
-/// host-side relaunch (`am attach`, `cmd_run`), the command line sent into the agent pane.
+/// host-side relaunch (`am attach`), the command line sent into the agent pane.
 ///
 /// `agent_name` is the raw string to launch (`cfg.agent`, `--agent`, or a recorded
 /// `Session.agent`) and `known` is that same value already parsed to a `KnownAgent`, kept
 /// separate so an unrecognized name still launches as a bare command rather than vanishing.
 /// This is not a defensive fallback for something that "shouldn't happen": `cmd_start`
 /// validates `--agent` via `KnownAgent::parse` before any session exists, so a
-/// `cmd_start`-originated `Session.agent` is always parseable, but `cmd_run`'s `agent`
-/// argument (`src/cli.rs`) has no such validator and is persisted onto `Session.agent`
-/// verbatim on success — so `am run <slug> some-typo` is an ordinary, everyday way to reach
-/// `known: None` here, later, via `am attach`.
+/// `cmd_start`-originated `Session.agent` is always parseable — but the now-removed `am run`
+/// had no such validator and persisted its `agent` argument onto `Session.agent` verbatim on
+/// success, so a session record written by an older `am` (or hand-edited) can still carry an
+/// unparseable value, reaching `known: None` here, later, via `am attach`.
 fn agent_command(
     agent_name: Option<&str>,
     known: Option<container::KnownAgent>,
@@ -1613,9 +1613,10 @@ fn is_shell_process(name: &str) -> bool {
 ///
 /// Biased hard toward `Ambiguous`/`Running` over `Idle`: an unrecognized foreground process
 /// name, a failed tmux query, or a gone pane target are all treated the same as "still
-/// running" — a missed relaunch costs the user an `am run`, but relaunching over a live agent
-/// can interrupt real work or lose in-flight state. Only a foreground process that is
-/// recognizably a bare shell counts as confidently idle.
+/// running" — a missed relaunch costs the user having to type the agent command into the
+/// pane themselves, but relaunching over a live agent can interrupt real work or lose
+/// in-flight state. Only a foreground process that is recognizably a bare shell counts as
+/// confidently idle.
 ///
 /// - Container sessions compare against the recorded runtime binary name
 ///   (`SessionContainer.runtime`, e.g. `"podman"`) rather than the agent: while the
@@ -1934,7 +1935,8 @@ fn run_post_attach(cfg: &config::Config, s: &session::Session) {
 fn print_no_agent_known_note(slug: &str, no_agent_known: bool) {
     if no_agent_known {
         println!(
-            "  {} am attach does not know which agent to launch — run 'am run {slug} <agent>'",
+            "  {} am attach does not know which agent to launch — set 'defaults.agent' in \
+             .am/config.toml (or run 'am setup --agent <name>'), then run 'am attach {slug}' again",
             note_prefix()
         );
     }
@@ -1968,11 +1970,11 @@ fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
         }
     }
     // `cmd_start` validates `--agent` via `KnownAgent::parse` before writing a session, but
-    // `cmd_run`'s `agent` argument has no such validator (see `agent_command`'s doc comment)
-    // and is persisted verbatim — so a parse failure here is an expected, reachable case
-    // (e.g. `am run <slug> some-typo`), not a "should not happen" one. Handled the same way
-    // either way: not propagated as an error, `agent_command` still launches the bare
-    // string, just without resume/auto flags.
+    // the now-removed `am run` had no such validator and persisted its `agent` argument onto
+    // `Session.agent` verbatim (see `agent_command`'s doc comment) — so a parse failure here
+    // is still a reachable case for a session record written by an older `am`, not a "should
+    // not happen" one. Handled the same way either way: not propagated as an error,
+    // `agent_command` still launches the bare string, just without resume/auto flags.
     let known_agent = s
         .agent
         .as_deref()
@@ -2005,33 +2007,24 @@ fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── am run ────────────────────────────────────────────────────────────────────
-
-fn cmd_run(slug: &str, agent: &str) -> anyhow::Result<()> {
-    let (repo_root, _) = find_repo_root()?;
-    if let Err(e) = session::migrate_sessions(&repo_root) {
-        eprintln!("{} session migration failed: {e}", warning_prefix());
-    }
-    let sessions = session::load_sessions_for_repo(&repo_root)?;
-
-    let mut s = session::find_session(&sessions, slug)
-        .ok_or_else(|| error::AmError::SlugNotFound(slug.to_string()))?
-        .clone();
-
-    if !tmux::is_in_tmux() {
-        return Err(error::AmError::NotInTmux.into());
-    }
-
-    tmux::send_keys(&s.tmux.agent_pane, agent)?;
-    tmux::select_window(s.tmux.tmux_window_id.as_deref().unwrap_or(&s.tmux.tmux_window))?;
-
-    // Record what was actually run so a later `am attach` relaunches this, not whatever
-    // `cmd_start` originally recorded (or nothing, for a legacy record).
-    s.agent = Some(agent.to_string());
-    session::update_session_global(s)?;
-
-    println!("Launched '{agent}' in session '{slug}'.");
-    Ok(())
+// ── am run (removed) ─────────────────────────────────────────────────────────
+//
+// `cmd_run` used to be `tmux::send_keys(&s.tmux.agent_pane, agent)` plus a `select_window`
+// and a `Session.agent` write — entirely container-unaware. For a containerized session the
+// agent pane's foreground process *is* the container (`podman run … claude`), so typing an
+// agent name into it sent claude a chat message rather than launching anything, and then
+// persisted the typo onto `Session.agent` regardless, so a later `am attach` would preflight
+// credentials and mounts for an agent that was never actually running. `am attach` already
+// handles both host and container relaunches correctly (see `launch_into_agent_pane`) and
+// has since subsumed the one legitimate use of `am run` — relaunching a dead agent — so
+// there is no replacement command, just a different path: see `AmError::RunRemoved`.
+//
+// The subcommand itself is kept as a hidden stub (`#[command(hide = true)]` in `cli.rs`)
+// rather than deleted outright, so a script or muscle-memory invocation gets this error
+// instead of clap's opaque "unrecognized subcommand". Transitional — delete the stub, this
+// function, and `Commands::Run` together in a later release.
+fn cmd_run_removed(slug: &str) -> anyhow::Result<()> {
+    Err(error::AmError::RunRemoved(slug.to_string()).into())
 }
 
 // ── am destroy ───────────────────────────────────────────────────────────────

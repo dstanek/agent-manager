@@ -170,7 +170,7 @@ Feature: Restore the agent on `am attach`
 
   # ── UC-5: legacy session record (no agent ever recorded) ──────────────────────
 
-  Scenario: a legacy record with no agent known still attaches cleanly and points at `am run`
+  Scenario: a legacy record with no agent known still attaches cleanly and points at defaults.agent
     Given a session "my-feature" has been started
     And the session file has no recorded agent
     And the tmux window no longer exists
@@ -178,7 +178,7 @@ Feature: Restore the agent on `am attach`
     When I run "am attach my-feature"
     Then the command succeeds
     And the output contains "Opened new window for session 'my-feature'."
-    And the output contains "am attach does not know which agent to launch — run 'am run my-feature <agent>'"
+    And the output contains "am attach does not know which agent to launch — set 'defaults.agent' in .am/config.toml (or run 'am setup --agent <name>'), then run 'am attach my-feature' again"
     And the mock tmux log does not contain "send-keys"
 
   Scenario: a legacy record falls back to the configured agent and persists it
@@ -191,15 +191,7 @@ Feature: Restore the agent on `am attach`
     And the output contains "relaunched 'claude' (resuming)."
     And the session file contains "claude"
 
-  # ── Regression: `am run` supersedes what `am start` originally recorded ───────
-
-  Scenario: attach relaunches whatever `am run` most recently launched, not what `am start` recorded
-    Given a session "my-feature" has been started with agent "claude"
-    When I run "am run my-feature codex"
-    Then the command succeeds
-    Given the tmux window no longer exists
-    When I run "am attach my-feature"
-    Then the command succeeds
-    And the output contains "relaunched 'codex' (resuming)."
-    And the mock tmux log contains "codex resume --last"
-    And the output does not contain "relaunched 'claude'"
+  # `am run` (which used to let a later relaunch supersede what `am start` recorded) has
+  # been removed — see error_handling.feature's "run has been removed" scenarios and
+  # `AmError::RunRemoved`. The replacement path (`defaults.agent` + `am attach`) has no
+  # equivalent "supersede the recorded agent" behavior to pin here.

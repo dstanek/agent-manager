@@ -86,11 +86,26 @@ pub enum Commands {
         fresh: bool,
     },
 
-    /// Launch an agent in an existing session's agent pane
+    // Removed. Kept as a hidden stub — `#[command(hide = true)]` keeps it out of the
+    // top-level `--help` listing — so a script or muscle-memory invocation gets
+    // `AmError::RunRemoved`'s explanation instead of clap's opaque "unrecognized
+    // subcommand". `am attach` now covers the legitimate half of what this did
+    // (relaunching a dead agent) for both host and container sessions. This stub is
+    // transitional and can be deleted outright in a later release.
+    //
+    // A plain `//` comment, not `///`: clap renders a variant's doc comment verbatim as
+    // that subcommand's own `--help` text, which `hide = true` does not suppress — so an
+    // `///` here would leak this maintainer-facing rationale straight to a user who runs
+    // `am run --help`. The `long_about` below carries the user-facing replacement instead.
+    #[command(
+        hide = true,
+        long_about = "Removed — set `defaults.agent` in .am/config.toml (or run `am setup \
+                      --agent <name>`), then run `am attach <slug>`."
+    )]
     Run {
         #[arg(value_parser = validate_slug)]
         slug: String,
-        /// Agent command to run, e.g. "claude", "codex"
+        // Accepted but unused — retained only so the stub still parses old invocations.
         agent: String,
     },
 

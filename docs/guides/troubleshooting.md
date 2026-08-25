@@ -233,7 +233,7 @@ sudo dnf install tmux
 
 ### Commands require running inside tmux
 
-**Applies to:** `am attach`, `am run`
+**Applies to:** `am attach`
 
 These commands must be run from inside a tmux session. If you see an error about `$TMUX` not being set:
 
@@ -477,15 +477,12 @@ List all active sessions and their details:
 am list
 ```
 
-### Run a command inside a session
+### Run a session non-interactively
 
-To execute a single command inside a session's container without interactively attaching:
-
-```sh
-am run feat -- your-command-here
-```
-
-This is useful for scripting and CI/CD integration.
+`am` has no "exec into a running session" command. For a non-interactive run from the start, use
+a containerized session started outside tmux: `am start` records the session, then `exec`s the
+container in place of the `am` process itself, so it runs to completion and exits with the
+container's real exit code — no split pane, no second shell.
 
 ---
 
