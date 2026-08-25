@@ -389,6 +389,58 @@ pointer is stale only in the sense that this entry is now closed.
 Found while pricing prompt-crate options for [`specs/guided-setup.md`](specs/guided-setup.md);
 independent of that feature.
 
+### `--auto` is a silent no-op for three of the four agents
+
+**The flag shipped; this entry replaces the stale "Future (v2)" one that described it as
+unbuilt.** What `am start --auto` actually does today, traced 2026-08-25:
+
+- Two preflight guards ([`src/main.rs:681-686`](src/main.rs)) — `AutoRequiresContainer` when
+  combined with `--no-container`, `AutoRequiresAgent` when no agent resolves.
+- Appends `container::agent_auto_flags(agent)` to the launched command
+  ([`src/main.rs:1384`](src/main.rs)).
+- Records `Session.auto: bool` ([`src/session.rs:114`](src/session.rs)), which is read back in
+  exactly three places: the `auto` column in `am list` and `am list --all`, and `am attach`'s
+  container recreate, which passes it into `plan_container` so a relaunch re-applies the flags.
+
+The gap is the flag table itself ([`src/container.rs:406-410`](src/container.rs)):
+
+| Agent | Auto flags |
+|---|---|
+| Claude | `--dangerously-skip-permissions` |
+| Copilot | *(none)* |
+| Gemini | *(none)* |
+| Codex | *(none)* |
+
+So `am start feat --agent codex --auto` passes both guards, appends nothing, launches a command
+byte-identical to the one without `--auto`, and then reports `yes` in `am list`'s `auto` column.
+The session claims to be autonomous; nothing about it is. The same holds for Copilot and Gemini.
+
+This is not obviously a code bug — it may be that those three CLIs genuinely need no flag, or
+that nobody has looked up what their flag is. That is the first thing to establish, and it has
+to be checked against each CLI's own `--help`, the way the resume flags in
+[`specs/attach-restore-agent.md`](specs/attach-restore-agent.md) were.
+
+- [ ] Determine, per agent, whether an autonomous/skip-approvals flag exists at all
+      (`copilot`, `gemini`, `codex`), verified against the CLI's own `--help` rather than
+      assumed. Fill in `agent_auto_flags` for any that have one.
+- [ ] For any agent that genuinely has none, decide what `--auto` should do: proceed silently
+      (today), warn that `am` has no autonomous-mode flag for this agent, or refuse. Note the
+      guards make `--auto` *look* validated, which is what makes the silent case misleading.
+- [ ] Revisit once [`specs/harness-decoupling.md`](specs/harness-decoupling.md) lands — a
+      custom command with integration `None` becomes a fifth way to reach the same no-op, and
+      that spec renames `AutoRequiresAgent` to `AutoRequiresCommand`.
+
+Two corrections to the description this entry replaces, both worth recording so they are not
+reintroduced from memory:
+
+- **`am` does not write commit trailers.** The old entry said "commit trailer becomes
+  `Auto-Piloted-By`." There is no `Auto-Piloted-By` or `Co-Piloted-By` string anywhere in
+  `src/` — `am` never creates a commit. The trailers are a convention for whoever is
+  committing, documented in [`docs/reference/commit-trailers.md`](docs/reference/commit-trailers.md),
+  and `Session.auto` does not feed them.
+- **`--auto` is `am start`-only.** Not on `am run`, not on `am attach`; attach re-applies the
+  recorded value rather than accepting a new one.
+
 ### Context-aware user messages
 > Spec: [`specs/context-aware-messages.md`](specs/context-aware-messages.md)
 
@@ -866,10 +918,6 @@ Decided against, recorded so it is not re-proposed:
 ---
 
 ## Future (v2)
-
-### Autonomous mode (`--auto` flag)
-
-Add `--auto` to `am start`. In autonomous mode the agent works without waiting for user input between steps. Sets a flag in the session record; commit trailer becomes `Auto-Piloted-By`.
 
 ### Team orchestration (`--team` flag)
 
