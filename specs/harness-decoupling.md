@@ -103,6 +103,61 @@ No key is renamed, no key is removed. Every config that only ever sets `[agents.
 `[agents.copilot]`'s existing keys, or `defaults.agent`, is untouched — see
 [Defaulting rules](#defaulting-rules) for why.
 
+### The parse shape is `FileAgentSettings`, not `AgentSettings` (finding #1)
+
+`AgentSettings` is the merged, in-memory shape — it is not what deserializes a TOML file. That
+is `FileAgentSettings` (`src/config.rs:314-320`), a separate struct with its own two fields plus
+a `#[serde(flatten)] unknown: HashMap<String, toml::Value>` catch-all, and `apply_file_config`'s
+per-agent loop (`src/config.rs:464-475`) copies exactly the fields `FileAgentSettings` declares
+into `base.agents`. Adding `command`/`integration` to `AgentSettings` alone, as an earlier draft
+of this section did, leaves both fields caught by the `unknown` flatten on every real config
+file: UC-2's own example —
+
+```toml
+[agents.my-harness]
+command = "my-agent"
+```
+
+— would warn `agents.my-harness.command` as an unrecognized key and never populate it,
+`resolve_agent` would fall back to defaulting rule 1 and use the section name as the command
+regardless of what was written, and the acceptance target would silently do nothing. Both
+structs need the two new fields:
+
+```rust
+#[derive(Debug, Deserialize, Default)]
+struct FileAgentSettings {
+    command: Option<String>,               // NEW
+    integration: Option<String>,           // NEW
+    image: Option<String>,                 // existing
+    devcontainer_feature: Option<String>,  // existing
+    #[serde(flatten)]
+    unknown: HashMap<String, toml::Value>,
+}
+```
+
+and `apply_file_config`'s per-agent loop gains the matching two `apply_opt_string` calls,
+alongside its existing two:
+
+```rust
+for (name, file_agent) in file.agents {
+    let entry = base.agents.entry(name).or_default();
+    apply_opt_string(&mut entry.command, file_agent.command);            // NEW
+    apply_opt_string(&mut entry.integration, file_agent.integration);    // NEW
+    apply_opt_string(&mut entry.image, file_agent.image);
+    apply_opt_string(&mut entry.devcontainer_feature, file_agent.devcontainer_feature);
+}
+```
+
+**Checked for the same split elsewhere in this design, so it isn't found the same way twice:**
+`ContainerConfig`/`FileContainer`, `DevcontainerConfig`/`FileDevcontainer`, and
+`AttachConfig`/`FileAttach` all have this same parse-shape split, but none of them gain a new
+field anywhere in this spec — `AgentSettings` is the only struct this design adds fields to
+that also has a partial-override file shape, so it is the only place the split needed
+accounting for. `Session`/`SessionContainer` (which do gain fields — `integration`,
+`agent_section`, below) deserialize directly with no such split: `sessions.json` is not a
+hand-edited, partial-override file the way `.am/config.toml` is, so there is no `FileSession`
+to keep in sync.
+
 ### `resolve_agent` (new, `src/config.rs`, beside the existing `resolve_image`)
 
 The one place that resolves a section name into everything downstream needs, shared by
@@ -134,6 +189,19 @@ pub fn resolve_agent(name: &str, cfg: &Config) -> Result<ResolvedAgent>;
 `effective_agent.as_deref().map(|name| config::resolve_agent(name, &cfg)).transpose()?`. The
 fix does not need to be bigger than the bug was; it needs to call a real resolver instead of an
 enum parse.
+
+**Image precedence, stated explicitly (finding #4 — it was missing before).** `resolve_agent`'s
+`image` field checks, in order: `cfg.container.image` — the existing global override,
+unconditional, `src/config.rs:293-303`'s current *first* check — **first**, then the section's
+own `image`, then, per Inheritance below, the integration's own section's `image`, then `None`.
+The global override still wins over every per-agent value, exactly as it does today; nothing
+about this spec changes that precedence, only where the per-agent fallback beneath it now looks.
+
+`resolve_agent` is not just a replacement for `resolve_image`/`resolve_agent_feature`'s
+*bodies* — every caller of those two functions must also switch from passing a bare section
+name to consuming an already-computed `ResolvedAgent`. That is a separate, necessary fix in its
+own right, not automatic — see
+[Fixing the container-recreate break](#fixing-the-container-recreate-break-finding-2).
 
 ### Defaulting rules
 
@@ -190,44 +258,164 @@ at the point it matters.
 
 ### `Session` (`src/session.rs:110-131`)
 
-One new field:
+Two new fields — this is a reversal of the previous draft's "not persisted: the section name"
+decision, forced by finding #2, not a free addition:
 
 ```rust
 pub struct Session {
     // ...existing fields...
-    pub agent: Option<String>,  // unchanged in name; now documented as the *resolved command*,
-                                 // not the section name — see reasoning below
+    pub agent: Option<String>,  // unchanged in name; the resolved COMMAND at last launch —
+                                 // drives the host relaunch path only, see below
     #[serde(default)]
-    pub integration: Option<String>,  // NEW — the resolved integration, if any
+    pub integration: Option<String>,     // resolved INTEGRATION at last launch — host relaunch
+                                          // resume/auto-flag lookup only, see below
+    #[serde(default)]
+    pub agent_section: Option<String>,   // NEW — the `[agents.<name>]` section name; drives the
+                                          // container-recreate path only, see below
 }
 ```
 
-**What gets persisted, and why it is the resolved values and not the section name.** A section
-can be edited or deleted between `am start` and a later `am attach` — `.am/config.toml` is a
-file, not a database, and nothing stops a teammate from renaming `[agents.my-harness]` or
-deleting it entirely while a session built from it is still running. If `Session` recorded only
-the *section name*, `am attach` would have to re-resolve `cfg.agents` at attach time to know
-what to relaunch — and a section edited in the meantime would silently relaunch something
-different from what is actually running, or a deleted section would break the relaunch outright
-with no fallback. Persisting the already-resolved `command`/`integration` instead means `am
-attach` never needs `cfg.agents` at all: it relaunches exactly what was launched before,
-independent of whatever the config says *now*. This is the same principle
-`SessionContainer.image`/`config_hash` already follow — an opaque, already-resolved string, not
-a pointer back into a config that may have moved.
+**Why three fields, and why the split, not one.** The previous draft persisted only the
+resolved `command`/`integration`, reasoning that `am attach` should never need to re-resolve
+`cfg.agents` — a section edited or deleted between `am start` and a later `am attach` shouldn't
+silently change what relaunches. That reasoning holds, unchanged, for the **host relaunch path**
+(`agent_command` + `tmux::send_keys`, no container involved): it has no other preflight to run,
+nothing to rebuild, and `attach-restore-agent.md`'s own design keeps it "the cheap, common-case
+path" — freezing it at launch-time values is correct.
 
-**Not persisted: the section name itself.** A `Session.agent_section` field recording which
-`[agents.<name>]` produced a given session would be genuinely useful for `am list` observability
-("this session was started via `my-harness`") — but that's the existing, separately-tracked
-`BACKLOG.md` item "Session observability in `am list`," not something this spec's correctness
-goal (`am attach` relaunches the right thing) requires. Left out deliberately rather than
-smuggled in; a future observability pass can add it without touching anything this spec
-defines.
+It does **not** hold for the **container-recreate path**
+(`attach_recreate_container_cmd`/`plan_container`), and that is exactly finding #2:
+`plan_image`/`plan_devcontainer`/`injected_features` all resolve image, mounts, and devcontainer
+Feature injection from a **section name**, not from a resolved command — and container recreate
+is already, deliberately, designed to re-resolve everything fresh from *current* config on every
+recreate (`attach-restore-agent.md`'s A2/OQ-2: "an attach that has to rebuild a container is
+allowed to be as slow as, and fail the same ways as, `am start`" — a pruned devcontainer image
+rebuilds, expired credentials re-fail, on every recreate, by design). Persisting only the
+resolved command gives that path nothing to resolve *from*. `Session.agent_section` is the
+missing piece: `attach_recreate_container_cmd` calls `config::resolve_agent(agent_section, &cfg)`
+fresh, the same way `cmd_start` does, and gets a full `ResolvedAgent` — image,
+`devcontainer_feature`, and (again) command/integration, all freshly current — instead of
+handing a command string to functions that read it as a section name.
 
-**Backward compatibility.** A record with no `integration` key deserializes as `None`. `am
-attach`'s existing legacy-fallback shape (`src/main.rs:1970-1979`) already re-derives
-`known_agent` by parsing `s.agent` when nothing better is available — extend that one step:
-when `s.integration` is `None`, fall back to `KnownAgent::parse(s.agent).ok()`, persisting the
-result the same way OQ-1 in `attach-restore-agent.md` already persists a recovered `s.agent`.
+So: two philosophies, one per path, each already established by this spec or by
+`attach-restore-agent.md`, now applied consistently instead of colliding:
+
+| Path | Reads | Philosophy |
+|---|---|---|
+| Host relaunch (`agent_command`) | `Session.agent`, `Session.integration` | Frozen at last launch — survives a section being edited or deleted; nothing else to fail on if it does. |
+| Container recreate (`plan_container`) | `Session.agent_section`, re-resolved via `config::resolve_agent` | Re-planned fresh from current config, exactly like `am start` — a section being edited *should* apply on recreate (a corrected image URL, e.g.), matching what `attach-restore-agent.md` already documents for devcontainer rebuilds and credential re-validation. |
+
+**What happens when the section is gone at recreate time.** `resolve_agent` returns
+`AmError::AgentNotConfigured` unchanged — no special-cased message. The window and split
+already exist by that point (A3 in `attach-restore-agent.md`), so this is the same "loud,
+actionable failure after partial progress" shape every other container-recreate preflight
+failure already has (expired credentials, a runtime that isn't up yet): the user sees exactly
+what's missing and what's configured instead, and can restore the section, edit
+`defaults.agent`, or fall back to `am destroy --force && am start`. Not silence, per the
+instruction.
+
+**Legacy compatibility.** `agent_section: None` on an old record (pre-dating this field, or a
+session whose agent was ever set via the since-removed `am run` — see Background) falls back to
+`s.agent.clone()`: `Session.agent` *was* the section name for every `cmd_start`-originated
+record under every model before this one (command, integration, and section name were always
+forced equal there), so the fallback is exact for that case, not a guess. It is *not* exact for
+a record whose agent was ever set via the since-removed `am run`, which wrote arbitrary
+positional strings straight to that field — including, per `cmd_run_removed`'s own comment,
+text typed into a running container's stdin and persisted regardless of whether it named
+anything real. For that case the fallback string isn't a real section, `resolve_agent` fails
+with `AgentNotConfigured` exactly as described above, and that reproduces — not introduces — the
+container-recreate failure such a corrupted record already hits today, pre-this-spec, for the
+same underlying reason (`resolve_image` already returns `None` for a name with no matching
+section). No special-case guard needed: the ordinary `AgentNotConfigured` path already covers
+it correctly.
+
+**Backward compatibility for `Session.integration`.** A record with no `integration` key
+deserializes as `None`. `am attach`'s existing legacy-fallback shape
+(`src/main.rs:1970-1979`) already re-derives `known_agent` by parsing `s.agent` when nothing
+better is available — extend that one step: when `s.integration` is `None`, fall back to
+`KnownAgent::parse(s.agent).ok()`, persisting the result the same way OQ-1 in
+`attach-restore-agent.md` already persists a recovered `s.agent`. This fallback is scoped to the
+host relaunch path only, per the table above — it never substitutes for `agent_section` on the
+container-recreate path.
+
+## Fixing the container-recreate break (finding #2)
+
+**The bug, verified against the code rather than assumed away.** `plan_image`
+(`src/main.rs:1039-1052`) calls `config::resolve_image(agent_name, cfg)` directly;
+`injected_features` (`src/main.rs:1397-1420`, mirrored in `src/doctor.rs:725-744` so image
+currency checks can't drift from what `am start` would build) calls
+`config::resolve_agent_feature(agent_name, cfg)`. Both treat their `agent_name: Option<&str>`
+argument as a **section name** — a flat `cfg.agents.get(agent_name)` — because under the old
+model that argument always *was* the section name (command, integration, and section name were
+one and the same string). `attach_recreate_container_cmd` (`src/main.rs:1696-1726`) passes
+`agent_name: s.agent.as_deref()` (`:1721`) into this same pipeline. Once `Session.agent` is
+redefined as the resolved *command* — which this spec's Session section does, and must, for the
+host relaunch path — that argument is no longer a section name on the recreate path: `am start`
+on UC-2's config resolves fine (its `agent_name` really is `"my-harness"` there), but the
+*session* persists `"my-agent"`, and the next container recreate calls
+`resolve_image("my-agent", cfg)`, finds no such section, and raises
+`ContainerImageNotConfigured` — on the acceptance target's very first `am attach` after a
+reboot, not an edge case.
+
+The same root cause independently breaks UC-3's inheritance claim, even on a fresh `am start`:
+`resolve_image` contains no inheritance logic at all (it predates this spec), so
+`[agents.claude-logging]` with `image` unset returns `None` and `am start` fails outright, while
+`am doctor` — already wired to `resolve_agent` from the previous pass — would report the
+inherited image correctly for the exact same config. Two code paths answering the same question
+differently is precisely the drift `resolve_agent` exists to prevent, and it was reintroduced by
+never actually pointing the container-planning call sites at it.
+
+**Decision: retire `resolve_image`/`resolve_agent_feature` as call targets; thread an
+already-computed `ResolvedAgent` through container planning instead of a bare name.** Rejected
+the alternative (keep both functions, give them the inheritance rule too, always call them with
+the section name) because it duplicates the inheritance rule in two places that must never
+disagree, and does nothing to address *why* `Session.agent` — the command — was being handed to
+a function that wants a section name in the first place; it treats the symptom, not the cause.
+
+**The mechanics.** `ContainerPlanInput`'s `agent: Option<container::KnownAgent>` and
+`agent_name: Option<&'a str>` fields (`src/main.rs:942-958`, specifically `:949-950`) collapse
+into one `resolved: Option<&'a config::ResolvedAgent>`. `plan_image`/`plan_devcontainer`
+(`src/main.rs:1039`, `1095`) drop their separate `agent`/`agent_name` parameters in favor of the
+one `resolved` parameter, reading `command`/`integration`/`image`/`devcontainer_feature` off it
+directly — `resolve_image`/`resolve_agent_feature` are called from nowhere once this lands, and
+can be deleted (their logic already lives inside `resolve_agent`, per the previous pass).
+`injected_features` (`src/main.rs:1397-1420`, and its `src/doctor.rs:725-744` mirror) drops its
+`resolve_agent_feature` call and reads `resolved.devcontainer_feature` directly — simpler than
+before, not just fixed, since there is no second lookup left to keep in sync with the first.
+
+Two call sites compute the `ResolvedAgent` that gets threaded down: `cmd_start`, from the
+`--agent`/`defaults.agent` name (unchanged from the previous pass), and
+`attach_recreate_container_cmd`, from `Session.agent_section` — see the `Session` section above
+for what that field is, why it exists only for this path, and what happens when the section it
+names no longer exists.
+
+**A stale parameter this fix initially missed, caught on independent re-review.**
+`attach_recreate_container_cmd`'s own `known_agent: Option<container::KnownAgent>` parameter
+(`src/main.rs:1702`) was left in place by the fix above — and it is still used, one line before
+the `ContainerPlanInput` construction: `plan_container_runtime(cfg, known_agent, &recreate_name)`
+(`:1711`) runs `validate_agent_credentials` against it. `known_agent` is computed once in
+`cmd_attach` (`:1978`) from the *frozen* `Session.integration`/legacy fallback and threaded down
+through `launch_into_agent_pane` — correct for that function's host-relaunch branch
+(`agent_command`/`resume_will_apply` at `:1865`/`:1869`, unaffected, still frozen, still
+correct), but wrong for `attach_recreate_container_cmd`, which the fix above already retargeted
+to resolve everything else *fresh* from `Session.agent_section`. Left as originally written, the
+function would validate credentials against one integration and plan the container against a
+possibly different one — a config edit changing a section's `integration` between `am start`
+and a later `am attach` would either fail a spurious credential check for an integration the
+current config no longer wants, or skip the check entirely for one it newly does, surfacing the
+failure later and worse (inside `preflight_agent_auth`, or in the container itself).
+
+**Fixed by removing the parameter, not by deriving it correctly at the call site.**
+`attach_recreate_container_cmd` drops `known_agent` from its signature entirely and resolves
+`Session.agent_section` (with its legacy fallback) once, at the top of the function, into the
+same `ResolvedAgent` both `plan_container_runtime` (via `.integration`) and `ContainerPlanInput`
+(via `resolved`) now read — one resolution, two consumers, matching the "shared, not duplicated"
+principle the rest of this design already follows. `launch_into_agent_pane`'s own `known_agent`
+parameter is unchanged and still passed to its host-relaunch branch, correctly; it simply stops
+being passed into its container branch's call to `attach_recreate_container_cmd`, which no
+longer accepts it. A parameter that survives in a function's signature solely to be misused by
+one remaining call site is exactly how this bug happened; removing it makes the mistake
+unrepresentable there rather than merely corrected.
 
 ## `AmError::AgentNotConfigured` and `KnownAgent::parse`'s role, unchanged
 
@@ -260,16 +448,22 @@ since nothing about command or image is threaded through `KnownAgent` in any fil
 | Resume flags | `agent_resume_flags`, `src/container.rs:430` | `KnownAgent` | No |
 | Devcontainer Feature injection | `resolve_agent_feature` → folded into `resolve_agent` | `KnownAgent`, via inheritance | No — see below |
 
-### The devcontainer Feature-injection "bug" from the previous draft evaporates
+### The devcontainer Feature-injection "bug" from the previous draft evaporates — once callers actually consume it
 
 The previous draft found a real latent bug: `injected_features` keyed the Feature lookup on the
 *command* string, which only ever matched the integration by coincidence (command and
 integration were forced equal). Under this model there is no command string to key on at all —
 `resolve_agent` resolves `devcontainer_feature` from the section's own value, or, via the
 inheritance rule above, from the *integration's own section* — which is exactly "keyed on
-integration," by construction, not by a fix layered on top. **Saying so plainly, as instructed
-rather than defended: this is not a bug carried forward from the previous draft. It does not
-exist under this model, and there is nothing to fix.**
+integration," by construction, not by a fix layered on top.
+
+**One correction to how plainly that was stated before.** "There is nothing to fix" was true of
+`resolve_agent`'s own resolution logic, but not, it turned out, of `injected_features`'s call
+site, which this spec had not yet actually pointed at `resolve_agent`'s output — it was still
+calling the standalone `resolve_agent_feature(agent_name, cfg)` by name. That gap is finding #2,
+and its fix is what makes the "nothing to fix" claim true end to end, not just inside
+`resolve_agent` in isolation. See
+[Fixing the container-recreate break](#fixing-the-container-recreate-break-finding-2).
 
 ## Honest cost report
 
@@ -280,30 +474,64 @@ changes" — was checked against this model rather than repeated on faith, per t
 or changes a parameter. `KnownAgent::parse`, `Display`, and all six behavior functions are
 untouched.
 
-**`onboarding.rs`: revised upward — the user overrode this spec's OQ-1 recommendation, and the
-menu itself now changes.** The previous pass of this spec recommended keeping `am setup`'s
-4-item preset menu (`MENU`, `src/onboarding.rs:29-33`) untouched, on the reasoning that listing
-custom sections was a config-editor-shaped feature `am setup` shouldn't grow. The user rejected
-that recommendation directly: a menu that silently omits an agent the user themselves
-configured reads as a bug, not a boundary. See
-[The agent menu becomes dynamic](#the-agent-menu-becomes-dynamic) under `am setup` impact for
-the resulting design (ordering, credential annotation, column width, `--agent` validation, and
-the boundary that *is* still preserved — listing, never creating).
+**`onboarding.rs`: exhaustively enumerated this time, not estimated — third revision, and the
+first two both undercounted.** All 86 `KnownAgent` references in the file were grepped and
+individually accounted for, per the instruction not to hand over another number that gets
+discounted on review.
 
-With that reversal, the things the previous estimate said were untouched no longer are: `MENU`
-itself is deleted (replaced by a list computed per invocation from `cfg.agents`),
-`agent_credentials`/`has_credentials` become section-derived rather than `KnownAgent`-indexed,
-`parse_agent_answer` needs the resolved entry list to accept a typed section name (not just a
-`KnownAgent::parse`), and the render loop's credential annotation grows a third state. Layered
-on top of the previously-identified `resolve_effective`/`effective_agent` fix (unchanged — still
-needed, still the same reasoning), the total footprint in the "which agent" question's code path
-is roughly 150–250 lines across ~8–9 items (`MENU`'s replacement, `DetectedState::gather`,
-`agent_credentials`/`has_credentials`, `default_agent()`, `agent_write`, `ask_agent`'s render
-loop and "currently" line, `parse_agent_answer`, `resolve_effective`'s agent branch,
-`MENU_NOTE_GAP`'s doc comment) — larger than the 60–100 lines previously quoted, and reported as
-such rather than smoothed over. Still confined to the single "which agent" question: the
-container/layout questions, the toml-writing helpers (`update_project_agent`, etc.), and the
-shared `write_target_line`/`dim_line` machinery are untouched.
+*Production code — every reference falls into one of 13 items, each a real signature or logic
+change, not a mechanical touch:*
+
+1. `MENU` and its doc comment (`:27-34`) — deleted.
+2. `DetectedState.agent_credentials: Vec<(KnownAgent, bool)>` (`:252`) — becomes section-derived.
+3. `DetectedState.effective_agent: Effective<Option<KnownAgent>>` (`:253`) — becomes
+   `Effective<Option<String>>`.
+4. `has_credentials` (`:337`) — becomes section-derived.
+5. `default_agent() -> KnownAgent` (`:345-354`) — **return type becomes `String`**, not just
+   its body: the preselected default can now be *any* configured section (including a custom
+   one already named by `defaults.agent`), not only one of the four presets. Missed in both
+   previous estimates.
+6. `resolve_effective`'s agent branch (`:436-461`) — return type and both `KnownAgent::parse`
+   calls become section-membership checks (unchanged finding from the previous pass).
+7. `agent_write` (`:571-573`) — parameter and return type `KnownAgent` → `String`.
+8. `default_agent_answer` (`:582-584`) — return type `KnownAgent` → `String`.
+9. `ask_agent` (`:593-670`) — `agent_flag` parameter and return type `KnownAgent` → `String`;
+   render loop rewritten for the dynamic entry list and the three-state credential note (see
+   `am setup` impact).
+10. The `KnownAgent`-`Display`-width workaround comment (`:622`) — becomes moot and deletable:
+    a plain `String`'s own `Display` impl already honors `f.pad`, which is the entire reason the
+    workaround existed. One less thing to maintain, not just a wash.
+11. `parse_agent_answer` (`:674-679`) — gains an entry-list parameter; return type `KnownAgent`
+    → `String`.
+12. `render_project_config_skeleton_with_agent(agent: KnownAgent)` (`:1235`) — **missed in both
+    previous passes.** Parameter becomes `&str`/`String`; its body (`format!("\"{agent}\"")`) is
+    unaffected by the type change, since both types implement `Display` identically here.
+13. `update_project_agent(path: &Path, agent: KnownAgent)` (`:1390-1392`) — **missed in both
+    previous passes.** Parameter becomes `&str`/`String`; body (`agent.to_string()`) likewise
+    unaffected in shape.
+
+Items 12 and 13 are the two the review named directly — verified by reading both functions
+rather than taking the citation on faith (`render_project_config_skeleton_with_agent` writes
+`defaults.agent` into a brand-new project file; `update_project_agent` writes it into an
+existing one via `toml_edit`) — and both are real gaps in the first two passes' accounting, not
+a disagreement about scope.
+
+*Test code — every one of the remaining ~73 references is touched, but mechanically, not by
+judgment:* the `configured(agent: Option<KnownAgent>, source: Source) -> DetectedState` test
+helper (`:1595`) and its ~22 call sites; `render_project_config_skeleton_with_agent`'s 3 test
+call sites and `update_project_agent`'s 13 (16 total — confirming the "~15" estimate by actual
+count); `parse_agent_answer`'s 3 assertions (`:2842-2844`); `ask_agent`'s 2 test call sites
+passing a `Some(KnownAgent::...)` flag; the remaining ~14 scattered `.value`/`KnownAgent::parse`
+equality assertions. Each is a `KnownAgent::Variant` literal swapped for its string form at a
+call site whose surrounding assertion structure does not otherwise change — low-risk, and
+self-checking: a leftover type mismatch fails to compile rather than passing silently.
+
+**The honest total:** all 86 references touched — 13 of them real production changes (roughly
+150–200 lines, matching the range previously quoted, now confirmed complete rather than
+estimated), the rest mechanical test-callsite follow-through (perhaps another 100–150 lines).
+Still confined to the single "which agent" question's code path — the container/layout
+questions and the shared `write_target_line`/`dim_line` machinery remain genuinely untouched,
+which was the one part of the earlier claim that held up under the exhaustive check.
 
 **The one genuinely structural finding, not just "more lines in the same shape":**
 `DetectedState::gather`'s own module doc comment states a deliberate principle — "Deliberately
@@ -537,22 +765,38 @@ Option<KnownAgent>` as an opaque input.
       (`#[serde(default)]`); `default_agent_images()` extended to include `gemini`/`codex` as
       entries with `image: None`/`devcontainer_feature: None`; `resolve_agent`/`ResolvedAgent`
       (folding in `resolve_image`/`resolve_agent_feature`'s existing logic plus the two
-      defaulting rules and the inheritance rule).
-- [ ] `src/session.rs`: `Session.integration: Option<String>`, `#[serde(default)]`; roundtrip
-      test with the field set and a legacy-record test confirming a missing key loads as
-      `None`.
-- [ ] `src/main.rs`: `cmd_start` calls `resolve_agent` instead of `KnownAgent::parse`;
-      `cmd_attach`'s legacy fallback per the Session data-model section; `agent_command`'s doc
-      comment updated (signature likely takes `Option<&ResolvedAgent>` or its unpacked
-      `command`/`integration` fields — implementer's choice, no behavior change either way);
-      fix the `agent_auto_flags`-before-`agent_resume_flags` ordering while `agent_command` is
-      already being touched (unchanged rationale from the previous draft — zero marginal cost,
-      no agent combines the two today).
+      defaulting rules, the inheritance rule, and the `cfg.container.image`-first precedence).
+- [ ] `src/config.rs`: `FileAgentSettings.command`/`.integration` (finding #1), and the matching
+      two `apply_opt_string` calls in `apply_file_config`'s per-agent loop — without this, the
+      acceptance target parses to nothing, silently.
+- [ ] `src/session.rs`: `Session.integration: Option<String>` and `Session.agent_section:
+      Option<String>` (finding #2), both `#[serde(default)]`; roundtrip tests for each, plus a
+      legacy-record test confirming both load as `None` from a pre-existing record.
+- [ ] `src/main.rs`: `cmd_start` calls `resolve_agent` instead of `KnownAgent::parse`, and
+      records `Session.agent_section` alongside `.agent`/`.integration`; `cmd_attach`'s legacy
+      fallback per the Session data-model section; `ContainerPlanInput`'s `agent`/`agent_name`
+      fields collapse into one `resolved: Option<&ResolvedAgent>` (finding #2 — see
+      [Fixing the container-recreate break](#fixing-the-container-recreate-break-finding-2));
+      `plan_image`/`plan_devcontainer` read off `resolved` instead of calling
+      `resolve_image`/`resolve_agent_feature`; `injected_features` (and its `doctor.rs` mirror)
+      reads `resolved.devcontainer_feature` directly; `attach_recreate_container_cmd` drops its
+      `known_agent` parameter entirely and resolves `Session.agent_section` via `resolve_agent`
+      once, at the top of the function, feeding both `plan_container_runtime`'s credential check
+      and `ContainerPlanInput` from the same result — the stale-parameter bug caught on
+      re-review, see the same section; `launch_into_agent_pane`'s own `known_agent` parameter is
+      unchanged (still correct for its host-relaunch branch) and simply stops being passed into
+      its container branch's call; `agent_command`'s doc comment updated; fix the
+      `agent_auto_flags`-before-`agent_resume_flags` ordering while `agent_command` is already
+      being touched (unchanged rationale from the previous draft — zero marginal cost, no agent
+      combines the two today).
 - [ ] `src/error.rs`: new `AmError::AgentNotConfigured(String, String)` (name, sorted
       comma-joined configured list); update `ContainerImageNotConfigured`'s message to mention
       adding `image` to `[agents.<name>]`.
-- [ ] `src/doctor.rs`: `check_agent`/`check_image_mode` call the shared `resolve_agent` result;
-      new `Status::Fail` case for a not-configured section; `integration: none` stays `ok`.
+- [ ] `src/doctor.rs`: `check_agent`/`check_image_mode` call the shared `resolve_agent` result
+      and the shared `ResolvedAgent`, not `resolve_image`/`resolve_agent_feature`; new
+      `Status::Fail` case for a not-configured section; `integration: none` stays `ok`. No new
+      `Status::Warn` for the mixed-version risk (finding #3) — directed against, see Edge Cases;
+      the one-time note lives in `am setup`'s write path instead, not here.
 - [ ] `src/onboarding.rs`: per [Honest cost report](#honest-cost-report) and
       [The agent menu becomes dynamic](#the-agent-menu-becomes-dynamic) — `cmd_setup` loads a
       `Config` once and passes it into `DetectedState::gather`; `MENU` deleted, replaced by a
@@ -564,7 +808,13 @@ Option<KnownAgent>` as an opaque input.
       reworded for the dynamic list; `effective_agent`'s type changes to
       `Effective<Option<String>>`; `agent_write`/`default_agent()`/`ask_agent`'s "currently"
       line updated to compare section names as strings; `cmd_setup`'s `--agent` validation
-      switches from `KnownAgent::parse` to the shared `AgentNotConfigured` path.
+      switches from `KnownAgent::parse` to the shared `AgentNotConfigured` path;
+      `render_project_config_skeleton_with_agent`/`update_project_agent` (finding #5 — missed in
+      the first two cost estimates) both change their `agent: KnownAgent` parameter to
+      `&str`/`String`, cascading to their ~16 combined test call sites; `cmd_setup`'s write-back
+      prints a one-time note when either function actually writes a non-preset name (i.e. the
+      name doesn't parse as a `KnownAgent`) into `defaults.agent` — the mixed-version nudge
+      (finding #3) that replaces the rejected permanent `am doctor` warning, see Edge Cases.
 - [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` clean.
 
 ### integration-tester
@@ -581,7 +831,15 @@ Option<KnownAgent>` as an opaque input.
         Include the variant where the section also sets its own `image`, overriding only that
         one inherited field.
   - UC-4: simulate window loss on UC-2's session, `am attach` — assert relaunch with no
-        `(resuming)` wording and no auto/resume flags.
+        `(resuming)` wording and no auto/resume flags **on the host-relaunch shape**, *and*,
+        separately, simulate window loss on a **containerized** UC-2/UC-3 session specifically
+        to exercise the container-recreate path finding #2 fixed — assert the recreated
+        container's mounted image and CMD match what a fresh `am start` against the same
+        section would produce (this is the scenario that would have caught finding #2 as a
+        failing test instead of a field bug). Include a variant on UC-3's config: after
+        deleting `[agents.claude-logging]` from `.am/config.toml` entirely, `am attach` on that
+        session's dead window fails with `AgentNotConfigured` naming the missing section, after
+        the window/split are recreated (A3) — not silently, and not before the window exists.
   - UC-5/UC-7: a config with `defaults.agent = "cladue"` — `am doctor`/`am start` both fail
         with `AmError::AgentNotConfigured`, hint lists configured names; a config with
         `[agents.my-harness]` `integration = "cladue"` — fails with `KnownAgent::parse`'s
@@ -622,17 +880,28 @@ Option<KnownAgent>` as an opaque input.
       boundary holds: no menu option creates a section, and no free-text entry silently
       defines one.
 - [ ] Confirm `resolve_agent`'s inheritance rule is applied per-field independently (a section
-      can inherit `image` while setting its own `devcontainer_feature`, or vice versa).
+      can inherit `image` while setting its own `devcontainer_feature`, or vice versa), and that
+      `cfg.container.image` is still checked before any per-agent value (finding #4).
 - [ ] Confirm `check_agent`/`check_image_mode` call `resolve_agent` exactly once per
       `doctor::run` invocation, not once each (drift risk if they diverge).
-- [ ] Confirm `Session.integration` round-trips through a legacy record and that the
-      attach-time inference-and-persist happens at most once per record.
+- [ ] Confirm `Session.integration`/`Session.agent_section` both round-trip through a legacy
+      record and that the attach-time inference-and-persist happens at most once per record.
+- [ ] Confirm `FileAgentSettings` actually declares `command`/`integration` and that a config
+      setting them round-trips through a real file parse into `resolve_agent`'s output — not
+      just through directly-constructed `Config`/`AgentSettings` values in a unit test, which
+      would pass even with finding #1 unfixed (finding #1's exact failure mode).
+- [ ] Confirm no call site anywhere still calls `resolve_image`/`resolve_agent_feature` by name
+      after this change — both should be unreachable dead code once `plan_image`/
+      `plan_devcontainer`/`injected_features` (both copies) consume `ResolvedAgent` directly
+      (finding #2). A leftover call site is exactly how this bug re-enters.
 
 ### documentation-writer
 
 - [ ] `docs/reference/configuration.md`: document `AgentSettings.command`/`.integration`
       alongside the existing `image`/`devcontainer_feature`, with the inheritance rule spelled
-      out and a worked custom-harness example matching UC-2/UC-3.
+      out and a worked custom-harness example matching UC-2/UC-3; a prominent callout that a
+      non-preset `defaults.agent` value requires every teammate's `am` to have this feature —
+      older binaries hard-error on `am start` in that repo until they upgrade (finding #3).
 - [ ] `docs/reference/commands.md`: `am start`'s `--agent` description updated from "select a
       known agent" to "select a configured `[agents.<name>]` section"; new short "Custom
       harnesses" callout.
@@ -648,9 +917,39 @@ Option<KnownAgent>` as an opaque input.
   fallback); negligible.
 - **UX:** `AgentNotConfigured`'s message needs to land in the same PR that introduces the
   failure mode it names, or a user hits a stale error — flagged in the task breakdown.
-- **Config drift across a shared `.am/config.toml`:** unaffected by the additive-only key
-  policy (`command`/`integration` are new, optional `AgentSettings` fields) — a teammate on an
-  older `am` binary sees them as unknown keys and gets the existing warn-don't-fail behavior.
+- **Config drift across a shared `.am/config.toml` — keys are safe, one value is not.** The
+  additive-only key policy genuinely covers the new *keys*: a teammate on an older `am` binary
+  sees `command`/`integration` inside `[agents.<name>]` as unrecognized keys and gets the
+  existing warn-don't-fail behavior, unaffected. It does **not** cover the new *value* this
+  design makes legal in `defaults.agent`/`--agent`: every `am` ever shipped before this feature
+  validates that value via `KnownAgent::parse` and hard-errors on anything outside the four
+  built-in names — confirmed at three call sites (`main.rs:689-692` inside `cmd_start`,
+  unconditional via `?`; `doctor.rs:757` inside `check_agent`, a failing check rather than a
+  crash; `am setup --agent <name>`'s own flag validation). The moment someone on the new `am`
+  commits `defaults.agent = "my-harness"` to a shared `.am/config.toml`, every teammate still on
+  an old binary gets `am start` hard-failing outright in that repo, unconditionally, until they
+  upgrade — the single most-used command, not a peripheral one. This is a real compatibility
+  break carried in a *value*, not a *key*, and the additive-key framing does not cover it; the
+  previous draft's claim that it did was wrong, and is corrected here rather than left standing.
+  **Decision: accept it, and make it visible at the moment it's committed, not with a standing
+  check that outlives the moment.** There is no way to patch already-shipped binaries. A
+  permanent `am doctor` warning was considered and rejected, directed by the user: every other
+  `Status::Warn` in `doctor.rs` is transient and locally actionable (credentials clear on login,
+  an unbuilt image clears on the next `am start`) — this one would fire forever for a correctly
+  configured custom harness, name a risk the local run can neither observe (other people's
+  binary versions) nor resolve, and train users to skim past warnings, which costs more than the
+  risk it names. Two things instead: the compiled-in config skeleton's `defaults.agent` comment
+  (`global_config_template`, `src/config.rs:639`) gains a clause naming the version requirement
+  for a non-preset value, and docs carry the same callout — both fire at the moment someone is
+  reading the thing they're about to change, not on every subsequent run. In addition, `am
+  setup`'s write path prints a one-time note exactly when it writes a non-preset name into
+  `defaults.agent` for the first time (in `update_project_agent`/`render_project_config_skeleton_with_agent`'s
+  call sites) — the moment of the deliberate action, said once, matching `doctor.rs`'s own
+  "warnings are things you can act on" pattern by living where the action is, not as a standing
+  check. This deliberately leaves one gap, stated rather than hidden: a section defined by
+  hand-editing `.am/config.toml` outside `am setup` gets no in-tool nudge at all, only the
+  skeleton comment and docs — consistent with `am setup` never validating what a user hand-edits
+  elsewhere in this design.
 - **A section can name itself as its own integration's inheritance source pathologically**
   (e.g. `[agents.claude]` with `integration = "claude"` — the default anyway, so this is
   self-referential but not infinite: the inheritance lookup only ever recurses one level, into
