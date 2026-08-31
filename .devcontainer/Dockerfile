@@ -19,7 +19,7 @@ ARG JJ_VERSION=0.44.0
 # implementation's, so an unpinned CLI would turn an upstream release into a local failure that
 # CI does not reproduce — or the reverse.
 # renovate: datasource=npm depName=@devcontainers/cli
-ARG DEVCONTAINER_CLI_VERSION=0.88.0
+ARG DEVCONTAINER_CLI_VERSION=0.89.0
 
 # tmux — `am` drives tmux, and it is needed to exercise a session by hand.
 #   The test suite mocks it via AM_TMUX_BIN and does not require it.
