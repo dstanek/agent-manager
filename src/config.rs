@@ -83,13 +83,68 @@ pub enum AgentInstall {
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
-/// Per-agent configuration (image override, devcontainer Feature, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Per-agent configuration.
+///
+/// Every field is optional and overlays the compiled-in definition of the same name (see
+/// `harness::builtin`), so a user changes one thing about `claude` without restating the
+/// rest. An entry for a name `am` was never compiled with is a complete definition in its own
+/// right — that is what makes a custom agent first-class rather than a special case.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct AgentSettings {
     pub image: Option<String>,
     /// Devcontainer Feature that installs this agent, injected via
     /// `--additional-features` when `devcontainer.agent_install` selects it.
     pub devcontainer_feature: Option<String>,
+    /// argv to exec. The first element is the binary. Defaults to the built-in's command, or
+    /// is required when the name has no built-in to inherit one from.
+    pub command: Option<Vec<String>>,
+    /// Appended to `command` under `--auto`.
+    pub auto_flags: Option<Vec<String>>,
+    /// argv form for resuming the previous conversation.
+    pub resume: Option<Vec<String>>,
+    /// Credential wiring. Absent means "inherit the built-in's, if any"; present replaces
+    /// the built-in's integration wholesale rather than merging field-by-field — a
+    /// half-overridden set of credential rules is not a thing anyone can reason about.
+    pub integration: Option<IntegrationSettings>,
+}
+
+/// How a config-defined agent authenticates.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct IntegrationSettings {
+    #[serde(default)]
+    pub mounts: Vec<MountSettings>,
+    /// Host environment variables forwarded when set and non-empty.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// OR of ANDs: at least one group must be fully satisfied.
+    #[serde(default)]
+    pub requires_any: Vec<Vec<RequirementSettings>>,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct MountSettings {
+    /// Host path. A leading `~/` is expanded at use time, not load time — the config may be
+    /// committed and read on a machine with a different home directory.
+    pub host: String,
+    /// Path inside the container. A leading `~/` means the container's home, which is not
+    /// the host's.
+    pub container: String,
+    /// `"ro"` or `"rw"`. Anything else is rejected at load.
+    pub mode: Option<String>,
+    /// Whether preflight fails when the host path is missing. Defaults to true: a mount
+    /// someone bothered to declare is presumed to matter.
+    pub required: Option<bool>,
+    /// Skip the mount when the host path does not exist, rather than letting the runtime
+    /// create it root-owned on the host.
+    pub only_if_exists: Option<bool>,
+}
+
+/// One condition in a `requires_any` group. Exactly one of the two fields must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RequirementSettings {
+    pub path: Option<String>,
+    pub env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +311,9 @@ fn default_agent_images() -> HashMap<String, AgentSettings> {
             AgentSettings {
                 image: image.map(str::to_string),
                 devcontainer_feature: feature.map(str::to_string),
+                // Command, auto/resume flags, and credentials for the built-ins live in
+                // `harness::builtin`, not here. Config only ever *overlays* them.
+                ..AgentSettings::default()
             },
         )
     })
@@ -315,6 +373,10 @@ struct FileDefaults {
 struct FileAgentSettings {
     image: Option<String>,
     devcontainer_feature: Option<String>,
+    command: Option<Vec<String>>,
+    auto_flags: Option<Vec<String>>,
+    resume: Option<Vec<String>>,
+    integration: Option<IntegrationSettings>,
     #[serde(flatten)]
     unknown: HashMap<String, toml::Value>,
 }
@@ -464,7 +526,8 @@ fn apply_opt_string(target: &mut Option<String>, value: Option<String>) {
 fn apply_file_config(base: &mut Config, file: FileConfig) {
     apply_opt_string(&mut base.agent, file.defaults.agent);
 
-    // Merge agents: file entries extend/override the compiled-in defaults.
+    // Merge agents: file entries extend/override the compiled-in defaults, field by field,
+    // so overriding one thing about a built-in does not require restating the rest.
     for (name, file_agent) in file.agents {
         let entry = base.agents.entry(name).or_default();
         apply_opt_string(&mut entry.image, file_agent.image);
@@ -472,6 +535,13 @@ fn apply_file_config(base: &mut Config, file: FileConfig) {
             &mut entry.devcontainer_feature,
             file_agent.devcontainer_feature,
         );
+        // `auto_flags = []` is a meaningful value — "this agent has no autonomous mode" —
+        // so an empty list must overwrite rather than be treated as absent the way an empty
+        // string is.
+        apply_opt_some(&mut entry.command, file_agent.command);
+        apply_opt_some(&mut entry.auto_flags, file_agent.auto_flags);
+        apply_opt_some(&mut entry.resume, file_agent.resume);
+        apply_opt_some(&mut entry.integration, file_agent.integration);
     }
 
     apply_opt(&mut base.tmux.agent_pane, file.tmux.agent_pane);
@@ -576,6 +646,18 @@ pub fn render_project_config_skeleton() -> &'static str {
 # [agents.copilot]
 # image = "ghcr.io/dstanek/am-copilot-minimal:latest"
 
+# Define an agent am wasn't compiled with — see the configuration reference's "Custom agents"
+# section for the full shape (command/auto_flags/resume/integration.*):
+# [agents.aider]
+# command = ["aider", "--model", "sonnet"]  # argv to launch; required when there's no built-in
+# auto_flags = ["--yes-always"]             # appended under `am start --auto`; [] = no auto mode
+# resume = ["--restore-chat-history"]       # argv used by `am attach` to resume the conversation
+#
+# [agents.aider.integration]                # omit entirely for an agent that needs no credentials
+# env = ["ANTHROPIC_API_KEY"]               # host env vars forwarded into the container
+# hint = "export ANTHROPIC_API_KEY=sk-..."  # shown by am doctor when requires_any is unsatisfied
+# requires_any = [[{ env = "ANTHROPIC_API_KEY" }]]  # am doctor/setup treat this as "authenticated"
+
 [tmux]
 # agent_pane = "left"    # which pane gets the agent: "left" | "right"
 # split = "horizontal"   # split direction: "horizontal" | "vertical"
@@ -651,6 +733,37 @@ image = "ghcr.io/dstanek/am-copilot-minimal:latest"
 # Add entries for any other agent you use, e.g.:
 # [agents.gemini]
 # image = "ghcr.io/your-org/am-gemini:latest"
+
+# A custom agent (one am wasn't compiled with) is a complete definition in its own right —
+# `command` is required since there's no built-in to inherit one from. See the "Custom agents"
+# section of the configuration reference for the full [agents.<name>] shape.
+# [agents.aider]
+# command = ["aider", "--model", "sonnet"]  # argv to launch; the first element is the binary
+# auto_flags = ["--yes-always"]             # appended under `am start --auto`
+#                                            #   an explicit [] means "no autonomous mode",
+#                                            #   which is different from leaving auto_flags unset
+# resume = ["--restore-chat-history"]       # argv `am attach` uses to resume the conversation;
+#                                            #   omit if the agent has no way to resume
+#
+# [agents.aider.integration]                # omit this whole table for an agent that needs no
+#                                            #   credentials from the host at all
+# env = ["ANTHROPIC_API_KEY"]               # host env vars forwarded into the container when set
+# hint = "export ANTHROPIC_API_KEY=sk-..."  # am doctor's fix suggestion when requires_any fails
+# requires_any = [[{ env = "ANTHROPIC_API_KEY" }]]
+#                                            # OR of ANDs: at least one inner array must be fully
+#                                            #   satisfied for am doctor/setup to call this agent
+#                                            #   authenticated. Two independent ways to sign in
+#                                            #   (e.g. an API key OR an interactive login) look
+#                                            #   like: requires_any = [[{ path = "~/.aider/auth.json" }], [{ env = "ANTHROPIC_API_KEY" }]]
+#
+# [[agents.aider.integration.mounts]]        # a credential file/dir to mount into the container
+# host = "~/.aider.conf.yml"                # host path: "~/..." or an absolute path
+# container = "~/.aider.conf.yml"           # container path; "~/..." resolves against the
+#                                            #   container's home, which may differ from the host's
+# mode = "rw"                               # "ro" (default) or "rw"
+# required = true                           # fail preflight if the host path is missing (default)
+# only_if_exists = false                    # skip the mount (rather than create it root-owned)
+#                                            #   when the host path doesn't exist (default false)
 
 [tmux]
 agent_pane = "left"    # which pane gets the agent: "left" | "right"
@@ -870,6 +983,22 @@ pub(crate) fn validate_split_percent(percent: u8) -> Result<()> {
     Ok(())
 }
 
+/// Reject an empty `[agents.""]` table key.
+///
+/// `[agents.""]` is syntactically valid TOML — the empty string is a legal table key — but a
+/// blank name can never be selected by `--agent`/`defaults.agent`, which both reject an empty
+/// value before it would ever reach `cfg.agents`. Left unrejected, it would only ever be a
+/// typo (a stray `[agents.]` heading with the dot swallowed) sitting in `am setup`'s menu as
+/// a blank, unselectable row instead of surfacing as the mistake it is.
+fn validate_agent_names(cfg: &Config) -> Result<()> {
+    if cfg.agents.contains_key("") {
+        return Err(anyhow::anyhow!(
+            "invalid config: [agents.\"\"] has an empty name — remove it or give it a real name"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_container_user(user: &str) -> Result<()> {
     let valid = !user.is_empty()
         && user
@@ -917,6 +1046,7 @@ pub fn load_with_global(
     validate_split_percent(config.tmux.split_percent)?;
     validate_env_passthrough(&config.container.env)?;
     validate_container_user(&config.container.user)?;
+    validate_agent_names(&config)?;
 
     Ok(config)
 }
@@ -1328,6 +1458,45 @@ image = "project-image"
     }
 
     #[test]
+    fn agent_command_and_integration_parse_from_a_real_toml_file() {
+        // Regression for the class of bug where a struct gains fields but the file-parsing
+        // shape (`FileAgentSettings`) does not: constructing `AgentSettings` directly in a
+        // test would pass even if these two keys silently landed in `unknown` and never
+        // reached `harness::resolve`.
+        let _guard = lock_env();
+        let _env = EnvGuard::save(&["AM_AGENT"]);
+        std::env::remove_var("AM_AGENT");
+        let tmp = TempDir::new().unwrap();
+
+        let project_path = write_toml(
+            tmp.path(),
+            "project.toml",
+            r#"
+[agents.my-harness]
+command = ["my-agent", "--flag"]
+auto_flags = []
+
+[agents.my-harness.integration]
+env = ["MY_TOKEN"]
+hint = "export MY_TOKEN"
+requires_any = [[{ env = "MY_TOKEN" }]]
+"#,
+        );
+
+        let config = load_with_global(None, Some(&project_path)).unwrap();
+        let settings = config.agents.get("my-harness").expect("section parsed");
+        assert_eq!(
+            settings.command,
+            Some(vec!["my-agent".to_string(), "--flag".to_string()])
+        );
+        assert_eq!(settings.auto_flags, Some(vec![]));
+        let integration = settings.integration.as_ref().expect("integration parsed");
+        assert_eq!(integration.env, vec!["MY_TOKEN".to_string()]);
+        assert_eq!(integration.hint.as_deref(), Some("export MY_TOKEN"));
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+    }
+
+    #[test]
     fn agent_image_overridden_in_project_config() {
         let _guard = lock_env();
         let _env = EnvGuard::save(&["AM_AGENT"]);
@@ -1687,6 +1856,24 @@ user = "../root"
         );
         let err = load_with_global(None, Some(&project)).unwrap_err();
         assert!(err.to_string().contains("../root"));
+    }
+
+    #[test]
+    fn empty_agent_table_key_is_rejected() {
+        assert!(validate_agent_names(&Config::default()).is_ok());
+        let mut cfg = Config::default();
+        cfg.agents.insert(String::new(), AgentSettings::default());
+        let err = validate_agent_names(&cfg).unwrap_err();
+        assert!(err.to_string().contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn load_with_global_errors_on_an_empty_agent_table_key() {
+        let tmp = TempDir::new().unwrap();
+        // A stray `[agents.]` heading — the dot swallowed the name, leaving an empty one.
+        let project = write_toml(tmp.path(), "config.toml", "[agents.\"\"]\ncommand = [\"x\"]\n");
+        let err = load_with_global(None, Some(&project)).unwrap_err();
+        assert!(err.to_string().contains("empty name"), "{err}");
     }
 
     #[test]

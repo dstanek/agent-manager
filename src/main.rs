@@ -7,6 +7,7 @@ mod container;
 mod devcontainer;
 mod doctor;
 mod error;
+mod harness;
 mod messages;
 mod onboarding;
 mod session;
@@ -200,7 +201,7 @@ fn created_global_config_line(path: &Path, home_dir: Option<&Path>, color: bool)
 
 /// "Set defaults.agent = ..." once the agent question is answered and written.
 fn set_project_agent_line(
-    agent: container::KnownAgent,
+    agent: &harness::AgentName,
     project_config_path: &Path,
     repo_root: Option<&Path>,
 ) -> String {
@@ -244,7 +245,7 @@ fn found_devcontainer_line(path: &Path, repo_root: Option<&Path>) -> String {
 /// so its output is unchanged.
 fn init_project(
     repo_root: &Path,
-    known_agent: Option<container::KnownAgent>,
+    known_agent: Option<&harness::AgentName>,
 ) -> anyhow::Result<Vec<InitLine>> {
     let mut report = Vec::new();
     let am_dir = repo_root.join(".am");
@@ -325,9 +326,24 @@ fn init_project(
 /// walk a user through the existing ones, so `doctor::run` and `cmd_start` are called
 /// directly and a passing `am setup` cannot disagree with a working `am start`.
 fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
-    // Both of these must fail before anything is written: an unknown agent name is a typo
-    // to correct, and a prompt no one can answer is a hang to avoid.
-    let flag_agent = agent_flag.map(container::KnownAgent::parse).transpose()?;
+    // The agent menu is dynamic — it lists whatever `cfg.agents` defines, not just the four
+    // built-ins (the user considered and explicitly overrode the "preset-only" alternative:
+    // "if we don't list custom agents it will be filed as a bug by users" — see
+    // specs/harness-decoupling.md, "The agent menu becomes dynamic") — so validating `--agent`
+    // needs a merged config, which needs a repo. `find_repo_root` therefore has to move ahead
+    // of the flag check that used to run context-free against a fixed 4-name list; the one
+    // user-visible change is which error a bad `--agent` outside a repo reports first.
+    let (repo_root, vcs) = find_repo_root()?;
+    let cfg = load_config(&repo_root)?;
+
+    // Both of these must fail before anything is written: an unknown agent name is a typo to
+    // correct, and a prompt no one can answer is a hang to avoid. Checked against the same
+    // full agent table `am start` uses (`AgentName::parse`, not `parse_builtin`) — one error
+    // shape, reached from both call sites, rather than two independently worded "unknown
+    // agent" messages that could drift apart.
+    let flag_agent = agent_flag
+        .map(|name| harness::AgentName::parse(name, &cfg))
+        .transpose()?;
     if !yes && !std::io::stdin().is_terminal() {
         return Err(anyhow::anyhow!(
             "am setup requires an interactive terminal — pass --yes for non-interactive \
@@ -335,11 +351,9 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
         ));
     }
 
-    let (repo_root, vcs) = find_repo_root()?;
-
     // Gathered before anything is created, so the "exists" flags describe what the user
     // arrived with rather than what this run just made.
-    let detected = onboarding::DetectedState::gather(Some((repo_root.as_path(), vcs.clone())))?;
+    let detected = onboarding::DetectedState::gather(Some((repo_root.as_path(), vcs.clone())), &cfg)?;
 
     // Decided once, up front: every dim line this command prints — the init report, each
     // question's write-target and "currently: ..." lines — shares this one flag, the same
@@ -373,8 +387,8 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // before it prints anything, and `default_agent_answer` never takes an `Io` at all), so
     // this changes nothing about what gets printed or when. A genuinely interactive answer is
     // still asked below, after the file exists, in its original place in the flow.
-    let resolved_agent_answer: Option<Option<container::KnownAgent>> = if flag_agent.is_some() {
-        Some(onboarding::ask_agent(&mut io, &detected, flag_agent, color_enabled)?)
+    let resolved_agent_answer: Option<Option<harness::AgentName>> = if flag_agent.is_some() {
+        Some(onboarding::ask_agent(&mut io, &detected, flag_agent.clone(), color_enabled, &cfg)?)
     } else if yes {
         Some(onboarding::default_agent_answer(&detected))
     } else {
@@ -393,7 +407,7 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // report order, same reason and same fix as `render_init_report`'s own doc comment: the
     // advisory is discovered mid-scan but grouped after the status detail so it reads as a
     // call-out attached to the list instead of a "Note:" interrupting it partway through.
-    let init_report = init_project(&repo_root, resolved_agent_answer.flatten())?;
+    let init_report = init_project(&repo_root, resolved_agent_answer.clone().flatten().as_ref())?;
     for line in init_report
         .iter()
         .filter(|line| matches!(line, InitLine::Status { .. }))
@@ -428,9 +442,9 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // default, which is why it writes nothing at all on an already-configured repo.
     // `--agent` is an answer rather than a default, so it is evaluated either way. Only ask
     // now if the agent question is still unresolved — i.e. it genuinely needs a prompt.
-    let agent_answer = match resolved_agent_answer {
+    let agent_answer = match resolved_agent_answer.clone() {
         Some(answer) => answer,
-        None => onboarding::ask_agent(&mut io, &detected, flag_agent, color_enabled)?,
+        None => onboarding::ask_agent(&mut io, &detected, flag_agent.clone(), color_enabled, &cfg)?,
     };
     // The containers question is exactly one of two mutually exclusive framings, chosen by
     // whether a global config file already existed *before this run* — never both in the
@@ -445,8 +459,9 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
         onboarding::ask_container_consent(&mut io, &detected, color_enabled)?
     };
 
-    if let Some(agent) = agent_answer {
-        let written = onboarding::update_project_agent(&detected.project_config_path, agent)?;
+    if let Some(agent) = agent_answer.clone() {
+        let written =
+            onboarding::update_project_agent(&detected.project_config_path, agent.clone())?;
         // A brand-new file already carries the active line from creation above, in which
         // case `update_project_agent` correctly finds it already correct and writes
         // nothing — so the confirmation has to come from here instead in that case.
@@ -456,7 +471,7 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
             println!(
                 "{}",
                 set_project_agent_line(
-                    agent,
+                    &agent,
                     &detected.project_config_path,
                     detected.repo_root.as_deref()
                 )
@@ -543,7 +558,7 @@ fn cmd_setup(yes: bool, agent_flag: Option<&str>) -> anyhow::Result<()> {
     // and possibly a container image unasked.
     let resolved_agent = flag_agent
         .or(agent_answer)
-        .or(detected.effective_agent.value);
+        .or(detected.effective_agent.value.clone());
     if !yes && std::io::stdin().is_terminal() {
         if let Some(slug) =
             onboarding::ask_first_session(&mut io, detected.devcontainer.is_some())?
@@ -608,7 +623,7 @@ fn print_what_to_do_next(report: &doctor::Report, color: bool) {
     print!("{}", render_what_to_do_next(report, color));
 }
 
-fn print_next_steps(agent: Option<container::KnownAgent>, tmux_present: bool) {
+fn print_next_steps(agent: Option<harness::AgentName>, tmux_present: bool) {
     let agent_flag = agent
         .map(|a| format!(" --agent {a}"))
         .unwrap_or_default();
@@ -685,10 +700,12 @@ fn cmd_start(
         return Err(error::AmError::AutoRequiresAgent.into());
     }
 
-    // 3. Parse agent name — validates and gives a typed KnownAgent for container functions
-    let effective_known_agent: Option<container::KnownAgent> = effective_agent
+    // 3. Resolve the agent name against the agent table — validates and gives a fully
+    //    resolved `Harness` (command, auto/resume flags, credential integration) for
+    //    container functions. Replaces the old closed `KnownAgent::parse`.
+    let resolved_harness: Option<harness::Harness> = effective_agent
         .as_deref()
-        .map(container::KnownAgent::parse)
+        .map(|name| harness::AgentName::parse(name, &cfg)?.resolve(&cfg))
         .transpose()?;
 
     // 4. Generate gitconfig in the global state directory.
@@ -708,7 +725,7 @@ fn cmd_start(
     let runtime = if use_container {
         Some(plan_container_runtime(
             &cfg,
-            effective_known_agent,
+            resolved_harness.as_ref(),
             &container_name,
         )?)
     } else {
@@ -735,7 +752,7 @@ fn cmd_start(
                 vcs: &vcs,
                 cfg: &cfg,
                 runtime,
-                agent: effective_known_agent,
+                agent: resolved_harness.clone(),
                 agent_name: effective_agent.as_deref(),
                 auto,
                 rebuild,
@@ -779,10 +796,16 @@ fn cmd_start(
             format!("tmux split failed — run 'am destroy --force {slug}' to clean up")
         })?;
         // A container command was exec'd by the split above. A host-side agent is short
-        // enough to type, and typing it leaves a shell behind when the agent exits.
+        // enough to type, and typing it leaves a shell behind when the agent exits. Reads
+        // the resolved command (`harness.command`), not the bare `--agent` name, so a
+        // harness whose command differs from its section name still launches correctly —
+        // `auto` is never true here (checked above: `--auto` requires a container), and a
+        // freshly started session never resumes.
         if container_shell_cmd.is_none() {
-            if let Some(ref agent) = effective_agent {
-                tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), agent)?;
+            let cmd = agent_command(resolved_harness.as_ref(), false, false);
+            if !cmd.is_empty() {
+                let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
+                tmux::send_keys(&tmux::get_pane_id(&window_id, agent_pane_idx), &keys)?;
             }
         }
         // Both panes already open in the worktree (via `new-window -c`), so no cd
@@ -946,7 +969,7 @@ struct ContainerPlanInput<'a> {
     vcs: &'a config::Vcs,
     cfg: &'a config::Config,
     runtime: &'a container::ContainerRuntime,
-    agent: Option<container::KnownAgent>,
+    agent: Option<harness::Harness>,
     agent_name: Option<&'a str>,
     auto: bool,
     rebuild: bool,
@@ -974,7 +997,7 @@ struct ContainerPlan {
 /// extraction.
 fn plan_container_runtime(
     cfg: &config::Config,
-    agent: Option<container::KnownAgent>,
+    agent: Option<&harness::Harness>,
     container_name: &str,
 ) -> anyhow::Result<container::ContainerRuntime> {
     let runtime = container::detect_runtime(cfg.container.runtime.clone())?;
@@ -1042,7 +1065,7 @@ fn plan_image(
     vcs: &config::Vcs,
     cfg: &config::Config,
     runtime: &container::ContainerRuntime,
-    agent: Option<container::KnownAgent>,
+    agent: Option<harness::Harness>,
     agent_name: Option<&str>,
     auto: bool,
     container_name: &str,
@@ -1051,7 +1074,7 @@ fn plan_image(
     let image = config::resolve_image(agent_name, cfg)
         .ok_or(error::AmError::ContainerImageNotConfigured)?;
     let home = container::container_home(&cfg.container.user, cfg.devcontainer.home.as_deref());
-    let agent_auth = match agent {
+    let agent_auth = match &agent {
         Some(agent) => container::preflight_agent_auth(agent, &home)?,
         None => container::AgentAuth::default(),
     };
@@ -1076,7 +1099,7 @@ fn plan_image(
         container_name,
         &container::DevcontainerRuntime::image_mode(),
     );
-    cmd.extend(agent_command(agent_name, agent, auto, resume));
+    cmd.extend(agent_command(agent.as_ref(), auto, resume));
     Ok(ContainerPlan {
         cmd,
         session: session::SessionContainer::image_mode(
@@ -1099,7 +1122,7 @@ fn plan_devcontainer(
     vcs: &config::Vcs,
     cfg: &config::Config,
     runtime: &container::ContainerRuntime,
-    agent: Option<container::KnownAgent>,
+    agent: Option<harness::Harness>,
     agent_name: Option<&str>,
     auto: bool,
     rebuild: bool,
@@ -1176,7 +1199,7 @@ fn plan_devcontainer(
     let home = container::container_home(&user, cfg.devcontainer.home.as_deref());
 
     let trusted = devcontainer::apply_trust(&resolved, cfg, worktree);
-    let agent_auth = match agent {
+    let agent_auth = match &agent {
         Some(agent) => container::preflight_agent_auth(agent, &home)?,
         None => container::AgentAuth::default(),
     };
@@ -1211,7 +1234,7 @@ fn plan_devcontainer(
     let agent_cmd = container::compose_entrypoint_command(
         &trusted.entrypoints,
         &user_commands,
-        &agent_command(agent_name, agent, auto, resume),
+        &agent_command(agent.as_ref(), auto, resume),
         trusted.user_env_probe,
         &container::protected_env_names(&mounts, &cfg.container.env, &agent_auth.env, &trusted),
         trusted.drop_to.as_deref(),
@@ -1354,40 +1377,33 @@ fn plan_compose(
 /// The agent invocation appended as the container command, if there is one — or, for a
 /// host-side relaunch (`am attach`), the command line sent into the agent pane.
 ///
-/// `agent_name` is the raw string to launch (`cfg.agent`, `--agent`, or a recorded
-/// `Session.agent`) and `known` is that same value already parsed to a `KnownAgent`, kept
-/// separate so an unrecognized name still launches as a bare command rather than vanishing.
-/// This is not a defensive fallback for something that "shouldn't happen": `cmd_start`
-/// validates `--agent` via `KnownAgent::parse` before any session exists, so a
-/// `cmd_start`-originated `Session.agent` is always parseable — but the now-removed `am run`
-/// had no such validator and persisted its `agent` argument onto `Session.agent` verbatim on
-/// success, so a session record written by an older `am` (or hand-edited) can still carry an
-/// unparseable value, reaching `known: None` here, later, via `am attach`.
-fn agent_command(
-    agent_name: Option<&str>,
-    known: Option<container::KnownAgent>,
-    auto: bool,
-    resume: bool,
-) -> Vec<String> {
-    let Some(name) = agent_name else {
+/// Reads the resolved `Harness::command` — never a bare `--agent`/`Session.agent` name — so
+/// an agent whose command differs from its own section name (e.g. `[agents.my-harness]`
+/// with `command = ["my-agent", "--flag"]`) launches correctly rather than trying to exec
+/// its own section name as a binary. `known: None` means there is nothing to launch: every
+/// `cmd_start`-originated session resolves its agent via `harness::resolve` before any
+/// session exists, so this is reachable only when there genuinely is no agent configured, or
+/// when a config-defined agent's section has since been removed — callers on the `am attach`
+/// path handle that second case explicitly (see `launch_into_agent_pane`) rather than
+/// silently falling back to launching a bare name as a command.
+fn agent_command(known: Option<&harness::Harness>, auto: bool, resume: bool) -> Vec<String> {
+    let Some(agent) = known else {
         return Vec::new();
     };
-    let mut cmd = vec![name.to_string()];
-    if let Some(agent) = known {
-        // Auto flags are appended before resume flags. Latent ordering constraint: if an
-        // agent ever has both a non-empty `agent_auto_flags` *and* a subcommand-shaped
-        // resume form (like Codex's `resume --last`, which must be the very first token
-        // after the binary name, not just present anywhere), appending auto flags first
-        // would produce an invalid invocation. Harmless today only because
-        // `agent_auto_flags(Codex)` is empty — revisit this ordering if that changes, or if
-        // `auto` and `resume` are ever combined for an agent with a subcommand-shaped resume.
-        if auto {
-            cmd.extend(container::agent_auto_flags(agent));
-        }
-        if resume {
-            if let Some(flags) = container::agent_resume_flags(agent) {
-                cmd.extend(flags);
-            }
+    let mut cmd = agent.command.clone();
+    // Auto flags are appended before resume flags. Latent ordering constraint: if an agent
+    // ever has both a non-empty `auto_flags` *and* a subcommand-shaped resume form (like
+    // Codex's `resume --last`, which must be the very first token after the binary name, not
+    // just present anywhere), appending auto flags first would produce an invalid invocation.
+    // Harmless today only because Codex's `auto_flags` is empty — revisit this ordering if
+    // that changes, or if `auto` and `resume` are ever combined for an agent with a
+    // subcommand-shaped resume.
+    if auto {
+        cmd.extend(agent.auto_flags.clone());
+    }
+    if resume {
+        if let Some(flags) = &agent.resume {
+            cmd.extend(flags.clone());
         }
     }
     cmd
@@ -1643,24 +1659,28 @@ fn agent_pane_status(s: &session::Session) -> PaneStatus {
 }
 
 /// Whether `resume` actually contributes a flag for `known_agent` — used only to decide the
-/// "(resuming)" wording in `am attach`'s output; the same test `agent_command` itself applies
-/// via `agent_resume_flags`.
-fn resume_will_apply(known_agent: Option<container::KnownAgent>, resume: bool) -> bool {
-    resume && known_agent.is_some_and(|a| container::agent_resume_flags(a).is_some())
+/// "(resuming)" wording in `am attach`'s output; the same test `agent_command` itself applies.
+fn resume_will_apply(known_agent: Option<&harness::Harness>, resume: bool) -> bool {
+    resume && known_agent.is_some_and(|a| a.resume.is_some())
 }
 
 /// What `am attach` actually launched, for building its output line — a host agent, a
-/// recreated container, or nothing (no agent could be determined; OQ-1/UC-5).
+/// recreated container, nothing (no agent recorded at all; OQ-1/UC-5), or an agent that was
+/// recorded but no longer resolves against config (its `[agents.<name>]` section was edited
+/// or removed since `am start`).
 enum AttachLaunch {
     Agent { name: String, resumed: bool },
     Container,
     NoAgentKnown,
+    AgentNotConfigured { name: String, reason: String },
 }
 
 /// `am attach`'s output line after opening a brand-new window (UC-1/UC-2/UC-5).
 fn attach_recreate_message(slug: &str, launch: &AttachLaunch) -> String {
     match launch {
-        AttachLaunch::NoAgentKnown => format!("Opened new window for session '{slug}'."),
+        AttachLaunch::NoAgentKnown | AttachLaunch::AgentNotConfigured { .. } => {
+            format!("Opened new window for session '{slug}'.")
+        }
         AttachLaunch::Agent { name, resumed } => {
             let suffix = if *resumed { " (resuming)" } else { "" };
             format!("Opened new window for session '{slug}' and relaunched '{name}'{suffix}.")
@@ -1675,7 +1695,9 @@ fn attach_recreate_message(slug: &str, launch: &AttachLaunch) -> String {
 /// was found idle (UC-4).
 fn attach_relaunch_message(slug: &str, launch: &AttachLaunch) -> String {
     match launch {
-        AttachLaunch::NoAgentKnown => format!("Attached to session '{slug}'."),
+        AttachLaunch::NoAgentKnown | AttachLaunch::AgentNotConfigured { .. } => {
+            format!("Attached to session '{slug}'.")
+        }
         AttachLaunch::Agent { name, resumed } => {
             let suffix = if *resumed { " (resuming)" } else { "" };
             format!(
@@ -1699,7 +1721,6 @@ fn attach_recreate_container_cmd(
     cfg: &config::Config,
     slug: &str,
     s: &mut session::Session,
-    known_agent: Option<container::KnownAgent>,
     resume: bool,
 ) -> anyhow::Result<Vec<String>> {
     let recreate_name = s
@@ -1708,7 +1729,29 @@ fn attach_recreate_container_cmd(
         .and_then(|c| c.container_name.clone())
         .unwrap_or_else(|| container_name(repo_root, slug));
 
-    let runtime = plan_container_runtime(cfg, known_agent, &recreate_name)?;
+    // Re-resolved fresh from current config on every recreate, deliberately — the same
+    // reason a devcontainer image rebuilds and credentials re-fail here: a corrected image or
+    // command should take effect on a recreate, exactly like a fresh `am start`. Resolved
+    // once and threaded to both `plan_container_runtime`'s credential check and
+    // `ContainerPlanInput` below, so the two cannot disagree about which agent this is. A
+    // section removed since `am start` fails loudly here — a clean, explanatory error —
+    // rather than falling back to launching the session's own recorded name as a bare
+    // command (see `agent_command`'s doc comment for why that fallback would be wrong).
+    let resolved_agent = s
+        .agent
+        .as_deref()
+        .map(|name| {
+            harness::resolve(name, cfg).map_err(|e| {
+                anyhow::anyhow!(
+                    "session '{slug}' was started with agent '{name}', which no longer \
+                     resolves: {e}\nHint: restore [agents.{name}] in .am/config.toml, or run \
+                     'am destroy {slug} --force' and start over"
+                )
+            })
+        })
+        .transpose()?;
+
+    let runtime = plan_container_runtime(cfg, resolved_agent.as_ref(), &recreate_name)?;
 
     let plan = plan_container(ContainerPlanInput {
         slug,
@@ -1717,7 +1760,7 @@ fn attach_recreate_container_cmd(
         vcs,
         cfg,
         runtime: &runtime,
-        agent: known_agent,
+        agent: resolved_agent,
         agent_name: s.agent.as_deref(),
         auto: s.auto,
         rebuild: false,
@@ -1759,7 +1802,6 @@ fn recreate_attach_window(
     cfg: &config::Config,
     slug: &str,
     s: &mut session::Session,
-    known_agent: Option<container::KnownAgent>,
     resume: bool,
 ) -> anyhow::Result<()> {
     let window_id = tmux::create_window(&s.tmux.tmux_window, &s.vcs.worktree_path)
@@ -1784,7 +1826,7 @@ fn recreate_attach_window(
     // so the record must reflect that even if what follows fails.
     session::update_session_global(s.clone())?;
 
-    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, resume)?;
     // Persist again: a container recreate replaces s.container with a freshly resolved plan
     // (mode/hash may have changed). A host launch or the no-agent case changes nothing further,
     // so this second write is a harmless no-op for those, kept for a single code path rather
@@ -1796,6 +1838,7 @@ fn recreate_attach_window(
 
     println!("{}", attach_recreate_message(slug, &launch));
     print_no_agent_known_note(slug, s.agent.is_none());
+    print_agent_not_configured_note(&launch);
     Ok(())
 }
 
@@ -1811,10 +1854,9 @@ fn relaunch_into_existing_window(
     cfg: &config::Config,
     slug: &str,
     s: &mut session::Session,
-    known_agent: Option<container::KnownAgent>,
     resume: bool,
 ) -> anyhow::Result<()> {
-    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+    let launch = launch_into_agent_pane(repo_root, vcs, cfg, slug, s, resume)?;
     // A container recreate replaces s.container with a freshly resolved plan; a host
     // relaunch or the no-agent case changes nothing further, so this is a harmless no-op
     // write for those — kept unconditional for the same reason as
@@ -1823,6 +1865,7 @@ fn relaunch_into_existing_window(
 
     println!("{}", attach_relaunch_message(slug, &launch));
     print_no_agent_known_note(slug, s.agent.is_none());
+    print_agent_not_configured_note(&launch);
     Ok(())
 }
 
@@ -1845,11 +1888,10 @@ fn launch_into_agent_pane(
     cfg: &config::Config,
     slug: &str,
     s: &mut session::Session,
-    known_agent: Option<container::KnownAgent>,
     resume: bool,
 ) -> anyhow::Result<AttachLaunch> {
     if s.container.is_some() {
-        let cmd = attach_recreate_container_cmd(repo_root, vcs, cfg, slug, s, known_agent, resume)?;
+        let cmd = attach_recreate_container_cmd(repo_root, vcs, cfg, slug, s, resume)?;
         // The container run command can be a multi-line `sh -c '<script>'` (the devcontainer
         // userEnvProbe script — see `container::user_env_probe_script`) with literal embedded
         // newlines, so it must reach the pane as one argv element via `respawn_pane`'s
@@ -1861,15 +1903,26 @@ fn launch_into_agent_pane(
         return Ok(AttachLaunch::Container);
     }
     match s.agent.clone() {
-        Some(name) => {
-            let cmd = agent_command(Some(&name), known_agent, false, resume);
-            let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
-            tmux::send_keys(&s.tmux.agent_pane, &keys)?;
-            Ok(AttachLaunch::Agent {
-                resumed: resume_will_apply(known_agent, resume),
+        // Re-resolved fresh from current config, same as the container-recreate path above —
+        // a section edited since `am start` should apply. A section that no longer resolves
+        // (deleted, or a legacy record from the since-removed `am run` that never named a
+        // real one) is reported explicitly rather than falling back to typing the bare name
+        // into the pane as a command (see `agent_command`'s doc comment).
+        Some(name) => match harness::resolve(&name, cfg) {
+            Ok(agent) => {
+                let cmd = agent_command(Some(&agent), false, resume);
+                let keys = cmd.iter().map(|t| shell_quote(t)).collect::<Vec<_>>().join(" ");
+                tmux::send_keys(&s.tmux.agent_pane, &keys)?;
+                Ok(AttachLaunch::Agent {
+                    resumed: resume_will_apply(Some(&agent), resume),
+                    name,
+                })
+            }
+            Err(e) => Ok(AttachLaunch::AgentNotConfigured {
                 name,
-            })
-        }
+                reason: e.to_string(),
+            }),
+        },
         // No agent recorded and no `cfg.agent` to fall back to (UC-5). Reachable from both
         // call sites — `recreate_attach_window`'s window-missing path, and
         // `relaunch_into_existing_window`'s idle-pane path, since `agent_pane_status` reports
@@ -1931,7 +1984,10 @@ fn run_post_attach(cfg: &config::Config, s: &session::Session) {
 
 /// The `Note:` printed after either attach path when no agent could be determined at all
 /// (UC-5) — indented as a detail line under the headline it follows, same as `am start`'s own
-/// detail lines and the old container-recreate note this replaces.
+/// detail lines and the old container-recreate note this replaces. Independent of `launch`
+/// itself: a containerized session with no recorded agent still restarts its container (see
+/// `AttachLaunch::Container`), and still gets this note alongside that headline — the note is
+/// about the session's own record, not about whether a container happened to be recreated.
 fn print_no_agent_known_note(slug: &str, no_agent_known: bool) {
     if no_agent_known {
         println!(
@@ -1939,6 +1995,16 @@ fn print_no_agent_known_note(slug: &str, no_agent_known: bool) {
              .am/config.toml (or run 'am setup --agent <name>'), then run 'am attach {slug}' again",
             note_prefix()
         );
+    }
+}
+
+/// The `Note:` printed after the host-relaunch path when an agent *was* recorded but no
+/// longer resolves against the current config — its `[agents.<name>]` section was edited or
+/// removed since `am start` (see `agent_command`'s doc comment for why this is reported
+/// explicitly rather than falling back to launching the bare recorded name as a command).
+fn print_agent_not_configured_note(launch: &AttachLaunch) {
+    if let AttachLaunch::AgentNotConfigured { name, reason } = launch {
+        println!("  {} could not launch agent '{name}': {reason}", note_prefix());
     }
 }
 
@@ -1969,16 +2035,13 @@ fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
             session::update_session_global(s.clone())?;
         }
     }
-    // `cmd_start` validates `--agent` via `KnownAgent::parse` before writing a session, but
-    // the now-removed `am run` had no such validator and persisted its `agent` argument onto
-    // `Session.agent` verbatim (see `agent_command`'s doc comment) — so a parse failure here
-    // is still a reachable case for a session record written by an older `am`, not a "should
-    // not happen" one. Handled the same way either way: not propagated as an error,
-    // `agent_command` still launches the bare string, just without resume/auto flags.
-    let known_agent = s
-        .agent
-        .as_deref()
-        .and_then(|name| container::KnownAgent::parse(name).ok());
+    // `cmd_start` validates `--agent` via `harness::resolve` before writing a session, but the
+    // now-removed `am run` had no such validator and persisted its `agent` argument onto
+    // `Session.agent` verbatim — and a section can also simply be edited or removed from
+    // config after a session was started. Either way this is a reachable case, not a "should
+    // not happen" one — `launch_into_agent_pane` re-resolves `s.agent` itself, right before
+    // it is actually needed, and reports it explicitly (`AttachLaunch::AgentNotConfigured`)
+    // rather than guessing at a command.
     let resume = !fresh && cfg.attach.resume;
 
     let window_target = s
@@ -1990,12 +2053,12 @@ fn cmd_attach(slug: &str, fresh: bool) -> anyhow::Result<()> {
     if tmux::select_window(&window_target).is_err() {
         // Persists its own changes internally — see its doc comment for why that can't wait
         // until this function returns.
-        recreate_attach_window(&repo_root, &vcs, &cfg, slug, &mut s, known_agent, resume)?;
+        recreate_attach_window(&repo_root, &vcs, &cfg, slug, &mut s, resume)?;
     } else {
         match agent_pane_status(&s) {
             PaneStatus::Idle => {
                 // Also persists its own changes internally.
-                relaunch_into_existing_window(&repo_root, &vcs, &cfg, slug, &mut s, known_agent, resume)?;
+                relaunch_into_existing_window(&repo_root, &vcs, &cfg, slug, &mut s, resume)?;
             }
             PaneStatus::Running | PaneStatus::Ambiguous => {
                 run_post_attach(&cfg, &s);
@@ -2410,6 +2473,7 @@ mod tests {
     use crate::command::shell_quote;
     use crate::config::PaneSide;
     use crate::doctor;
+    use crate::harness;
     use crate::session;
 
     // ── init_project ─────────────────────────────────────────────────────────
@@ -2418,7 +2482,7 @@ mod tests {
     fn a_known_agent_is_rendered_active_in_a_fresh_project_file() {
         let tmp = tempfile::TempDir::new().unwrap();
 
-        init_project(tmp.path(), Some(KnownAgent::Codex)).unwrap();
+        init_project(tmp.path(), Some(&harness::builtin_name("codex"))).unwrap();
 
         let content = std::fs::read_to_string(tmp.path().join(".am").join("config.toml")).unwrap();
         assert!(content.contains("agent = \"codex\""), "{content}");
@@ -2442,7 +2506,7 @@ mod tests {
         std::fs::create_dir_all(&am_dir).unwrap();
         std::fs::write(am_dir.join("config.toml"), "[defaults]\nagent = \"gemini\"\n").unwrap();
 
-        init_project(tmp.path(), Some(KnownAgent::Codex)).unwrap();
+        init_project(tmp.path(), Some(&harness::builtin_name("codex"))).unwrap();
 
         let content = std::fs::read_to_string(am_dir.join("config.toml")).unwrap();
         assert_eq!(content, "[defaults]\nagent = \"gemini\"\n");
@@ -2721,7 +2785,7 @@ mod tests {
     fn set_project_agent_line_shortens_the_path_relative_to_the_repo_root() {
         let path = Path::new("/repo/.am/config.toml");
         assert_eq!(
-            set_project_agent_line(KnownAgent::Claude, path, Some(Path::new("/repo"))),
+            set_project_agent_line(&harness::builtin_name("claude"), path, Some(Path::new("/repo"))),
             "Set defaults.agent = \"claude\" in .am/config.toml"
         );
     }
@@ -2941,7 +3005,6 @@ mod tests {
 
     use super::{agent_command, injected_features};
     use crate::config::{AgentInstall, Config};
-    use crate::container::KnownAgent;
 
     fn cfg_with_install(install: AgentInstall) -> Config {
         let mut cfg = Config::default();
@@ -3024,50 +3087,62 @@ mod tests {
 
     #[test]
     fn agent_command_is_empty_without_an_agent() {
-        assert!(agent_command(None, None, false, false).is_empty());
+        assert!(agent_command(None, false, false).is_empty());
     }
 
     #[test]
     fn agent_command_adds_auto_flags_only_in_auto_mode() {
+        let claude = harness::builtin("claude").unwrap();
+        assert_eq!(agent_command(Some(&claude), false, false), vec!["claude"]);
         assert_eq!(
-            agent_command(Some("claude"), Some(KnownAgent::Claude), false, false),
-            vec!["claude"]
-        );
-        assert_eq!(
-            agent_command(Some("claude"), Some(KnownAgent::Claude), true, false),
+            agent_command(Some(&claude), true, false),
             vec!["claude", "--dangerously-skip-permissions"]
         );
     }
 
     #[test]
     fn agent_command_adds_resume_flags_only_when_requested() {
+        let claude = harness::builtin("claude").unwrap();
+        assert_eq!(agent_command(Some(&claude), false, false), vec!["claude"]);
         assert_eq!(
-            agent_command(Some("claude"), Some(KnownAgent::Claude), false, false),
-            vec!["claude"]
-        );
-        assert_eq!(
-            agent_command(Some("claude"), Some(KnownAgent::Claude), false, true),
+            agent_command(Some(&claude), false, true),
             vec!["claude", "--continue"]
         );
     }
 
     #[test]
     fn agent_command_combines_auto_and_resume_flags() {
+        let claude = harness::builtin("claude").unwrap();
         assert_eq!(
-            agent_command(Some("claude"), Some(KnownAgent::Claude), true, true),
+            agent_command(Some(&claude), true, true),
             vec!["claude", "--dangerously-skip-permissions", "--continue"]
         );
     }
 
     #[test]
-    fn agent_command_degrades_to_a_bare_command_for_an_unrecognized_name() {
-        // Defensive path (see cmd_attach's OQ-1 handling): a raw agent name that fails
-        // KnownAgent::parse still launches, just with no auto/resume flags — never a
-        // silent no-op.
+    fn agent_command_reads_the_resolved_command_not_the_section_name() {
+        // The fix this pins: a custom agent whose command differs from its `[agents.<name>]`
+        // section name (e.g. `[agents.my-harness]` with `command = ["my-agent", "--flag"]`)
+        // must exec the resolved command, never the section name itself.
+        let custom = harness::Harness {
+            name: "my-harness".to_string(),
+            command: vec!["my-agent".to_string(), "--flag".to_string()],
+            auto_flags: vec![],
+            resume: None,
+            integration: None,
+        };
         assert_eq!(
-            agent_command(Some("some-custom-agent"), None, true, true),
-            vec!["some-custom-agent"]
+            agent_command(Some(&custom), false, false),
+            vec!["my-agent", "--flag"]
         );
+    }
+
+    #[test]
+    fn agent_command_is_empty_when_the_agent_does_not_resolve() {
+        // The fix this pins (see `agent_command`'s doc comment and `launch_into_agent_pane`):
+        // when there is nothing to resolve to, there is nothing to launch — never a bare
+        // section name typed in as a command.
+        assert!(agent_command(None, true, true).is_empty());
     }
 
     // ── cmd_attach: OQ-6 pane status ────────────────────────────────────────────
@@ -3267,7 +3342,7 @@ mod tests {
 
     #[test]
     fn resume_will_apply_is_false_when_resume_not_requested() {
-        assert!(!resume_will_apply(Some(KnownAgent::Claude), false));
+        assert!(!resume_will_apply(Some(&harness::builtin("claude").unwrap()), false));
     }
 
     #[test]
@@ -3277,7 +3352,7 @@ mod tests {
 
     #[test]
     fn resume_will_apply_is_true_for_a_known_agent_when_requested() {
-        assert!(resume_will_apply(Some(KnownAgent::Claude), true));
+        assert!(resume_will_apply(Some(&harness::builtin("claude").unwrap()), true));
     }
 
     #[test]

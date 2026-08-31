@@ -13,7 +13,7 @@ use std::path::Path;
 
 use crate::color::{paint, Color};
 use crate::config::{Config, ContainerMode, Vcs};
-use crate::{config, container, devcontainer, tmux};
+use crate::{config, container, devcontainer, harness, tmux};
 
 // ── Report types ──────────────────────────────────────────────────────────────
 
@@ -214,7 +214,7 @@ pub fn run(repo: Option<(&Path, Vcs)>, agent_flag: Option<&str>) -> Report {
     if let Some(root) = repo_root {
         check_environment(&mut report, root, &cfg, runtime.as_ref(), agent_name.as_deref());
     }
-    check_agent(&mut report, agent_name.as_deref());
+    check_agent(&mut report, &cfg, agent_name.as_deref());
 
     report
 }
@@ -743,7 +743,7 @@ fn injected_features(cfg: &Config, agent_name: Option<&str>) -> Vec<devcontainer
     features
 }
 
-fn check_agent(report: &mut Report, agent_name: Option<&str>) {
+fn check_agent(report: &mut Report, cfg: &Config, agent_name: Option<&str>) {
     let Some(name) = agent_name else {
         report.checks.push(Check::warn(
             AGENT,
@@ -754,23 +754,35 @@ fn check_agent(report: &mut Report, agent_name: Option<&str>) {
         return;
     };
 
-    let agent = match container::KnownAgent::parse(name) {
+    // Resolution can fail two ways, and they deserve different hints: a name nothing
+    // defines, and a name config defines badly. Listing the configured names covers the
+    // first; the resolver's own message covers the second, and a hard-coded "pick one of"
+    // would be wrong the moment a user defines their own agent.
+    let agent = match harness::resolve(name, cfg) {
         Ok(agent) => agent,
         Err(e) => {
             report.checks.push(Check::fail(
                 AGENT,
                 "agent",
-                e.to_string(),
-                "pick one of: claude, copilot, gemini, codex",
+                first_line(&e.to_string()),
+                format!("configured agents are: {}", harness::all_names(cfg).join(", ")),
             ));
             return;
         }
     };
     report
         .checks
-        .push(Check::ok(AGENT, "agent", agent.to_string()));
+        .push(Check::ok(AGENT, "agent", agent.name.clone()));
 
-    match container::validate_agent_credentials(agent) {
+    match container::validate_agent_credentials(&agent) {
+        // "present" would be a lie for an agent that declares no integration — nothing was
+        // found because nothing was looked for, and saying so is the difference between "you
+        // are authenticated" and "authentication is not am's business here".
+        Ok(()) if agent.integration.is_none() => {
+            report
+                .checks
+                .push(Check::ok(AGENT, "credentials", "none required"))
+        }
         Ok(()) => report
             .checks
             .push(Check::ok(AGENT, "credentials", "present")),
@@ -778,7 +790,7 @@ fn check_agent(report: &mut Report, agent_name: Option<&str>) {
             AGENT,
             "credentials",
             first_line(&e.to_string()),
-            container::credentials_hint(agent),
+            container::credentials_hint(&agent),
         )),
     }
 }
@@ -1284,7 +1296,7 @@ mod tests {
         assert_eq!(check.status, Status::Fail);
         assert_eq!(
             check.hint.as_deref(),
-            Some(container::credentials_hint(container::KnownAgent::Claude))
+            Some(container::credentials_hint(&harness::builtin("claude").unwrap()))
         );
     }
 

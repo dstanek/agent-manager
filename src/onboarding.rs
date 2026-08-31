@@ -22,21 +22,46 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::color::{self, Color};
 use crate::config::RuntimePreference;
+use crate::harness::{self, AgentName};
 use crate::{config, container, devcontainer, tmux};
 
-/// The agents the menu offers, in the order shown. `KnownAgent` is the source of truth for
-/// which agents exist; this list only fixes their order.
-const MENU: [container::KnownAgent; 4] = [
-    container::KnownAgent::Claude,
-    container::KnownAgent::Copilot,
-    container::KnownAgent::Gemini,
-    container::KnownAgent::Codex,
-];
+/// The agents the menu offers, in the order shown.
+///
+/// `cfg.agents` is the source of truth for which agents exist — the four built-ins appear in
+/// it automatically as compiled-in sections, and any custom section a user adds appears the
+/// same way. Silently omitting a user's own configured agent from this menu reads as a bug,
+/// not a scoping boundary worth defending, so it is listed here like any other: the four
+/// built-ins first, in their current fixed order, then every other name in `cfg.agents`
+/// sorted alphabetically (ASCII byte order) — `harness::all_names` already implements exactly
+/// this rule, which is also why `am doctor`'s "configured agents are: ..." hint and this menu
+/// can never disagree about the list. `cfg.agents` is a `HashMap`, whose iteration order is
+/// not guaranteed and must never leak into an interactive menu; sorting the non-built-in tail
+/// is what keeps this deterministic across runs. Built-ins keep their existing fixed order
+/// (rather than folding into one fully alphabetical list) so a config with no custom sections
+/// — the overwhelmingly common case — keeps today's exact menu positions (`[1] claude`, `[2]
+/// copilot`, ...); a custom section whose name sorts earlier than `claude` must not bump it
+/// out of `[1]` and disrupt muscle memory for a feature most users will never touch.
+///
+/// Listing configured agents is not the same as becoming a config editor: there is no
+/// "add a new custom agent..." menu option, and no free-text prompt creates a section on the
+/// fly (see `parse_agent_answer`). Defining a *new* section stays purely a config-editing
+/// action outside `am setup`'s scope — only *existing* ones are ever listed or selectable
+/// here.
+fn menu(cfg: &config::Config) -> Vec<AgentName> {
+    harness::all_names(cfg)
+        .into_iter()
+        .map(|name| {
+            AgentName::parse(&name, cfg)
+                .expect("harness::all_names only returns names that exist in cfg.agents")
+        })
+        .collect()
+}
 
-/// The gap between the longest agent name and its "credentials found" note, so every note
-/// lines up in a column regardless of which names have one. The gap itself is a fixed 3
-/// spaces; it's the column *width* it's added to that's computed from `MENU` at the call
-/// site, so a longer agent name added later doesn't silently misalign the menu.
+/// The gap between the longest agent name and its credential note, so every note lines up in
+/// a column regardless of which names have one. The gap itself is a fixed 3 spaces; it's the
+/// column *width* it's added to that's computed from the dynamic entry list at the call site
+/// (`menu(cfg).iter().map(|a| a.to_string().len()).max()`), so a longer agent name — built-in
+/// or a user's own — never silently misaligns the menu.
 const MENU_NOTE_GAP: usize = 3;
 
 // ── Effective values, and where they come from ────────────────────────────────
@@ -221,6 +246,17 @@ pub struct Effective<T> {
     pub source: Source,
 }
 
+/// An agent menu row's credential state — three of them, not two, because "there is nothing
+/// to check" (`NoIntegration`) is a different fact from "checked, and not found yet"
+/// (`NotFound`), and collapsing both into unlabeled silence would read a config-defined agent
+/// with no integration as having failed a check it never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialState {
+    Found,
+    NotFound,
+    NoIntegration,
+}
+
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 /// What `am setup` already knows without asking, gathered once up front.
@@ -249,8 +285,8 @@ pub struct DetectedState {
     pub runtimes_found: Vec<container::RuntimeKind>,
     pub devcontainer: Option<PathBuf>,
     /// Presence only. No credential is ever read, displayed, or written.
-    pub agent_credentials: Vec<(container::KnownAgent, bool)>,
-    pub effective_agent: Effective<Option<container::KnownAgent>>,
+    pub agent_credentials: Vec<(AgentName, CredentialState)>,
+    pub effective_agent: Effective<Option<AgentName>>,
     pub effective_container_enabled: Effective<bool>,
     pub effective_tmux_agent_pane: Effective<config::PaneSide>,
     pub effective_tmux_split: Effective<config::SplitDirection>,
@@ -262,8 +298,16 @@ impl DetectedState {
     ///
     /// Takes the repository the same way `doctor::run` does — the caller has already
     /// resolved it, and re-deriving the VCS here would be a second answer to a question
-    /// that already has one.
-    pub fn gather(repo: Option<(&Path, config::Vcs)>) -> Result<Self> {
+    /// that already has one. Also takes an already-merged `Config` — a new dependency this
+    /// module did not used to have: the four tracked scalars below are still read per-layer
+    /// (`resolve_effective`/`TrackedKeys`, deliberately not `config::load_with_global` — see
+    /// this module's doc comment), but a menu row for a custom agent can genuinely depend on
+    /// a *different* layer than the one defining its section (a project-level
+    /// `[agents.my-harness]` naming `integration = "claude"`, whose image comes from a global
+    /// or compiled-in `[agents.claude]`), which only a merged config can answer. Two
+    /// resolution strategies, each used for what it's for, rather than one silently
+    /// absorbing the other's job.
+    pub fn gather(repo: Option<(&Path, config::Vcs)>, cfg: &config::Config) -> Result<Self> {
         let repo_root = repo.as_ref().map(|(root, _)| *root);
         let vcs = repo.map(|(_, vcs)| vcs);
 
@@ -285,6 +329,7 @@ impl DetectedState {
         ) = resolve_effective(
             project_config_exists.then_some(project_config_path.as_path()),
             global_config_path.as_deref().filter(|p| p.is_file()),
+            cfg,
         );
 
         // Asked per runtime rather than via RuntimePreference::Auto: the question is which
@@ -304,13 +349,21 @@ impl DetectedState {
             .and_then(|root| devcontainer::find_config(root, None).ok())
             .flatten();
 
-        let agent_credentials = MENU
+        let agent_credentials = menu(cfg)
             .iter()
             .map(|agent| {
-                (
-                    *agent,
-                    container::validate_agent_credentials(*agent).is_ok(),
-                )
+                // `menu(cfg)` only ever returns names `harness::all_names` reports, so
+                // `.resolve` cannot fail here — every entry either has a compiled-in profile
+                // or a config section with a command.
+                let profile = agent.resolve(cfg).expect("every menu entry resolves");
+                let state = if profile.integration.is_none() {
+                    CredentialState::NoIntegration
+                } else if container::validate_agent_credentials(&profile).is_ok() {
+                    CredentialState::Found
+                } else {
+                    CredentialState::NotFound
+                };
+                (agent.clone(), state)
             })
             .collect();
 
@@ -334,24 +387,29 @@ impl DetectedState {
         })
     }
 
-    fn has_credentials(&self, agent: container::KnownAgent) -> bool {
+    /// This agent's row state in the credential column, or `None` if it isn't a menu entry at
+    /// all (unreachable in practice — every agent `ask_agent` renders came from `menu(cfg)`,
+    /// the same source `agent_credentials` was built from).
+    fn credential_state(&self, agent: &AgentName) -> Option<CredentialState> {
         self.agent_credentials
             .iter()
-            .any(|(known, present)| *known == agent && *present)
+            .find(|(known, _)| known == agent)
+            .map(|(_, state)| *state)
     }
 
     /// The agent a prompt pre-selects: whatever is already configured, else the first agent
     /// already authenticated on this host, else claude.
-    fn default_agent(&self) -> container::KnownAgent {
+    fn default_agent(&self) -> AgentName {
         self.effective_agent
             .value
+            .clone()
             .or_else(|| {
                 self.agent_credentials
                     .iter()
-                    .find(|(_, present)| *present)
-                    .map(|(agent, _)| *agent)
+                    .find(|(_, state)| *state == CredentialState::Found)
+                    .map(|(agent, _)| agent.clone())
             })
-            .unwrap_or(container::KnownAgent::Claude)
+            .unwrap_or_else(harness::default_name)
     }
 }
 
@@ -432,8 +490,9 @@ fn read_tracked(path: Option<&Path>) -> TrackedKeys {
 fn resolve_effective(
     project: Option<&Path>,
     global: Option<&Path>,
+    cfg: &config::Config,
 ) -> (
-    Effective<Option<container::KnownAgent>>,
+    Effective<Option<AgentName>>,
     Effective<bool>,
     Effective<config::PaneSide>,
     Effective<config::SplitDirection>,
@@ -443,15 +502,18 @@ fn resolve_effective(
     let global = read_tracked(global);
 
     // The source is the first layer that *sets* the key, even if it sets it to a name that
-    // is not a known agent: that value is still what the file says, doctor still reports it,
-    // and treating the slot as unfilled here is what lets `am setup` repair it (UC3).
+    // is not a configured agent: that value is still what the file says, doctor still reports
+    // it, and treating the slot as unfilled here is what lets `am setup` repair it (UC3). The
+    // menu is dynamic now, so a `defaults.agent` naming a valid, configured custom section
+    // (not just one of the four built-ins) reports as the effective value too — checked
+    // against the merged `cfg`, not just the four built-ins, via `AgentName::parse`.
     let agent = match (project.defaults.agent, global.defaults.agent) {
         (Some(name), _) => Effective {
-            value: container::KnownAgent::parse(&name).ok(),
+            value: AgentName::parse(&name, cfg).ok(),
             source: Source::Project,
         },
         (None, Some(name)) => Effective {
-            value: container::KnownAgent::parse(&name).ok(),
+            value: AgentName::parse(&name, cfg).ok(),
             source: Source::Global,
         },
         (None, None) => Effective {
@@ -566,11 +628,8 @@ fn eof_aborted() -> anyhow::Error {
 /// The write implied by choosing `chosen`, or `None` when the config already resolves that
 /// way. A `Some` is always written to the *project* file, whatever layer the current value
 /// came from.
-fn agent_write(
-    detected: &DetectedState,
-    chosen: container::KnownAgent,
-) -> Option<container::KnownAgent> {
-    (detected.effective_agent.value != Some(chosen)).then_some(chosen)
+fn agent_write(detected: &DetectedState, chosen: AgentName) -> Option<AgentName> {
+    (detected.effective_agent.value.as_ref() != Some(&chosen)).then_some(chosen)
 }
 
 /// The agent question answered without asking, for `--yes`.
@@ -579,7 +638,7 @@ fn agent_write(
 /// would show: the effective value where there is one, and otherwise the first agent already
 /// authenticated on this host. On an already-configured repo that is a no-op; on a fresh one
 /// it is what makes `am setup --yes` produce a config a session can actually start from.
-pub fn default_agent_answer(detected: &DetectedState) -> Option<container::KnownAgent> {
+pub fn default_agent_answer(detected: &DetectedState) -> Option<AgentName> {
     agent_write(detected, detected.default_agent())
 }
 
@@ -593,9 +652,10 @@ pub fn default_agent_answer(detected: &DetectedState) -> Option<container::Known
 pub fn ask_agent(
     io: &mut dyn Io,
     detected: &DetectedState,
-    agent_flag: Option<container::KnownAgent>,
+    agent_flag: Option<AgentName>,
     color: bool,
-) -> Result<Option<container::KnownAgent>> {
+    cfg: &config::Config,
+) -> Result<Option<AgentName>> {
     if let Some(agent) = agent_flag {
         return Ok(agent_write(detected, agent));
     }
@@ -615,23 +675,34 @@ pub fn ask_agent(
         color,
     ));
     io.println("");
-    let width = MENU.iter().map(|a| a.to_string().len()).max().unwrap_or(0) + MENU_NOTE_GAP;
-    for (index, agent) in MENU.iter().enumerate() {
-        // Presence of credentials, never their contents.
-        if detected.has_credentials(*agent) {
-            // `KnownAgent`'s `Display` impl writes its name with a plain `write!`, which does
+    let all = menu(cfg);
+    let width = all.iter().map(|a| a.to_string().len()).max().unwrap_or(0) + MENU_NOTE_GAP;
+    for (index, agent) in all.iter().enumerate() {
+        // Presence of credentials, never their contents — and, for an agent with no
+        // integration at all, that there is nothing here to check in the first place. Three
+        // states, three presentations: `"credentials found"` when checked and present, a
+        // blank when checked and not (still legitimately "not yet"), and an explicit
+        // `"no integration"` so that blank is never confused with this third case.
+        let note = match detected.credential_state(agent) {
+            Some(CredentialState::Found) => Some("credentials found"),
+            Some(CredentialState::NoIntegration) => Some("no integration"),
+            Some(CredentialState::NotFound) | None => None,
+        };
+        match note {
+            // `AgentName`'s `Display` impl writes its name with a plain `write!`, which does
             // not honor a width/alignment request from the caller (that requires `f.pad`,
             // which it doesn't use) — going through an owned `String` first sidesteps that,
             // since `str`'s own `Display` impl does.
-            let name = agent.to_string();
-            io.println(&format!("  [{}] {name:<width$}credentials found", index + 1));
-        } else {
-            io.println(&format!("  [{}] {agent}", index + 1));
+            Some(note) => {
+                let name = agent.to_string();
+                io.println(&format!("  [{}] {name:<width$}{note}", index + 1));
+            }
+            None => io.println(&format!("  [{}] {agent}", index + 1)),
         }
     }
     io.println("");
     io.println(&dim_line(
-        &match detected.effective_agent.value {
+        &match &detected.effective_agent.value {
             Some(agent) => format!("currently: {agent} ({})", detected.effective_agent.source.label()),
             None => "currently: none configured".to_string(),
         },
@@ -642,7 +713,10 @@ pub fn ask_agent(
     // infer the fallback from "currently: none configured" plus "Enter for claude" below;
     // stating it explicitly removes that inference.
     if detected.effective_agent.value.is_none()
-        && !detected.agent_credentials.iter().any(|(_, present)| *present)
+        && !detected
+            .agent_credentials
+            .iter()
+            .any(|(_, state)| *state == CredentialState::Found)
     {
         io.println(&dim_line(
             "nothing found configured or credentialed on this host — defaulting to claude.",
@@ -652,30 +726,36 @@ pub fn ask_agent(
     io.println("");
 
     loop {
-        let Some(answer) = io.prompt_line(&format!("Agent [1-{}] (Enter for {default}): ", MENU.len()))
+        let Some(answer) = io.prompt_line(&format!("Agent [1-{}] (Enter for {default}): ", all.len()))
         else {
             return Err(eof_aborted());
         };
         if answer.is_empty() {
             return Ok(agent_write(detected, default));
         }
-        match parse_agent_answer(&answer) {
+        match parse_agent_answer(&answer, cfg) {
             Some(agent) => return Ok(agent_write(detected, agent)),
+            // Mirrors `am start`'s `AgentNotConfigured`-shaped rejection for the same input:
+            // typing an existing agent's name (built-in or a user's own configured section)
+            // selects it, same as typing "claude" already does today; anything else
+            // re-prompts rather than silently defining a new section on the fly (see
+            // `menu`'s doc comment — listing is not creating).
             None => io.println(&format!(
-                "'{answer}' is not one of 1-{} or an agent name.",
-                MENU.len()
+                "'{answer}' is not one of 1-{} or a configured agent name.",
+                all.len()
             )),
         }
     }
 }
 
 /// A menu number or an agent name — a user who knows what they want should not have to
-/// count list items.
-fn parse_agent_answer(answer: &str) -> Option<container::KnownAgent> {
+/// count list items. A name is accepted whether it is one of the four built-ins or a user's
+/// own configured section: selecting an *existing* entry, never creating a new one.
+fn parse_agent_answer(answer: &str, cfg: &config::Config) -> Option<AgentName> {
     if let Ok(index) = answer.parse::<usize>() {
-        return MENU.get(index.checked_sub(1)?).copied();
+        return menu(cfg).get(index.checked_sub(1)?).cloned();
     }
-    container::KnownAgent::parse(answer).ok()
+    AgentName::parse(answer, cfg).ok()
 }
 
 // ── Question 5: containers ────────────────────────────────────────────────────
@@ -1232,7 +1312,10 @@ const AGENT_EXAMPLE_LINE: &str =
 /// freshly created file read like `defaults.agent` was set twice. `update_project_agent` —
 /// `toml_edit`, preserving everything else about the file — still owns every other case: a
 /// file that already existed, or one created without a known agent yet.
-pub fn render_project_config_skeleton_with_agent(agent: container::KnownAgent) -> String {
+pub fn render_project_config_skeleton_with_agent(agent: &AgentName) -> String {
+    // Called with a borrowed name (`init_project` may still need it afterward for the
+    // "Set defaults.agent" report line), unlike `update_project_agent`, which is always the
+    // last use of an owned answer at its call site.
     let active_line = AGENT_EXAMPLE_LINE
         .trim_start_matches("# ")
         .replacen("\"claude\"", &format!("\"{agent}\""), 1);
@@ -1387,7 +1470,7 @@ pub fn strip_global_tmux_layout_examples(path: &Path, written_keys: &[&str]) -> 
 ///
 /// Returns `Ok(true)` if the file was written, `Ok(false)` if it already said so — in which
 /// case the file is not touched at all, so its mtime does not move.
-pub fn update_project_agent(path: &Path, agent: container::KnownAgent) -> Result<bool> {
+pub fn update_project_agent(path: &Path, agent: AgentName) -> Result<bool> {
     update_key(path, "defaults", "agent", Value::from(agent.to_string()))
 }
 
@@ -1519,7 +1602,7 @@ fn same_value(a: &Value, b: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use container::KnownAgent;
+    use crate::harness::builtin_name as hn;
     use tempfile::TempDir;
 
     // ── Test doubles ──────────────────────────────────────────────────────────
@@ -1555,9 +1638,9 @@ mod tests {
     }
 
     fn detected(
-        agent: Effective<Option<KnownAgent>>,
+        agent: Effective<Option<AgentName>>,
         enabled: Effective<bool>,
-        credentials: &[KnownAgent],
+        credentials: &[AgentName],
         runtimes: Vec<container::RuntimeKind>,
     ) -> DetectedState {
         DetectedState {
@@ -1571,9 +1654,16 @@ mod tests {
             tmux_present: true,
             runtimes_found: runtimes,
             devcontainer: None,
-            agent_credentials: MENU
+            agent_credentials: menu(&config::Config::default())
                 .iter()
-                .map(|agent| (*agent, credentials.contains(agent)))
+                .map(|agent| {
+                    let state = if credentials.contains(agent) {
+                        CredentialState::Found
+                    } else {
+                        CredentialState::NotFound
+                    };
+                    (agent.clone(), state)
+                })
                 .collect(),
             effective_agent: agent,
             effective_container_enabled: enabled,
@@ -1592,7 +1682,7 @@ mod tests {
         }
     }
 
-    fn configured(agent: Option<KnownAgent>, source: Source) -> DetectedState {
+    fn configured(agent: Option<AgentName>, source: Source) -> DetectedState {
         detected(
             Effective {
                 value: agent,
@@ -1611,18 +1701,18 @@ mod tests {
 
     #[test]
     fn empty_input_accepts_the_effective_value_and_writes_nothing() {
-        let state = configured(Some(KnownAgent::Claude), Source::Global);
+        let state = configured(Some(hn("claude")), Source::Global);
         let mut io = ScriptedIo::new(&[""]);
 
-        assert_eq!(ask_agent(&mut io, &state, None, false).unwrap(), None);
+        assert_eq!(ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(), None);
     }
 
     #[test]
     fn the_prompt_names_the_source_of_the_current_value() {
-        let state = configured(Some(KnownAgent::Claude), Source::Global);
+        let state = configured(Some(hn("claude")), Source::Global);
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None, false).unwrap();
+        ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap();
 
         assert!(
             io.output.contains("claude (from your global config)"),
@@ -1644,15 +1734,15 @@ mod tests {
                 value: true,
                 source: Source::CompiledDefault,
             },
-            &[KnownAgent::Gemini],
+            &[hn("gemini")],
             vec![container::RuntimeKind::Podman],
         );
         let mut io = ScriptedIo::new(&[""]);
 
         // Accepting it is a change, because the effective value was "none".
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
-            Some(KnownAgent::Gemini)
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
+            Some(hn("gemini"))
         );
         assert!(io.output.contains("Enter for gemini"), "{}", io.output);
         // Gemini's credentials were found, so the "nothing found anywhere" fallback note —
@@ -1670,8 +1760,8 @@ mod tests {
         let mut io = ScriptedIo::new(&[""]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
-            Some(KnownAgent::Claude)
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
+            Some(hn("claude"))
         );
         assert!(
             io.output.contains("nothing found configured or credentialed on this host"),
@@ -1685,10 +1775,10 @@ mod tests {
         // Gated on effective_agent.value being None, not on credentials alone — a repo that
         // already names an agent is not the "am has no basis for a guess" case, even if that
         // agent's own credentials happen to be missing.
-        let state = configured(Some(KnownAgent::Codex), Source::Project);
+        let state = configured(Some(hn("codex")), Source::Project);
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None, false).unwrap();
+        ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap();
 
         assert!(
             !io.output.contains("defaulting to claude"),
@@ -1701,45 +1791,45 @@ mod tests {
     fn a_different_answer_is_written_even_when_the_current_value_is_inherited() {
         // The trap: read precedence and write target are different things. The value came
         // from the global config; the change still belongs in the project file.
-        let state = configured(Some(KnownAgent::Claude), Source::Global);
+        let state = configured(Some(hn("claude")), Source::Global);
         let mut io = ScriptedIo::new(&["4"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
-            Some(KnownAgent::Codex)
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
+            Some(hn("codex"))
         );
     }
 
     #[test]
     fn an_agent_can_be_answered_by_name() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["copilot"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
-            Some(KnownAgent::Copilot)
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
+            Some(hn("copilot"))
         );
     }
 
     #[test]
     fn invalid_input_re_asks_with_a_reason() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["9", "nope", "2"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
-            Some(KnownAgent::Copilot)
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
+            Some(hn("copilot"))
         );
         assert_eq!(io.output.matches("is not one of").count(), 2, "{}", io.output);
     }
 
     #[test]
     fn zero_is_not_a_menu_item() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["0", "1"]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, None, false).unwrap(),
+            ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap(),
             None,
             "1 is claude, which is already the effective value"
         );
@@ -1747,17 +1837,17 @@ mod tests {
 
     #[test]
     fn end_of_input_aborts_rather_than_looping() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
-        let err = ask_agent(&mut io, &state, None, false).unwrap_err();
+        let err = ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap_err();
 
         assert!(err.to_string().contains("--yes"), "{err}");
     }
 
     #[test]
     fn yes_accepts_the_same_default_an_enter_press_would() {
-        let configured_repo = configured(Some(KnownAgent::Claude), Source::Global);
+        let configured_repo = configured(Some(hn("claude")), Source::Global);
         assert_eq!(default_agent_answer(&configured_repo), None);
 
         let fresh_repo = detected(
@@ -1769,35 +1859,35 @@ mod tests {
                 value: true,
                 source: Source::CompiledDefault,
             },
-            &[KnownAgent::Copilot],
+            &[hn("copilot")],
             vec![container::RuntimeKind::Podman],
         );
         assert_eq!(
             default_agent_answer(&fresh_repo),
-            Some(KnownAgent::Copilot),
+            Some(hn("copilot")),
             "a fresh repo gets the agent this host is already authenticated for"
         );
     }
 
     #[test]
     fn the_agent_flag_answers_without_asking() {
-        let state = configured(Some(KnownAgent::Codex), Source::Project);
+        let state = configured(Some(hn("codex")), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, Some(KnownAgent::Claude), false).unwrap(),
-            Some(KnownAgent::Claude)
+            ask_agent(&mut io, &state, Some(hn("claude")), false, &config::Config::default()).unwrap(),
+            Some(hn("claude"))
         );
         assert!(io.output.is_empty(), "flag should not prompt: {}", io.output);
     }
 
     #[test]
     fn the_agent_flag_matching_the_current_value_writes_nothing() {
-        let state = configured(Some(KnownAgent::Codex), Source::Project);
+        let state = configured(Some(hn("codex")), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
         assert_eq!(
-            ask_agent(&mut io, &state, Some(KnownAgent::Codex), false).unwrap(),
+            ask_agent(&mut io, &state, Some(hn("codex")), false, &config::Config::default()).unwrap(),
             None
         );
     }
@@ -1813,12 +1903,12 @@ mod tests {
                 value: true,
                 source: Source::CompiledDefault,
             },
-            &[KnownAgent::Claude],
+            &[hn("claude")],
             vec![container::RuntimeKind::Podman],
         );
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None, false).unwrap();
+        ask_agent(&mut io, &state, None, false, &config::Config::default()).unwrap();
 
         assert!(io.output.contains("claude    credentials found"), "{}", io.output);
         assert!(!io.output.contains("copilot   credentials found"), "{}", io.output);
@@ -1843,7 +1933,7 @@ mod tests {
 
     #[test]
     fn containers_are_not_asked_about_when_a_runtime_exists() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
         assert_eq!(ask_container_enabled(&mut io, &state, false).unwrap(), None);
@@ -2116,9 +2206,9 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = true\n",
         );
 
-        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global));
+        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global), &config::Config::default());
 
-        assert_eq!(agent.value, Some(KnownAgent::Codex));
+        assert_eq!(agent.value, Some(hn("codex")));
         assert_eq!(agent.source, Source::Project);
         assert!(!enabled.value);
         assert_eq!(enabled.source, Source::Project);
@@ -2134,9 +2224,9 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = false\n",
         );
 
-        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global));
+        let (agent, enabled, ..) = resolve_effective(Some(&project), Some(&global), &config::Config::default());
 
-        assert_eq!(agent.value, Some(KnownAgent::Claude));
+        assert_eq!(agent.value, Some(hn("claude")));
         assert_eq!(agent.source, Source::Global);
         assert!(!enabled.value);
         assert_eq!(enabled.source, Source::Global);
@@ -2144,7 +2234,7 @@ mod tests {
 
     #[test]
     fn compiled_defaults_apply_when_neither_file_sets_anything() {
-        let (agent, enabled, ..) = resolve_effective(None, None);
+        let (agent, enabled, ..) = resolve_effective(None, None, &config::Config::default());
 
         assert_eq!(agent.value, None);
         assert_eq!(agent.source, Source::CompiledDefault);
@@ -2162,7 +2252,7 @@ mod tests {
             render_project_config_skeleton(),
         );
 
-        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None, &config::Config::default());
 
         assert_eq!(agent.source, Source::CompiledDefault);
         assert_eq!(enabled.source, Source::CompiledDefault);
@@ -2174,7 +2264,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = write(tmp.path(), "config.toml", "this is not = = toml\n");
 
-        let (agent, ..) = resolve_effective(Some(&project), None);
+        let (agent, ..) = resolve_effective(Some(&project), None, &config::Config::default());
 
         assert_eq!(agent.source, Source::CompiledDefault);
     }
@@ -2192,7 +2282,7 @@ mod tests {
             "[defaults]\nagent = 5\n[container]\nenabled = true\n",
         );
 
-        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None, &config::Config::default());
 
         assert_eq!(
             agent.source,
@@ -2212,9 +2302,9 @@ mod tests {
             "[defaults]\nagent = \"claude\"\n[container]\nenabled = \"yes please\"\n",
         );
 
-        let (agent, enabled, ..) = resolve_effective(Some(&project), None);
+        let (agent, enabled, ..) = resolve_effective(Some(&project), None, &config::Config::default());
 
-        assert_eq!(agent.value, Some(KnownAgent::Claude));
+        assert_eq!(agent.value, Some(hn("claude")));
         assert_eq!(agent.source, Source::Project);
         assert_eq!(enabled.source, Source::CompiledDefault);
     }
@@ -2226,7 +2316,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = write(tmp.path(), "config.toml", "[defaults]\nagent = \"nope\"\n");
 
-        let (agent, ..) = resolve_effective(Some(&project), None);
+        let (agent, ..) = resolve_effective(Some(&project), None, &config::Config::default());
 
         assert_eq!(agent.value, None);
         assert_eq!(agent.source, Source::Project);
@@ -2272,7 +2362,7 @@ mod tests {
 
     #[test]
     fn the_agent_aware_skeleton_activates_only_the_agent_line() {
-        let text = render_project_config_skeleton_with_agent(KnownAgent::Codex);
+        let text = render_project_config_skeleton_with_agent(&hn("codex"));
 
         assert!(text.contains("agent = \"codex\""), "{text}");
         // Nothing else in the skeleton was touched — same guarantee `render_project_config_
@@ -2294,7 +2384,7 @@ mod tests {
 
     #[test]
     fn the_agent_aware_skeleton_is_valid_toml_that_sets_only_the_agent() {
-        let text = render_project_config_skeleton_with_agent(KnownAgent::Claude);
+        let text = render_project_config_skeleton_with_agent(&hn("claude"));
         let parsed: toml::Table = toml::from_str(&text).expect("skeleton is not valid TOML");
         assert_eq!(
             parsed["defaults"].get("agent").and_then(|v| v.as_str()),
@@ -2304,8 +2394,8 @@ mod tests {
 
     #[test]
     fn the_agent_aware_skeleton_names_each_menu_agent_correctly() {
-        for agent in MENU {
-            let text = render_project_config_skeleton_with_agent(agent);
+        for agent in menu(&config::Config::default()) {
+            let text = render_project_config_skeleton_with_agent(&agent);
             assert!(
                 text.contains(&format!("agent = \"{agent}\"")),
                 "{agent}: {text}"
@@ -2336,7 +2426,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", HAND_EDITED);
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        assert!(update_project_agent(&path, hn("claude")).unwrap());
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, HAND_EDITED.replace("\"codex\"", "\"claude\""));
@@ -2347,7 +2437,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", HAND_EDITED);
 
-        update_project_agent(&path, KnownAgent::Claude).unwrap();
+        update_project_agent(&path, hn("claude")).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -2362,7 +2452,7 @@ custom_key = "left alone"
         let path = write(tmp.path(), "config.toml", HAND_EDITED);
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        assert!(!update_project_agent(&path, KnownAgent::Codex).unwrap());
+        assert!(!update_project_agent(&path, hn("codex")).unwrap());
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
@@ -2377,7 +2467,7 @@ custom_key = "left alone"
             "[defaults]\n# agent = \"claude\"\n\n[tmux]\nsplit = \"vertical\"\n",
         );
 
-        assert!(update_project_agent(&path, KnownAgent::Gemini).unwrap());
+        assert!(update_project_agent(&path, hn("gemini")).unwrap());
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("agent = \"gemini\""), "{after}");
@@ -2392,12 +2482,12 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", "[tmux]\nsplit_percent = 30\n");
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        assert!(update_project_agent(&path, hn("claude")).unwrap());
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("split_percent = 30"), "{after}");
-        let (agent, ..) = resolve_effective(Some(&path), None);
-        assert_eq!(agent.value, Some(KnownAgent::Claude));
+        let (agent, ..) = resolve_effective(Some(&path), None, &config::Config::default());
+        assert_eq!(agent.value, Some(hn("claude")));
     }
 
     #[test]
@@ -2405,7 +2495,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", "defaults.agent = \"codex\"\n");
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        assert!(update_project_agent(&path, hn("claude")).unwrap());
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2450,7 +2540,7 @@ custom_key = "left alone"
 
         assert!(update_global_container_enabled(&path, false).unwrap());
 
-        let (_, enabled, ..) = resolve_effective(None, Some(&path));
+        let (_, enabled, ..) = resolve_effective(None, Some(&path), &config::Config::default());
         assert!(!enabled.value);
         assert_eq!(enabled.source, Source::Global);
     }
@@ -2473,7 +2563,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", "defaults = 3\n");
 
-        let err = update_project_agent(&path, KnownAgent::Claude).unwrap_err();
+        let err = update_project_agent(&path, hn("claude")).unwrap_err();
 
         assert!(err.to_string().contains("not a table"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "defaults = 3\n");
@@ -2489,7 +2579,7 @@ custom_key = "left alone"
         let content = "[defaults.agent]\nfoo = \"bar\"\n";
         let path = write(tmp.path(), "config.toml", content);
 
-        let err = update_project_agent(&path, KnownAgent::Claude).unwrap_err();
+        let err = update_project_agent(&path, hn("claude")).unwrap_err();
 
         assert!(err.to_string().contains("defaults.agent"), "{err}");
         assert!(err.to_string().contains("not a plain value"), "{err}");
@@ -2509,7 +2599,7 @@ custom_key = "left alone"
         let content = "[defaults]\nagent = { name = \"claude\", extra = \"keep-me\" }\n";
         let path = write(tmp.path(), "config.toml", content);
 
-        let err = update_project_agent(&path, KnownAgent::Claude).unwrap_err();
+        let err = update_project_agent(&path, hn("claude")).unwrap_err();
 
         assert!(err.to_string().contains("defaults.agent"), "{err}");
         assert!(err.to_string().contains("not a plain value"), "{err}");
@@ -2526,7 +2616,7 @@ custom_key = "left alone"
         let content = "[defaults]\nagent = [\"claude\", \"keep-me-too\"]\n";
         let path = write(tmp.path(), "config.toml", content);
 
-        let err = update_project_agent(&path, KnownAgent::Claude).unwrap_err();
+        let err = update_project_agent(&path, hn("claude")).unwrap_err();
 
         assert!(err.to_string().contains("defaults.agent"), "{err}");
         assert!(err.to_string().contains("not a plain value"), "{err}");
@@ -2556,7 +2646,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", "[defaults\nagent =\n");
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).is_err());
+        assert!(update_project_agent(&path, hn("claude")).is_err());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "[defaults\nagent =\n"
@@ -2588,7 +2678,7 @@ custom_key = "left alone"
         let tmp = TempDir::new().unwrap();
         let path = write(tmp.path(), "config.toml", render_project_config_skeleton());
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        assert!(update_project_agent(&path, hn("claude")).unwrap());
         strip_project_agent_example(&path).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
@@ -2608,7 +2698,7 @@ custom_key = "left alone"
         let path = write(
             tmp.path(),
             "config.toml",
-            &render_project_config_skeleton_with_agent(KnownAgent::Claude),
+            &render_project_config_skeleton_with_agent(&hn("claude")),
         );
         let before = std::fs::read_to_string(&path).unwrap();
 
@@ -2710,7 +2800,7 @@ custom_key = "left alone"
         let path = tmp.path().join("config.toml");
         config::write_defaults(&path).unwrap();
 
-        assert!(update_project_agent(&path, KnownAgent::Claude).unwrap());
+        assert!(update_project_agent(&path, hn("claude")).unwrap());
         strip_project_agent_example(&path).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
@@ -2832,19 +2922,172 @@ custom_key = "left alone"
 
     #[test]
     fn every_menu_entry_round_trips_through_its_own_name() {
-        for agent in MENU {
-            assert_eq!(KnownAgent::parse(&agent.to_string()).unwrap(), agent);
+        let cfg = config::Config::default();
+        for agent in menu(&cfg) {
+            assert_eq!(AgentName::parse(&agent.to_string(), &cfg).unwrap(), agent);
         }
     }
 
     #[test]
     fn menu_answers_are_accepted_as_numbers_or_names() {
-        assert_eq!(parse_agent_answer("1"), Some(KnownAgent::Claude));
-        assert_eq!(parse_agent_answer("4"), Some(KnownAgent::Codex));
-        assert_eq!(parse_agent_answer("codex"), Some(KnownAgent::Codex));
-        assert_eq!(parse_agent_answer("5"), None);
-        assert_eq!(parse_agent_answer("0"), None);
-        assert_eq!(parse_agent_answer(""), None);
+        assert_eq!(parse_agent_answer("1", &config::Config::default()), Some(hn("claude")));
+        assert_eq!(parse_agent_answer("4", &config::Config::default()), Some(hn("codex")));
+        assert_eq!(parse_agent_answer("codex", &config::Config::default()), Some(hn("codex")));
+        assert_eq!(parse_agent_answer("5", &config::Config::default()), None);
+        assert_eq!(parse_agent_answer("0", &config::Config::default()), None);
+        assert_eq!(parse_agent_answer("", &config::Config::default()), None);
+    }
+
+    // ── The dynamic menu (custom agents) ────────────────────────────────────────
+    //
+    // "if we don't list custom agents it will be filed as a bug by users" — the menu must
+    // list every configured agent, not just the four built-ins, with a deterministic order
+    // and an honest credential note per row.
+
+    fn cfg_with_agent(name: &str, settings: config::AgentSettings) -> config::Config {
+        let mut cfg = config::Config::default();
+        cfg.agents.insert(name.to_string(), settings);
+        cfg
+    }
+
+    #[test]
+    fn a_configured_custom_agent_is_listed_after_the_builtins() {
+        let cfg = cfg_with_agent(
+            "aider",
+            config::AgentSettings {
+                command: Some(vec!["aider".to_string()]),
+                ..config::AgentSettings::default()
+            },
+        );
+        let names: Vec<String> = menu(&cfg).iter().map(|a| a.to_string()).collect();
+        assert_eq!(names, vec!["claude", "copilot", "gemini", "codex", "aider"]);
+    }
+
+    #[test]
+    fn multiple_custom_agents_sort_alphabetically_regardless_of_declaration_order() {
+        // Insertion order into the HashMap must not leak into the menu — inserting "zebra"
+        // before "aider" and still getting them back alphabetically is the point.
+        let mut cfg = config::Config::default();
+        for name in ["zebra", "aider", "mid"] {
+            cfg.agents.insert(
+                name.to_string(),
+                config::AgentSettings {
+                    command: Some(vec![name.to_string()]),
+                    ..config::AgentSettings::default()
+                },
+            );
+        }
+        let names: Vec<String> = menu(&cfg).iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            names,
+            vec!["claude", "copilot", "gemini", "codex", "aider", "mid", "zebra"]
+        );
+    }
+
+    #[test]
+    fn menu_order_is_identical_across_repeated_calls() {
+        // Same config, called twice — a `HashMap`'s iteration order is randomised per
+        // process but stable within one, so this alone would not catch a regression; it
+        // documents the determinism guarantee the sort exists to provide, alongside the two
+        // tests above that actually exercise a non-alphabetical insertion order.
+        let cfg = cfg_with_agent(
+            "aider",
+            config::AgentSettings {
+                command: Some(vec!["aider".to_string()]),
+                ..config::AgentSettings::default()
+            },
+        );
+        let first: Vec<String> = menu(&cfg).iter().map(|a| a.to_string()).collect();
+        let second: Vec<String> = menu(&cfg).iter().map(|a| a.to_string()).collect();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn credential_state_is_no_integration_for_a_custom_agent_that_declares_none() {
+        let cfg = cfg_with_agent(
+            "aider",
+            config::AgentSettings {
+                command: Some(vec!["aider".to_string()]),
+                ..config::AgentSettings::default()
+            },
+        );
+        let detected = DetectedState::gather(None, &cfg).unwrap();
+        let aider = AgentName::parse("aider", &cfg).unwrap();
+        assert_eq!(
+            detected.credential_state(&aider),
+            Some(CredentialState::NoIntegration)
+        );
+        // Distinct from "checked, not found" — the blank state a real preset shows when its
+        // credentials are absent — so the two are never confusable in the rendered menu.
+        assert_ne!(
+            detected.credential_state(&aider),
+            Some(CredentialState::NotFound)
+        );
+    }
+
+    #[test]
+    fn credential_state_is_not_found_for_a_custom_agent_with_unmet_requirements() {
+        let cfg = cfg_with_agent(
+            "needs-token",
+            config::AgentSettings {
+                command: Some(vec!["needs-token".to_string()]),
+                integration: Some(config::IntegrationSettings {
+                    requires_any: vec![vec![config::RequirementSettings {
+                        env: Some("SOME_TOKEN_NEVER_SET_BY_THIS_SUITE".to_string()),
+                        path: None,
+                    }]],
+                    ..config::IntegrationSettings::default()
+                }),
+                ..config::AgentSettings::default()
+            },
+        );
+        let detected = DetectedState::gather(None, &cfg).unwrap();
+        let needs_token = AgentName::parse("needs-token", &cfg).unwrap();
+        assert_eq!(
+            detected.credential_state(&needs_token),
+            Some(CredentialState::NotFound)
+        );
+    }
+
+    #[test]
+    fn ask_agent_renders_no_integration_for_a_custom_agent_alongside_a_built_in_row() {
+        let cfg = cfg_with_agent(
+            "aider",
+            config::AgentSettings {
+                command: Some(vec!["aider".to_string()]),
+                ..config::AgentSettings::default()
+            },
+        );
+        let detected = DetectedState::gather(None, &cfg).unwrap();
+        let mut io = ScriptedIo::new(&["1"]);
+        ask_agent(&mut io, &detected, None, false, &cfg).unwrap();
+        assert!(io.output.contains("[5] aider"), "{}", io.output);
+        assert!(io.output.contains("no integration"), "{}", io.output);
+        // "no integration" must never appear next to a built-in, which always has one.
+        assert!(!io.output.contains("claude   no integration"), "{}", io.output);
+    }
+
+    #[test]
+    fn parse_agent_answer_accepts_a_configured_custom_name_by_number_or_name() {
+        let cfg = cfg_with_agent(
+            "aider",
+            config::AgentSettings {
+                command: Some(vec!["aider".to_string()]),
+                ..config::AgentSettings::default()
+            },
+        );
+        let aider = AgentName::parse("aider", &cfg).unwrap();
+        assert_eq!(parse_agent_answer("5", &cfg), Some(aider.clone()));
+        assert_eq!(parse_agent_answer("aider", &cfg), Some(aider));
+    }
+
+    #[test]
+    fn parse_agent_answer_rejects_a_name_matching_nothing_configured() {
+        // Selecting, never creating (see `menu`'s doc comment): a name matching no configured
+        // agent is rejected the same way a typo or an out-of-range number already is —
+        // never silently defines a new section.
+        let cfg = config::Config::default();
+        assert_eq!(parse_agent_answer("nope-not-configured", &cfg), None);
     }
 
     // ── The write-target line ─────────────────────────────────────────────────
@@ -2929,10 +3172,10 @@ custom_key = "left alone"
         // The pty/color hazard this covers: `ScriptedIo`-based tests never see ANSI codes
         // unless `color: true` is passed explicitly, the same way the interactive cucumber
         // scenarios only see them because a real pty makes `color::enabled` true there too.
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&[""]);
 
-        ask_agent(&mut io, &state, None, true).unwrap();
+        ask_agent(&mut io, &state, None, true, &config::Config::default()).unwrap();
 
         assert!(
             io.output.contains("\x1b[2m  just this repo; saved to"),
@@ -2954,7 +3197,7 @@ custom_key = "left alone"
         split_percent: u8,
         source: Source,
     ) -> DetectedState {
-        let mut state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut state = configured(Some(hn("claude")), Source::Project);
         state.effective_tmux_agent_pane = Effective {
             value: agent_pane,
             source,
@@ -2969,7 +3212,7 @@ custom_key = "left alone"
 
     #[test]
     fn layout_is_not_asked_about_without_a_global_config_to_write_to() {
-        let mut state = configured(Some(KnownAgent::Claude), Source::Project);
+        let mut state = configured(Some(hn("claude")), Source::Project);
         state.global_config_path = None;
         let mut io = ScriptedIo::new(&[]);
 
@@ -3240,9 +3483,9 @@ custom_key = "left alone"
 
     #[test]
     fn every_top_level_question_opens_with_a_blank_line() {
-        let agent_state = configured(Some(KnownAgent::Claude), Source::Project);
+        let agent_state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&[""]);
-        ask_agent(&mut io, &agent_state, None, false).unwrap();
+        ask_agent(&mut io, &agent_state, None, false, &config::Config::default()).unwrap();
         assert!(
             io.output.starts_with("\nWhich agent do you use?\n"),
             "{}",
@@ -3304,7 +3547,7 @@ custom_key = "left alone"
 
     #[test]
     fn invalid_customize_direction_re_asks() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["5", "9", "1", "", "", "y"]);
 
         ask_layout(&mut io, &state, false).unwrap();
@@ -3314,7 +3557,7 @@ custom_key = "left alone"
 
     #[test]
     fn invalid_customize_percent_re_asks() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["5", "", "", "150", "50", "y"]);
 
         ask_layout(&mut io, &state, false).unwrap();
@@ -3328,7 +3571,7 @@ custom_key = "left alone"
 
     #[test]
     fn end_of_input_aborts_the_layout_question() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&[]);
 
         assert!(ask_layout(&mut io, &state, false).is_err());
@@ -3336,7 +3579,7 @@ custom_key = "left alone"
 
     #[test]
     fn end_of_input_aborts_the_customize_direction_question() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["5"]);
 
         assert!(ask_layout(&mut io, &state, false).is_err());
@@ -3344,7 +3587,7 @@ custom_key = "left alone"
 
     #[test]
     fn end_of_input_aborts_the_customize_pane_side_question() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["5", ""]);
 
         assert!(ask_layout(&mut io, &state, false).is_err());
@@ -3352,7 +3595,7 @@ custom_key = "left alone"
 
     #[test]
     fn end_of_input_aborts_the_customize_percent_question() {
-        let state = configured(Some(KnownAgent::Claude), Source::Project);
+        let state = configured(Some(hn("claude")), Source::Project);
         let mut io = ScriptedIo::new(&["5", "", ""]);
 
         assert!(ask_layout(&mut io, &state, false).is_err());
@@ -3521,7 +3764,7 @@ custom_key = "left alone"
         .unwrap();
 
         assert_eq!(written, vec!["agent_pane", "split", "split_percent"]);
-        let (_, _, agent_pane, split, split_percent) = resolve_effective(None, Some(&path));
+        let (_, _, agent_pane, split, split_percent) = resolve_effective(None, Some(&path), &config::Config::default());
         assert_eq!(agent_pane.value, config::PaneSide::Right);
         assert_eq!(split.value, config::SplitDirection::Vertical);
         assert_eq!(split_percent.value, 80);

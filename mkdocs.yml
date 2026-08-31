@@ -50,6 +50,7 @@ nav:
     - GitHub Copilot: guides/github-copilot.md
     - Gemini: guides/gemini.md
     - Codex: guides/codex.md
+    - Custom Agents: guides/custom-agents.md
     - Session Lifecycle: guides/session-lifecycle.md
     - Custom Images: guides/custom-images.md
     - Dev Containers: guides/devcontainers.md

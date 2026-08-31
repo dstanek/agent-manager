@@ -157,7 +157,9 @@ am start feat --team --agent claude   # future
 
 ## Agent integrations
 
-`am` has built-in **agent integrations** for the most popular coding agents. Activating an integration (via `defaults.agent` in config or `--agent` on the command line) tells `am` to automatically provide that agent's credentials to the container at runtime, either by mounting host paths or by injecting required environment variables. The agent selection also determines the container image — `am` ships with built-in image defaults for `claude` and `copilot`, and you can configure images for any agent under `[agents.<name>]`.
+`--agent <name>` (and `defaults.agent`) names an entry in `am`'s agent table — a `[agents.<name>]` section that carries everything `am` knows about that agent: the command it launches, and an optional **integration**, which tells `am` how to make that command authenticated inside the container (mounting host credential paths, injecting environment variables, or both). Activating an agent also determines the container image — `am` ships with built-in image defaults for `claude` and `copilot`, and you can configure images for any agent under `[agents.<name>]`.
+
+`am` ships with four built-in agents, fully defined this same way:
 
 | Agent | What gets mounted | Status |
 |---|---|---|
@@ -165,6 +167,12 @@ am start feat --team --agent claude   # future
 | `copilot` | `~/.config/gh` and `~/.config/github-copilot` → `/home/am/...` (read-only) | ✓ Supported |
 | `gemini` | `~/.gemini` → `/home/am/.gemini` (read-only) | ✓ Supported |
 | `codex` | _(env-var only — no filesystem mount)_ | ✓ Supported |
+
+The four built-ins are not privileged over anything you can define yourself: a `[agents.<name>]`
+section for a tool `am` was never compiled with (`aider`, an in-house agent, anything with a
+CLI) is a complete agent definition in its own right, selectable with `--agent` exactly like a
+built-in. See the [configuration reference](reference/configuration.md#custom-agents) for the
+full shape and a worked example.
 
 Credentials are **never baked into the container image** — they come from your host at session start. This means you can share a container image across machines or teammates without embedding any secrets.
 

@@ -541,56 +541,70 @@ recommendations we *agreed* with; the "get back to basics" theme here means
 
 ### Decouple command, integration, and image (highest priority)
 
-Today a single `--agent` string means three things at once: the command that
-launches (`main.rs` appends it as the container CMD), the auth preset
-(`container.rs::resolve_agent_auth`), and the image (`config::resolve_image` via
-`[agents.<name>]`). `KnownAgent::parse` rejects any name outside
-`claude|copilot|gemini|codex` — even with `--no-container` — so there is no path
-to "run this image, mount these creds, exec this command."
+**Done 2026-08-31**, together with the *Custom-harness fast path* below — the two collapsed into
+one change, since neither is useful alone.
 
-- [ ] Introduce independent concepts: **command** (what to exec), **integration**
-      (which auth preset, if any), **image/profile** (runtime environment).
-- [ ] Keep the current `--agent claude` shorthand as a preset that expands into
-      the three, so nothing breaks for existing users.
-- [ ] Make integration optional: an unknown/custom command with no preset should
-      be allowed (this is what makes the tool genuinely "harness-agnostic").
-Note: this was originally recorded as blocking **Dev Container Support**, and it
-turned out not to be. Devcontainer mode simply never resolves an `am` image —
-`config::resolve_image` is now called from exactly one place, `plan_image` — so
-`--agent claude` already stops implying an image on that path. The decoupling is
-still worth doing for the custom-harness fast path below; it is not a prerequisite
-for anything shipped.
+`--agent <name>` now names an entry in `[agents.<name>]`, and that entry carries everything `am`
+knows about the agent: `command`, `integration`, `image`, `devcontainer_feature`, `auto_flags`,
+`resume`. The four built-ins are the same structure with compiled-in values, so a user-defined
+agent is first-class rather than second-tier. `KnownAgent` is **gone** — the nine `match
+KnownAgent` sites in `container.rs` became data lookups against a `Harness` struct
+(`src/harness.rs`).
+
+`integration` is itself user-definable data — `mounts`, `env`, `requires_any` (an OR of ANDs,
+which is what Codex's "API key *or* interactive sign-in" needs), `alternatives_message`, `hint`
+— not a reference to one of four compiled-in presets. A user can describe a genuinely new
+credential integration for a genuinely new tool entirely in config. That is what makes this a
+real decoupling rather than a wider set of built-ins.
+
+**No new CLI flags.** A one-off custom agent means adding a config section first. Considered and
+rejected: `--cmd`/`--image` (built, on the branch described below, then dropped). Every
+implementation that tried the flag route hit the same three edge cases — `--image` implying a
+container and needing a hard error against `--no-container`, `--cmd` needing merge semantics
+against `--agent`, `--auto` on an agent with no `auto_flags` needing a warning rather than the
+planned error. A config section has none of them, and it is committable and shareable, which a
+flag retyped per invocation is not.
+
+**How this was actually built, recorded because the process failed in an instructive way.** This
+entry and the one below were treated as unstarted and designed from scratch — three spec drafts
+and three adversarial review passes, producing `specs/harness-decoupling.md`. Only when trying to
+push did anyone notice the local `harness-profiles` bookmark, dated 2026-08-18/20, which already
+*implemented* both items. `BACKLOG.md` is not a reliable record of what has been built: work lands
+on local bookmarks that are never pushed and never reflected back here. **Check `jj bookmark list
+--all-remotes` before treating an entry as unstarted.**
+
+The two designs were then compared properly, and the existing implementation won on the point
+that mattered: it persists the agent *name* only and re-resolves once per use, feeding one
+resolved value to both the credential check and the container plan. The from-scratch design spent
+three review rounds chasing variants of the bug that not doing this causes. Its implementation was
+adopted, with two of its product decisions rejected — see below.
+
+### Rejected from `harness-profiles`: the agent → harness rename
+
+The branch renamed the user-facing concept from `agent` to `harness` as a hard break, with no
+deprecation aliases — old spellings detected only to be refused.
+
+Rejected, and the reasoning is worth keeping because it will come up again. The rename handles
+*new binary reads old config* well: a loud, specific error naming every rename. But *old binary
+reads new config* — the direction that matters for a file this project deliberately commits and
+shares — fails **silently**: `[harnesses.*]` lands in the unknown-key catch-all as one opaque
+warning, and the old binary then runs with only its compiled-in defaults, ignoring every override
+the team wrote. If `defaults.harness` was the only thing selecting an agent, `am start` runs with
+no agent at all and says nothing.
+
+That is a larger blast radius and a worse failure mode than the thing it replaced, for a change
+with no behavioural payoff. It is also the opposite of the call this project already made for this
+exact file when it rejected `deny_unknown_fields` (see "Decided against") — the same argument
+applied inconsistently within one codebase. `harness` survives as internal Rust vocabulary; the
+wire format stays `agents`.
 
 ### Rename `KnownAgent` to `KnownIntegration`
 
-**Scheduled** (decided 2026-08-25): do it as soon as
-[`specs/harness-decoupling.md`](specs/harness-decoupling.md) is implemented, as its own PR.
-
-After the decoupling, the type unambiguously means "which built-in auth preset" and never
-"which command to launch" — it becomes the *value* of an `integration` key rather than the
-thing `--agent` parses into. The name then actively misleads, and the longer it survives past
-the decoupling the more new code gets written against the wrong mental model.
-
-Two constraints on how, both deliberate:
-
-- **Not in the decoupling PR.** It is a mechanical, behaviour-preserving rename across ~217
-  references (`container.rs` 94, `onboarding.rs` 86, `main.rs` 34, `doctor.rs` 2, `cli.rs` 1).
-  Bundled with a few hundred lines of real logic change it would make the logic diff
-  unreviewable — a renamed-but-unchanged 94-site file reviews exactly like an unchanged one,
-  badly.
-- **Compiler-verified and nothing else.** No behaviour change, no signature change beyond the
-  type's name, no reordering. If the rename PR wants to fix anything, that is a different PR.
-
-- [ ] Rename the type, its `parse`/`Display` impls, and every reference
-- [ ] Update doc comments that describe it as "the agent" rather than "the integration"
-- [ ] Confirm `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings` are
-      clean, and that the diff contains no change other than the rename
-
-### Custom-harness fast path
-
-Deliver the mission promise ("quickly manage isolated AI harnesses") for
-arbitrary tools, e.g. `am start idea --image my-image --cmd my-agent` with no
-built-in integration required. Depends on the decoupling above.
+**Moot 2026-08-31 — the type no longer exists.** This was scheduled as a follow-up PR on the
+assumption that `KnownAgent` would survive the decoupling as the value of an `integration` key.
+The design that actually shipped deletes the enum outright: the four built-ins became data on a
+`Harness` struct, and an integration is user-definable config rather than a closed set of four.
+Nothing to rename.
 
 ### `am doctor` readiness check
 

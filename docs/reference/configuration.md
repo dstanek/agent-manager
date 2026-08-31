@@ -160,7 +160,7 @@ The `am start` command accepts flags that act as the highest-precedence override
 
 | Flag | Description |
 |---|---|
-| `--agent <AGENT>` | Override the agent command for this session only. Must be a known agent integration: `claude`, `copilot`, `gemini`, `codex`. |
+| `--agent <AGENT>` | Override the agent for this session only. Must name an entry in the agent table — one of the four built-ins, or a `[agents.<name>]` section defined in config. An unknown name is rejected with the full list of configured agents. |
 | `--no-container` | Disable container isolation for this session. The agent runs directly in the tmux pane. |
 
 `am attach` accepts one flag of its own, overriding `[attach].resume` for a single invocation:
@@ -187,12 +187,22 @@ Top-level defaults that apply across all sessions unless overridden.
 
 ### `[agents.<name>]`
 
-Per-agent configuration. `am` ships with compiled-in image defaults for `claude` and `copilot`; define an entry here to override them or to add images for other agents.
+Everything `am` knows about one agent: the command it launches, the credentials it needs, and
+the environment it runs in. `--agent <name>` (and `defaults.agent`) names an entry in this
+table — there is no other list of valid agents. `am` ships four built-in entries (`claude`,
+`copilot`, `gemini`, `codex`) with compiled-in commands, flags, and credential integrations;
+`[agents.<name>]` *overlays* a built-in field by field, or, for a name `am` was never compiled
+with, defines a new agent from scratch. A user-defined agent is first-class: once
+`[agents.aider]` exists, `am start feat --agent aider` works exactly like any built-in.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `image` | string | see below | Container image to use when this agent is selected (used in `container.mode = "image"`) |
 | `devcontainer_feature` | string | see below | Dev Container Feature that installs this agent, injected at build time in devcontainer mode |
+| `command` | list of strings | inherited from the built-in, if any | argv to launch; the first element is the binary. **Required** for an agent with no built-in to inherit one from — resolving an entry with no command anywhere fails with an error naming the missing key. |
+| `auto_flags` | list of strings | inherited from the built-in, if any | Flags appended to `command` under `am start --auto`. An explicit `auto_flags = []` means "this agent has no autonomous mode" — a deliberate value, distinct from leaving the key unset (which inherits the built-in's flags, or nothing for an agent with no built-in). |
+| `resume` | list of strings | inherited from the built-in, if any | argv `am attach` uses to resume the previous conversation instead of starting fresh (see the `[attach]` section below). Omit for an agent that has no way to resume. |
+| `integration` | table | inherited from the built-in, if any | Credential wiring — see below. Absent means "inherit the built-in's, if any"; present **replaces** the built-in's integration wholesale, field by field within the table but not merged against it — a half-overridden set of credential rules is not something anyone could reason about. |
 
 **Compiled-in defaults:**
 
@@ -202,7 +212,9 @@ Per-agent configuration. `am` ships with compiled-in image defaults for `claude`
 | `copilot` | `ghcr.io/dstanek/am-copilot-minimal:latest` | — |
 
 Only Claude Code publishes an official Feature today. Agents without one fall through to the
-`bootstrap` install path in devcontainer mode.
+`bootstrap` install path in devcontainer mode. `gemini` and `codex` have compiled-in commands
+and credential integrations but no default image — set `[agents.gemini].image` (or
+`[agents.codex].image`) if you use `container.mode = "image"` with either.
 
 Example — override the claude image and add a gemini entry:
 
@@ -215,6 +227,118 @@ image = "my-org/am-gemini:latest"
 ```
 
 Agent entries are **merged** across config layers: global config entries extend the compiled-in defaults, and project config entries extend the global ones. Only keys you set in a later layer are overridden — other agents keep their values from earlier layers.
+
+#### Custom agents
+
+An agent `am` was never compiled with needs only `command`; everything else is optional. This
+defines a minimal one with no credential handling at all — a perfectly good agent, not a
+degraded one:
+
+```toml
+[agents.plain]
+command = ["plain-agent"]
+```
+
+A fuller example, giving `aider` an autonomous-mode flag, a resume flag, and a credential check
+(verified against the actual TOML parser — see the note at the end of this section):
+
+```toml
+[agents.aider]
+command = ["aider", "--model", "sonnet"]
+auto_flags = ["--yes-always"]
+resume = ["--restore-chat-history"]
+
+[agents.aider.integration]
+env = ["ANTHROPIC_API_KEY"]
+hint = "export ANTHROPIC_API_KEY=sk-..."
+requires_any = [[{ env = "ANTHROPIC_API_KEY" }]]
+
+[[agents.aider.integration.mounts]]
+host = "~/.aider.conf.yml"
+container = "~/.aider.conf.yml"
+mode = "rw"
+required = false
+only_if_exists = true
+```
+
+With this in `.am/config.toml`, `am start feat --agent aider` launches `aider --model sonnet`
+(or with `--yes-always` appended under `--auto`), and `am doctor`/`am setup` report its
+credentials as present once `ANTHROPIC_API_KEY` is set on the host.
+
+Once `[agents.<name>]` exists, the name is usable everywhere an agent name is: `--agent`,
+`defaults.agent`, `am setup`'s agent menu (listed after the four built-ins, sorted
+alphabetically), and `am doctor`'s report. There are no CLI flags for defining a one-off agent
+inline (no `--cmd`, no `--image`) — a custom agent is deliberately something you add to config
+and commit, not something you retype per invocation.
+
+##### `[agents.<name>.integration]`
+
+How an agent authenticates. Omit the table entirely for an agent that needs no credentials from
+the host — that is a first-class outcome (`am doctor` reports `credentials: none required`, not
+a failure). When present, it replaces a built-in's integration wholesale rather than merging
+into it.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mounts` | array of tables | `[]` | Host paths to mount into the container — see below |
+| `env` | list of strings | `[]` | Host environment variables forwarded into the container when set and non-empty |
+| `requires_any` | array of arrays of requirement tables | `[]` | What `am doctor`/`am setup` check to decide the agent is authenticated — see below |
+| `hint` | string | `""` | Shown by `am doctor` when none of `requires_any` is satisfied — the concrete fix, e.g. a sign-in command |
+
+**`mounts`** — each entry is a `[[agents.<name>.integration.mounts]]` table:
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `host` | string | — | Host path: `~/...` (expanded against the *reader's* home at use time, not load time — the config is meant to be committed) or an absolute path starting with `/`. Anything else is rejected at load, since a relative path would resolve against whatever directory `am` happened to run in. |
+| `container` | string | — | Path inside the container. A leading `~/` means the container's home, which is not necessarily the host's — a devcontainer's `remoteUser` may be `root`. |
+| `mode` | string | `"ro"` | `"ro"` or `"rw"`. Anything else is rejected at load. |
+| `required` | boolean | `true` | Whether `am doctor`/preflight fail when the host path is missing. Defaults to `true` — a mount someone bothered to declare is presumed to matter. |
+| `only_if_exists` | boolean | `false` | Skip the mount entirely (rather than let the container runtime create it root-owned on the host) when the host path does not exist. |
+
+**`requires_any`** — an OR of ANDs: `am` considers the agent authenticated when *at least one*
+inner array is *fully* satisfied. Most agents need only one way to sign in, expressed as a
+single one-element outer list:
+
+```toml
+requires_any = [[{ path = "~/.aider/auth.json" }]]
+```
+
+An agent with two independent ways to authenticate — an API key *or* an interactive sign-in,
+the way Codex's built-in does it — adds a second inner array; either one being fully satisfied
+is enough:
+
+```toml
+requires_any = [
+  [{ path = "~/.codex/auth.json" }],
+  [{ env = "OPENAI_API_KEY" }],
+]
+```
+
+An inner array with more than one entry means all of them are required together (the AND):
+
+```toml
+requires_any = [[{ env = "MY_TOKEN" }, { env = "MY_ORG" }]]  # both MY_TOKEN and MY_ORG must be set
+```
+
+Each requirement table takes exactly one of `path` or `env` — never both, never neither:
+
+| Key | Type | Description |
+|---|---|---|
+| `path` | string | Satisfied when this host path exists. Same `~/...`/absolute rule as a mount's `host`. |
+| `env` | string | Satisfied when this environment variable is set on the host and non-empty. |
+
+When `requires_any` has more than one inner array, `am doctor`'s failure message reports "none
+of its alternatives is present" rather than naming a single missing path — with two independent
+ways to authenticate there is no one culprit to point at, so `hint` is what carries the actual
+fix.
+
+!!! note "Verified against the code"
+    Every TOML example on this page was checked by loading it with the real `am` binary
+    (`am doctor` against a scratch repo) rather than written from the schema alone — including
+    the `requires_any = [[{ env = "..." }]]` nested-array-of-inline-tables syntax, the
+    `[[agents.<name>.integration.mounts]]` array-of-tables form, and the OR-of-ANDs semantics
+    (`am doctor` reporting failure with only one half of a two-requirement AND group satisfied,
+    and success once both are).
 
 ### `[tmux]`
 

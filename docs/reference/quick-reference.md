@@ -96,6 +96,27 @@ agent = "claude"
 image = "ghcr.io/myorg/my-claude:latest"
 ```
 
+### Define a Custom Agent
+
+`--agent` isn't limited to the four built-ins (`claude`, `copilot`, `gemini`, `codex`) — add a
+`[agents.<name>]` section for any other CLI and use it the same way:
+
+```toml
+[agents.aider]
+command = ["aider", "--model", "sonnet"]
+
+[agents.aider.integration]
+env = ["ANTHROPIC_API_KEY"]
+requires_any = [[{ env = "ANTHROPIC_API_KEY" }]]
+```
+
+```bash
+am start feat --agent aider
+```
+
+See the [custom agents guide](../guides/custom-agents.md) and the
+[configuration reference](configuration.md#custom-agents) for the full shape.
+
 ### Adjust Tmux Layout
 
 ```toml
@@ -152,7 +173,7 @@ Valid slugs: **1–40 characters**, lowercase letters (a–z), digits (0–9), h
 | **Worktree** | Separate git checkout at `.am/worktrees/<slug>` |
 | **Agent Pane** | Left/right side of split tmux window where agent runs |
 | **Shell Pane** | Other side of split window for your shell commands |
-| **Integration** | Built-in support for specific agents (Claude, Copilot) |
+| **Integration** | An agent's credential wiring — mounts, env vars, and how to check it's authenticated. Built in for Claude, Copilot, Gemini, and Codex; definable for any other agent under `[agents.<name>].integration` |
 
 ---
 

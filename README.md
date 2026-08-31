@@ -82,7 +82,8 @@ for every option.
 
 ## Supported agents
 
-Each agent has an auth preset that provides credentials to the container at runtime.
+`--agent <name>` names an entry in `am`'s agent table (`[agents.<name>]` in config), not a
+fixed list — four are built in, each with a compiled-in command and credential preset:
 
 | Agent    | `--agent` value | Credentials provided                                            |
 |----------|-----------------|-----------------------------------------------------------------|
@@ -91,7 +92,12 @@ Each agent has an auth preset that provides credentials to the container at runt
 | Google Gemini | `gemini`   | mounts `~/.gemini`                                              |
 | OpenAI Codex  | `codex`    | passes `OPENAI_API_KEY` through as an environment variable      |
 
-Unknown agent names are rejected before any session resources are created.
+Any other agent — Aider, an in-house tool, anything with a CLI — is just as first-class: add an
+`[agents.<name>]` section defining its `command` (and, optionally, `auto_flags`, `resume`, and
+an `integration` for its credentials), and `--agent <name>` works the same way. See the
+[custom agents](https://dstanek.github.io/agent-manager/reference/configuration/#custom-agents)
+section of the configuration reference. A name that resolves to neither a built-in nor a
+configured section is rejected before any session resources are created.
 
 ## Example Dockerfile
 

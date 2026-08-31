@@ -220,3 +220,22 @@ Feature: am setup — the interactive prompts
     When I run "am setup --agent claude" through a pty with input "\n1\nn"
     Then the command succeeds
     And the output does not contain "already sets its own"
+
+  # ── The dynamic agent menu (custom agents) ──────────────────────────────────
+
+  Scenario: the agent menu lists a configured custom agent after the built-ins, with its own credential note
+    # "if we don't list custom agents it will be filed as a bug by users" — the menu must
+    # show every configured agent, not just the four built-ins.
+    Given a project config containing "[agents.aider]\ncommand = [\"aider\"]\n"
+    When I run "am setup" through a pty with input "5\n\n1\nn"
+    Then the command succeeds
+    And the output contains "[1] claude"
+    And the output contains "[2] copilot"
+    And the output contains "[3] gemini"
+    And the output contains "[4] codex"
+    And the output contains "[5] aider"
+    And the output contains "no integration"
+    # "no integration" is aider's row only — a built-in always has one, so the annotation
+    # must never appear attached to claude's row.
+    And the output does not contain "claude   no integration"
+    And the output contains 'Set defaults.agent = "aider" in .am/config.toml'
