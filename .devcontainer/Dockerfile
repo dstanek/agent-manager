@@ -12,7 +12,7 @@ FROM mcr.microsoft.com/devcontainers/rust:2-bookworm
 
 # Keep in step with the jj version the project is developed against.
 # renovate: datasource=github-releases depName=jj-vcs/jj
-ARG JJ_VERSION=0.44.0
+ARG JJ_VERSION=0.45.1
 
 # The reference Dev Containers CLI. Pinned, and kept in step with
 # .github/workflows/integration.yml: the differential tests assert that am's output matches this
